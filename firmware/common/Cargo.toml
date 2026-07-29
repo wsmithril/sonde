@@ -1,0 +1,35 @@
+[package]
+name       = "sonde-common"
+version    = "0.1.0"
+edition    = "2024"
+authors    = ["wsmithril <wsmithril@gmail.com>"]
+license    = "MIT"
+repository = "https://github.com/wsmithril/sonde"
+description = "Shared BLE/802.15.4 capture + decode library for the Sonde firmware builds"
+
+# Library only: the binary crates (firmware/usb, firmware/headless) build their
+# own variant on top of this. The lib target auto-names to `sonde_common`.
+
+[features]
+# Resolve rotating BLE identities (RPA via IRK, CSIP RSI via SIRK) against keys
+# compiled into `src/keys.rs`. Privacy-sensitive — off by default; enable only
+# for authorized analysis of devices whose keys you legitimately hold.
+resolve-identities = []
+
+# Versions and features are defined once in the workspace root (see
+# `[workspace.dependencies]` there).
+[dependencies]
+embassy-executor = { workspace = true }
+embassy-time     = { workspace = true }
+embassy-nrf      = { workspace = true }
+embassy-sync     = { workspace = true }
+embassy-usb      = { workspace = true }
+embassy-futures  = { workspace = true }
+static_cell      = { workspace = true }
+heapless         = { workspace = true }
+embedded-storage = { workspace = true }
+defmt            = { workspace = true }
+defmt-rtt        = { workspace = true }
+cortex-m         = { workspace = true }
+cortex-m-rt      = { workspace = true }
+panic-probe      = { workspace = true }

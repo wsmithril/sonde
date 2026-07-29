@@ -1,0 +1,12 @@
+[package]
+name       = "builder"
+version    = "0.1.0"
+edition    = "2024"
+authors    = ["wsmithril <wsmithril@gmail.com>"]
+license    = "MIT"
+repository = "https://github.com/wsmithril/sonde"
+description = "Host-side UF2 packer and QSPI asset provisioner for the Sonde firmware"
+
+[dependencies]
+object     = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+serialport = "4"
