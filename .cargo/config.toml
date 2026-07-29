@@ -1,0 +1,17 @@
+# Cross target for the firmware. This applies to every cargo invocation made
+# from the workspace root, including `-p builder`, so the host `builder` crate
+# must be built with an explicit `--target <host>`. That is what
+# scripts/run-builder.sh and scripts/provision.sh do; both resolve the host
+# tuple at runtime via `rustc --print host-tuple`, so they work on any host.
+#
+# Do NOT "fix" this by adding a builder/.cargo/config.toml that pins a concrete
+# host triple — cargo has no `target = "host"` sentinel, so any value written
+# there hardcodes one machine's architecture and breaks every other one.
+[build]
+target = "thumbv7em-none-eabi"
+
+[env]
+DEFMT_LOG = "trace"
+
+[target.thumbv7em-none-eabi]
+runner = "scripts/run-builder.sh"

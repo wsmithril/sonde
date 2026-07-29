@@ -1,0 +1,37 @@
+# Cargo build output. Both workspace members build into the root `target/`,
+# which is also where `firmware/build.rs` drops the generated `assets_blob.bin`
+# that `builder provision` reads.
+/target
+
+# Backup files left by `rustfmt --backup`.
+**/*.rs.bk
+
+# MSVC debug info (harmless on this target, but cheap to keep out).
+*.pdb
+
+# Python virtualenv used by scripts/refresh_data.py and adafruit-nrfutil.
+.venv/
+__pycache__/
+*.pyc
+
+# Flashable images built from `target/` by rust-objcopy / uf2conv / nrfutil.
+# Regenerate with scripts/flash.sh — never worth versioning.
+sonde.bin
+sonde.uf2
+sonde_dfu*.zip
+*.hex
+assets_blob.bin
+
+# macOS
+.DS_Store
+
+# Tracked on purpose, listed here so it is not "fixed" later:
+#   Cargo.lock          — this is a firmware binary, pin the whole graph
+#   rust-toolchain.toml — the target and components are part of the build
+#   .cargo/config.toml  — linker, runner and target selection
+#   assets/*.yaml,.csv  — SIG/IEEE source data, input to build.rs codegen
+#   firmware/memory.x   — the linker script
+
+.idea
+
+logs
