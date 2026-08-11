@@ -217,6 +217,24 @@ enum EndReason {
     PhyUnsupported,
 }
 
+/// The next channel marked used in `chm`, strictly after `from`, wrapping at 37.
+///
+/// Drives the re-acquisition sweep: the peers only ever transmit on mapped
+/// channels, so walking the map covers every place the master can be in
+/// `used_count` events instead of 37. Falls back to `from + 1` if the map is empty
+/// (which cannot happen on a live link — an all-zero map would have ended the
+/// follow at [`EndReason::BadChannel`] — but keeps the sweep advancing regardless).
+fn next_used_channel(from: u8, chm: &[u8; 5]) -> u8 {
+    let used = |i: u8| chm[(i / 8) as usize] & (1 << (i % 8)) != 0;
+    for step in 1..=37u8 {
+        let c = (from + step) % 37;
+        if used(c) {
+            return c;
+        }
+    }
+    (from + 1) % 37
+}
+
 /// True once the connection event counter has reached or passed `instant`,
 /// wrap-safe over the 16-bit counter. An update's instant is always scheduled a
 /// small number of events ahead (< 2^15), so a half-range window separates "not
@@ -622,14 +640,24 @@ pub async fn follow(
 
         // This event's channel. Normally CSA#2 reads it off the event counter and
         // CSA#1 remaps its unmapped index through the map. But once a miss run passes
-        // `SCAN_AFTER_MISSES` the map is no longer trusted (a dropped CHANNEL_MAP_IND
-        // makes the computed channel permanently wrong): sweep the 37 data channels
-        // one per event instead, so we eventually land on the master and — catching
-        // a CHANNEL_MAP_IND — restore the map. `ever_synced` gates this so it is only
-        // a *recovery*, never the initial acquisition (which the hunt window covers).
+        // `SCAN_AFTER_MISSES` the sequence is no longer trusted (a dropped
+        // CHANNEL_MAP_IND, or an anchor that slipped a whole event, makes every
+        // computed channel wrong): step channels one per event instead, so we
+        // eventually land on the master and resync. `ever_synced` gates this so it is
+        // only a *recovery*, never the initial acquisition (the hunt window covers
+        // that).
+        //
+        // The sweep walks only the channels the map marks used. The master transmits
+        // nowhere else, so stepping all 37 spends two thirds of the sweep on dead air
+        // — and the budget does not allow it: supervision ends the follow after
+        // `timeout / interval` consecutive misses, which for the common
+        // 720 ms / 30 ms link is 24 events. Starting at `SCAN_AFTER_MISSES` leaves
+        // ~16, so a 37-channel sweep can never complete, while a typical 10-channel
+        // map is covered more than once. (Captured 2026-08-11: the sweep fired in all
+        // four follows and re-acquired in none.)
         let scanning = ever_synced && !synced && consec_miss >= SCAN_AFTER_MISSES;
         let selected = if scanning {
-            scan_ch = (scan_ch + 1) % 37;
+            scan_ch = next_used_channel(scan_ch, &chm);
             data_ch_freq(scan_ch).map(|f| (scan_ch, f))
         } else if spec.csa2 {
             csa2::channel(ev as u16, chan_id, &chm)
