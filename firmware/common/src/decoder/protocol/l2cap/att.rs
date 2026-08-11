@@ -139,6 +139,7 @@ impl Decoder<u16> for Att {
                 write_hex_capped(&mut s, &d[1..], 32);
                 send(s);
                 crate::device::midea::gatt::frame(&d[1..]);
+                crate::device::daikin::gatt::frame(&d[1..]);
             }
             // Write Req / Write Cmd / Notification / Indication: handle + value.
             0x12 | 0x1B | 0x1D if d.len() >= 3 => {
@@ -150,6 +151,7 @@ impl Decoder<u16> for Att {
                 write_hex_capped(&mut s, &d[3..], 32);
                 send(s);
                 crate::device::midea::gatt::frame(&d[3..]);
+                crate::device::daikin::gatt::frame(&d[3..]);
             }
             // Prepare Write Req / Rsp: handle, offset into the value, and the
             // part being queued.
