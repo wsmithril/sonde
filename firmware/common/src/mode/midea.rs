@@ -1,6 +1,7 @@
 //! Midea-control mode: an active central specialised to Midea appliances — detect,
-//! connect, run the control-channel handshake, read status for a minute, move on.
-//! Text output straight to the log; LED is the shared state-colour [`drive_indicator`].
+//! connect, run the control-channel handshake, read status, move on. Text output
+//! goes straight to the log; the onboard LED reports which task holds the radio
+//! (see the LED section below), rendered by the shared [`drive_indicator`].
 //!
 //! The generic BLE-central machinery (connect, CSA#1, T_IFS, ATT/GATT walk) is
 //! shared with GATT-enum and lives in [`crate::central`]; this module owns
@@ -268,6 +269,75 @@ fn log_table(st: &MideaState) {
     }
 }
 
+// ── LED: phase colour + event flashes ─────────────────────────────────────────
+//
+// The mode runs six tasks over one radio, so the LED answers a single question:
+// *what is the fleet doing right now?* Two rules keep it readable:
+//
+//   * **The base colour is whoever holds the radio** — green scanning, blue
+//     handshaking, magenta probing, dark idle. A board stuck on one colour names
+//     the wedged task, which a blinking-only scheme cannot do.
+//   * **Flashes are events, never state.** Every flash settles back to the phase
+//     colour (never to `OFF`), so a flash can't leave the LED misreporting what
+//     the radio is doing.
+//
+// | Colour            | Meaning                                            |
+// |-------------------|----------------------------------------------------|
+// | Off               | idle — table warm, nothing on air                  |
+// | Green             | discovery scan holding the radio                   |
+// | Green flash ×1    | a filtered `2…AC…` appliance entered the table      |
+// | Blue              | handshake (C1→C2→C3) in progress                   |
+// | Cyan flash ×1     | peer answered a handshake step                     |
+// | Cyan flash ×2     | credential acquired (c3 accepted)                  |
+// | Magenta           | probe running                                       |
+// | White flash ×1    | probe read status; device retired to cooldown      |
+// | Yellow flash ×2   | handshake/probe attempt failed — will retry        |
+// | Red flash ×1      | no link (CONNECT_IND refused, or link lost)        |
+
+/// Which task currently holds the radio. Stored as a plain discriminant so any
+/// task can read the resting colour back without locking.
+#[derive(Clone, Copy)]
+enum Phase {
+    Idle = 0,
+    Scan = 1,
+    Handshake = 2,
+    Probe = 3,
+}
+
+static PHASE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+impl Phase {
+    fn colour(self) -> led::Rgb {
+        match self {
+            Phase::Idle => led::OFF,
+            Phase::Scan => led::GREEN,
+            Phase::Handshake => led::BLUE,
+            Phase::Probe => led::MAGENTA,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Phase::Scan,
+            2 => Phase::Handshake,
+            3 => Phase::Probe,
+            _ => Phase::Idle,
+        }
+    }
+}
+
+/// Enter a phase: record it and light its colour. Called by the task that just
+/// took the radio, so the LED always names the current on-air owner.
+fn set_phase(p: Phase) {
+    PHASE.store(p as u8, Ordering::Relaxed);
+    led::solid(p.colour());
+}
+
+/// Flash an event colour, settling back to the current phase colour.
+fn flash(colour: led::Rgb, count: u16) {
+    let base = Phase::from_u8(PHASE.load(Ordering::Relaxed)).colour();
+    led::blink_then(colour, base, count, 60, 60);
+}
+
 // ── Tasks ─────────────────────────────────────────────────────────────────────
 
 /// Discovery: every [`SCAN_PERIOD_MS`], log the table, then hold the radio for a
@@ -281,7 +351,10 @@ pub async fn scan_task() -> ! {
         }
         let found = {
             let mut rng = RADIO.lock().await;
-            scan_midea(&mut rng).await
+            set_phase(Phase::Scan);
+            let f = scan_midea(&mut rng).await;
+            set_phase(Phase::Idle);
+            f
         };
         {
             let mut st = STATE.lock().await;
@@ -308,8 +381,14 @@ pub async fn handshake_task() -> ! {
         };
         let outcome = {
             let mut rng = RADIO.lock().await;
-            do_handshake(&mut rng, &e).await
+            set_phase(Phase::Handshake);
+            let o = do_handshake(&mut rng, &e).await;
+            set_phase(Phase::Idle);
+            o
         };
+        // Two cyan flashes = credential acquired; two yellow = this attempt
+        // failed and the device stays queued for another try.
+        flash(if outcome == Outcome::Ok { led::CYAN } else { led::YELLOW }, 2);
         let mut st = STATE.lock().await;
         record_handshake(&mut st, &e.sn, outcome);
     }
@@ -330,8 +409,18 @@ pub async fn probe_task() -> ! {
         };
         let outcome = {
             let mut rng = RADIO.lock().await;
-            do_probe(&mut rng, &e).await
+            set_phase(Phase::Probe);
+            let o = do_probe(&mut rng, &e).await;
+            set_phase(Phase::Idle);
+            o
         };
+        // White = status read and the device is retiring to cooldown; yellow =
+        // the probe failed.
+        if outcome == Outcome::Ok {
+            flash(led::WHITE, 1);
+        } else {
+            flash(led::YELLOW, 2);
+        }
         let mut st = STATE.lock().await;
         record_probe(&mut st, &e.sn, outcome);
     }
@@ -400,12 +489,11 @@ async fn midea_handshake(
         let f = hs.build_c1(&mut rng)?;
         let t0 = Instant::now();
         st.writes += 1;
-        led::blink(led::RED, 1, 60, 60); // flash red on each handshake write
         if let Some(n) =
             att_write_await_notify(conn, prof.write_h, &f, prof.notify_h, HS_REPLY_EVENTS, &mut out).await
         {
             st.notifs += 1;
-            led::blink(led::BLUE, 1, 40, 40); // flash blue on notification
+            flash(led::CYAN, 1); // peer answered this step
             ulogf!("  midea[c1]: reply attempt={} in {}ms len={}\r\n",
                 attempt, (Instant::now() - t0).as_millis(), n);
             c1_len = Some(n);
@@ -461,12 +549,11 @@ async fn resend_await(
     for attempt in 1..=HS_RETRIES {
         let t0 = Instant::now();
         st.writes += 1;
-        led::blink(led::RED, 1, 60, 60); // flash red on each handshake write
         if let Some(n) =
             att_write_await_notify(conn, prof.write_h, frame, prof.notify_h, HS_REPLY_EVENTS, out).await
         {
             st.notifs += 1;
-            led::blink(led::BLUE, 1, 40, 40); // flash blue on notification
+            flash(led::CYAN, 1); // peer answered this step
             ulogf!("  midea[{}]: reply attempt={} in {}ms len={}\r\n",
                 phase, attempt, (Instant::now() - t0).as_millis(), n);
             return Some(n);
@@ -533,7 +620,7 @@ async fn midea_listen(
                         && u16::from_le_bytes([frame[1], frame[2]]) == prof.notify_h
                     {
                         st.notifs += 1;
-                        led::blink(led::BLUE, 1, 40, 40); // flash blue on notification
+                        flash(led::CYAN, 1); // peer answered this step
                         // The notification value is the Midea conn frame (AA 55…).
                         if let Some(Recv::Biz(body)) = hs.on_recv(&frame[3..])
                             && let Some(s) = control::parse_status_frame(&body)
@@ -611,6 +698,7 @@ async fn scan_midea(rng: &mut Rng) -> heapless::Vec<Candidate, ACTIVE_MAX> {
                             if let Some(sn) = parse_midea_sn(&buf[8..2 + len]) {
                                 if sn_matches(&sn) {
                                     if !found.iter().any(|c| c.sn == Some(sn)) {
+                                        flash(led::GREEN, 1); // new appliance in range
                                         let _ = found.push(Candidate {
                                             addr,
                                             addr_random: (buf[0] >> 6) & 1 == 1,
@@ -651,6 +739,7 @@ async fn open(rng: &mut Rng, e: &DeviceEntry) -> Option<(Conn, device::midea::ga
         Some(c) => c,
         None => {
             ulogf!("  connect failed (target={} connectable={})\r\n", cstat.target, cstat.connectable);
+            flash(led::RED, 1); // no link
             ensure_disabled();
             configure_ble();
             return None;
