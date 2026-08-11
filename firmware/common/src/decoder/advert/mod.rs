@@ -25,6 +25,7 @@ mod baidu;
 mod bandxi;
 mod bluetrum;
 mod bose;
+mod bthome;
 mod bwgroup;
 mod eddystone;
 mod edifier;
@@ -156,6 +157,7 @@ static DECODERS: &[&dyn VendorDecoder] = &[
     &amap::Amap,
     &motive::Motive,
     &yichip::Yichip,
+    &bthome::BtHome,
     &gopro::GoPro,
     &garmin::Garmin,
     &bwgroup::BwGroup,
