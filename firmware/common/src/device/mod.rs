@@ -5,5 +5,6 @@
 //! its GATT control channel, framing, crypto and command set — the parts that a
 //! generic advertising/GATT decoder does not cover.
 
+pub mod airoha;
 pub mod daikin;
 pub mod midea;

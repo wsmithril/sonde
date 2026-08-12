@@ -206,7 +206,7 @@ async fn main(spawner: Spawner) {
     // card is up (see the storage block below) — there is no console to print to.
 
     let mode = next_boot_mode(p.NVMC);
-    let capture = !matches!(mode, BootMode::RssiMonitor | BootMode::ZigbeeSniff | BootMode::MideaCtl);
+    let capture = !matches!(mode, BootMode::RssiMonitor | BootMode::ZigbeeSniff | BootMode::Recon);
 
     // Radio capture + ring consumers depend on neither the SD card nor USB, so
     // start them now; they fill SD_RING while the card comes up (the ring drops and

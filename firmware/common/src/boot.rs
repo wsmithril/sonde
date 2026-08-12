@@ -32,7 +32,7 @@ pub enum BootMode {
     GattEnum,
     ConnFollow,
     ZigbeeSniff,
-    MideaCtl,
+    Recon,
 }
 
 pub const BOOT_MODES: u32 = 6;
@@ -112,7 +112,7 @@ pub fn next_boot_mode(nvmc: Peri<'static, peripherals::NVMC>) -> BootMode {
         2 => BootMode::GattEnum,
         3 => BootMode::ConnFollow,
         4 => BootMode::ZigbeeSniff,
-        _ => BootMode::MideaCtl,
+        _ => BootMode::Recon,
     }
 }
 
@@ -151,6 +151,6 @@ pub fn mode_index(mode: BootMode) -> u8 {
         BootMode::GattEnum => 2,
         BootMode::ConnFollow => 3,
         BootMode::ZigbeeSniff => 4,
-        BootMode::MideaCtl => 5,
+        BootMode::Recon => 5,
     }
 }

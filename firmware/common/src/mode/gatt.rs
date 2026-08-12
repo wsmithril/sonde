@@ -59,6 +59,7 @@
 use core::marker::PhantomData;
 
 use embassy_time::{Duration, Instant, Timer};
+use heapless::Vec;
 
 use super::{Ctx, Mode, drive_indicator};
 use crate::central::*;
@@ -68,6 +69,23 @@ use crate::{Rng, led};
 
 // ── Public entry ──────────────────────────────────────────────────────────────
 
+
+/// Test drive: one survey → establish several links → concurrent listen cycle.
+/// Surveys for up to [`MUX_MAX`] connectable peers and hands them to the
+/// multiplexed listen ([`multiplex_listen_session`]), which holds them all open
+/// and prints every peer's notifications for a minute. HARDWARE-UNVERIFIED.
+pub async fn run_multiplex(rng: &mut Rng) {
+    led::solid(led::OFF);
+    let mut cands: Vec<Candidate, MUX_MAX> = Vec::new();
+    survey_multi(rng, &mut cands).await;
+    if cands.is_empty() {
+        led::solid(led::OFF);
+        Timer::after_millis(500).await;
+        return;
+    }
+    ulogf!("mux: {} candidate(s) — establishing links\r\n", cands.len());
+    multiplex_listen_session(rng, &cands, 60).await;
+}
 
 /// One survey → connect → enumerate → disconnect cycle. Called in a loop by the
 /// `gatt_task`.
@@ -318,7 +336,9 @@ impl<K: super::CaptureSink> Mode for GattEnum<K> {
 
     async fn run(&mut self, ctx: &'static Ctx<K>) -> ! {
         loop {
-            run(ctx.rng()).await;
+            // Test drive: multiplexed concurrent listen across several links.
+            // Swap back to `run` for the single-link enumerate-and-teardown cycle.
+            run_multiplex(ctx.rng()).await;
         }
     }
 

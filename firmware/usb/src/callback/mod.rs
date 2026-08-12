@@ -6,6 +6,6 @@
 pub mod ble_sniff;
 pub mod conn_follow;
 pub mod gatt;
-pub mod midea;
+pub mod recon;
 pub mod rssi;
 pub mod zigbee;

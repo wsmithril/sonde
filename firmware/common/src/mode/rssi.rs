@@ -222,7 +222,7 @@ fn sample_rssi(freq_offset: u8) -> u8 {
     while r.events_rssiend().read() == 0 {}
     let magnitude = r.rssisample().read().rssisample();
     r.tasks_disable().write_value(1);
-    while r.events_disabled().read() == 0 {}
+    let _ = crate::hal::radio::wait_disabled();
     r.events_disabled().write_value(0);
     magnitude
 }

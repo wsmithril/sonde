@@ -1,5 +1,5 @@
 //! Shared BLE-central machinery: the transmitting connection role used by both the
-//! GATT-enum mode ([`crate::mode::gatt`]) and the Midea mode ([`crate::mode::midea`]).
+//! GATT-enum mode ([`crate::mode::gatt`]) and the recon mode ([`crate::mode::recon`]).
 //!
 //! It surveys connectable advertisers, fires a `CONNECT_IND` at T_IFS, drives the
 //! connection events (CSA#1 hopping, stop-and-wait flow, hardware T_IFS turnaround),
@@ -65,7 +65,7 @@ use heapless::Vec;
 
 use crate::hal::radio::{
     configure_ble, data_ch_freq, disable_silent, ensure_disabled, set_access_address, set_pcnf0,
-    ADV_AA, ADV_CRC_POLY,
+    wait_disabled, ADV_AA, ADV_CRC_POLY,
 };
 use crate::decoder::protocol::Decoder as _; // `.decode()` on the ATT channel decoder
 use crate::{decoder, led, Rng};
@@ -206,6 +206,15 @@ const WIN_OFFSET: u16 = 2; // ×1.25 ms; delays the first anchor to leave time t
 const HOP_INCREMENT: u8 = 7; // CSA#1 hop (5..16)
 const TX_WIN_DELAY_US: u64 = 1250; // fixed transmitWindowDelay for a CONNECT_IND
 
+// The transmit-window size and supervision timeout the *next* CONNECT_IND will
+// carry. They default to the single-connection constants above; the multiplex
+// driver widens the window (for anchor placement) and stretches the timeout (so a
+// link set up early survives while the rest are established), then restores both.
+static TX_WIN_SIZE_UNITS: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(WIN_SIZE);
+static CONN_TIMEOUT_UNITS: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(CONN_TIMEOUT);
+
 /// Our address (Initiator address in CONNECT_IND). Random static: the two MSBs of
 /// the most-significant octet (`buf[7]`, i.e. index 5 here) are 0b11.
 /// Our BD_ADDR as an initiator, on-air order (LSB first), regenerated for every
@@ -243,25 +252,11 @@ pub(crate) fn randomize_our_addr(rng: &mut Rng) {
 // ── Event / discovery budgets ─────────────────────────────────────────────────
 
 const MAX_EVENTS_PER_TXN: u32 = 60; // connection events to await one ATT response
+/// Short budget for the *optional* Exchange MTU: these appliances often ignore it
+/// entirely, and enumeration proceeds fine at ATT_MTU_DEFAULT — so fail fast (~0.5 s)
+/// rather than burning the full budget before discovery even starts.
+const MTU_EVENTS: u32 = 16;
 
-/// Connection events to wait after the peer's Link Layer acknowledges our ATT
-/// request before putting it on air again.
-///
-/// An LL ack proves only that the peer's *link layer* took the PDU — not that its
-/// ATT server processed it. On a fresh link the peer is usually still running its
-/// own LL feature/length exchange and silently drops the first ATT request it is
-/// handed. Treating the ack as delivery meant the transaction then idled out the
-/// whole [`MAX_EVENTS_PER_TXN`] budget waiting for a response that was never
-/// coming: in a captured 85-connection run, *every* Exchange MTU on a live link
-/// failed that way (82 of 85 `mtu = 23 (unanswered)`), which then forced the whole
-/// enumeration to [`ATT_MTU_DEFAULT`] and roughly doubled its wall time
-/// (9–14 s at MTU 23 vs 5–6 s at MTU 247).
-///
-/// Twelve events is ~375 ms at [`CONN_INTERVAL`] — long enough that a peer which
-/// is merely busy answers first, short enough to fit four more attempts inside the
-/// budget. A duplicate request is harmless: ATT is stop-and-wait, so a peer that
-/// did process the original simply answers again.
-const ATT_RETRY_EVENTS: u32 = 12;
 pub(crate) const MAX_CONSEC_MISS: u32 = 40; // consecutive peer no-shows on a *live* link → lost
 // Consecutive no-shows tolerated *before the peer has ever replied*. Three in
 // four accepted connections in captured runs are silent: the CONNECT_IND is
@@ -271,8 +266,8 @@ pub(crate) const MAX_CONSEC_MISS: u32 = 40; // consecutive peer no-shows on a *l
 // full 40 events (~1.2 s) on a peer that will never speak is pure dead time, so
 // bail early until the link proves itself, then extend to MAX_CONSEC_MISS.
 const MAX_CONSEC_MISS_UNPROVEN: u32 = 10;
-const MAX_SERVICES: usize = 16;
-const MAX_CHARS_PER_SVC: usize = 24;
+pub(crate) const MAX_SERVICES: usize = 16;
+pub(crate) const MAX_CHARS_PER_SVC: usize = 24;
 
 /// ATT MTU before any Exchange MTU — the spec default (23) and the negotiation
 /// floor.
@@ -301,7 +296,7 @@ const SUBSCRIBE: bool = true;
 
 /// Connection events to hold the link open after enumeration, collecting
 /// whatever the subscriptions push. 64 × 31.25 ms = 2 s.
-const LISTEN_EVENTS: u32 = 64;
+pub(crate) const LISTEN_EVENTS: u32 = 64;
 
 /// Diagnostic: when non-zero, skip enumeration and instead spend this many ms
 /// after the `CONNECT_IND` counting advertisements still coming from the target
@@ -561,7 +556,7 @@ pub(crate) async fn survey(rng: &mut Rng) -> (Option<Candidate>, u32) {
 
             r.shorts().write(|_w| {});
             r.tasks_disable().write_value(1);
-            while r.events_disabled().read() == 0 {}
+            let _ = wait_disabled();
             r.events_disabled().write_value(0);
         }
     }
@@ -593,6 +588,492 @@ fn record_candidate(
         return;
     }
     *best = Some(Candidate { addr, addr_random, rssi, sn });
+}
+
+// ── Multiplexed listen (test drive) ─────────────────────────────────────────
+//
+// Hold several links open on the one radio and listen to all of them at once.
+// This is the low-risk slice of connection multiplexing: during listen a link only
+// sends empty PDUs and receives notifications (sub-ms per event, no ATT
+// sequencing), so staggering [`MUX_MAX`] links inside the 31.25 ms interval has
+// ample headroom. It still exercises the hard prerequisites — per-link radio
+// identity ([`Conn::aa`]/[`Conn::crc_init`], restored by [`conn_event`]), anchor
+// staggering, and holding links alive concurrently — before the harder
+// enumerate+handshake multiplex is attempted. HARDWARE-UNVERIFIED.
+
+/// How many links the multiplexed listen holds open at once.
+pub(crate) const MUX_MAX: usize = 4;
+/// Transmit-window size (×1.25 ms) for a multiplexed CONNECT_IND. The spec caps it
+/// at 10 ms; the wide window is the room within which each link's first anchor is
+/// placed on a distinct phase of the shared interval so the links do not collide.
+const MUX_WIN_SIZE: u8 = 8;
+/// Supervision timeout (×10 ms) for a multiplexed CONNECT_IND: 20 s, long enough
+/// that a link established first survives while the remaining links are set up
+/// (each setup is a several-second gap in which that link gets no events).
+const MUX_CONN_TIMEOUT: u16 = 2000;
+/// Target minimum spacing between two links' anchors, in ticks (~3 ms). Below this
+/// their events overlap on air and one starts missing every interval.
+const MUX_MIN_GAP_TICKS: u64 = (3_000 * embassy_time::TICK_HZ) / 1_000_000;
+/// Backfill: refill a freed slot at most this often — a survey freezes the
+/// survivors for its duration, so it must not run every loop iteration.
+const MUX_BACKFILL_EVERY_S: u64 = 8;
+/// …and only when at least this much listen time remains, so a fresh link is worth
+/// the survey cost and the survivors' freeze.
+const MUX_BACKFILL_MIN_LEFT_S: u64 = 15;
+
+/// A characteristic value handle and its UUID, remembered from the walk so a
+/// notification arriving on that handle can be named instead of shown as a bare
+/// number.
+#[derive(Clone, Copy)]
+struct CharRef {
+    handle: u16,
+    uuid: [u8; 16],
+    uuid_len: u8,
+}
+
+/// Characteristics remembered per link for notification resolution.
+const MUX_CHARS: usize = 24;
+
+/// One multiplexed link: its connection plus the per-link reassembly/flow state
+/// the listen loop keeps for it (each link is an independent ATT bearer), and the
+/// handle→UUID table used to name its notifications.
+struct MuxLink {
+    conn: Conn,
+    asm: Reasm,
+    owed: Option<([u8; 5], usize)>,
+    miss: u32,
+    label: [u8; 6],
+    notifs: u32,
+    chars: Vec<CharRef, MUX_CHARS>,
+}
+
+/// Survey the advertising channels and collect up to [`MUX_MAX`] distinct
+/// connectable advertisers (strongest RSSI per address, skipping recently
+/// enumerated ones). Mirrors [`survey`] but keeps a small set rather than one best.
+pub(crate) async fn survey_multi(rng: &mut Rng, out: &mut Vec<Candidate, MUX_MAX>) {
+    configure_ble();
+    let r = pac::RADIO;
+    for _ in 0..SURVEY_ROUNDS {
+        for &(ch_idx, freq) in ADV_CHANNELS.iter() {
+            ensure_disabled();
+            r.frequency().write(|w| {
+                w.set_frequency(freq);
+                w.set_map(vals::Map::Default);
+            });
+            r.datawhiteiv().write(|w| w.set_datawhiteiv(ch_idx));
+            r.packetptr().write_value(RX_BUF.0.get() as u32);
+            r.events_end().write_value(0);
+            r.events_crcok().write_value(0);
+            r.events_address().write_value(0);
+            r.events_disabled().write_value(0);
+            r.shorts().write(|w| {
+                w.set_rxready_start(true);
+                w.set_address_rssistart(true);
+            });
+            r.tasks_rxen().write_value(1);
+
+            let deadline = Instant::now() + Duration::from_millis(SURVEY_DWELL_MS);
+            while Instant::now() < deadline {
+                if r.events_end().read() != 0 {
+                    r.events_end().write_value(0);
+                    let crc_ok = r.events_crcok().read() != 0;
+                    let rssi = -(r.rssisample().read().rssisample() as i16);
+                    r.events_crcok().write_value(0);
+                    r.events_address().write_value(0);
+                    if crc_ok {
+                        let buf = unsafe { &*RX_BUF.0.get() };
+                        let pdu_type = buf[0] & 0x0F;
+                        let len = buf[1] as usize;
+                        if matches!(pdu_type, 0x00 | 0x01) && len >= 6 {
+                            let addr = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
+                            let addr_random = (buf[0] >> 6) & 1 == 1;
+                            let sn = parse_midea_sn(&buf[8..2 + len]);
+                            record_candidate_multi(out, addr, addr_random, rssi, sn);
+                        }
+                    }
+                    r.tasks_start().write_value(1);
+                }
+                Timer::after_micros(200).await;
+                rng.stir(r.rssisample().read().rssisample() as u32);
+            }
+
+            r.shorts().write(|_w| {});
+            r.tasks_disable().write_value(1);
+            let _ = wait_disabled();
+            r.events_disabled().write_value(0);
+        }
+    }
+}
+
+/// Insert/refresh a candidate in the fixed set: refresh RSSI if already present,
+/// else push, else replace the weakest when this one is stronger.
+fn record_candidate_multi(
+    out: &mut Vec<Candidate, MUX_MAX>,
+    addr: [u8; 6],
+    addr_random: bool,
+    rssi: i16,
+    sn: Option<[u8; 14]>,
+) {
+    for c in out.iter_mut() {
+        if c.addr == addr {
+            if rssi > c.rssi {
+                c.rssi = rssi;
+            }
+            return;
+        }
+    }
+    if recently_enumerated(addr, Instant::now()) {
+        return;
+    }
+    if out.push(Candidate { addr, addr_random, rssi, sn }).is_err() {
+        let mut wi = 0usize;
+        let mut wr = i16::MAX;
+        for (i, c) in out.iter().enumerate() {
+            if c.rssi < wr {
+                wr = c.rssi;
+                wi = i;
+            }
+        }
+        if rssi > wr {
+            out[wi] = Candidate { addr, addr_random, rssi, sn };
+        }
+    }
+}
+
+/// Move a freshly-established link's first anchor within its transmit window to the
+/// phase of the shared interval farthest from every link already established, so
+/// the links' events do not land on top of each other. The first link keeps its
+/// nominal anchor; each later one is placed relative to it.
+fn snap_anchor(conn: &mut Conn, existing: &[MuxLink]) {
+    if existing.is_empty() {
+        return; // the reference link — everyone else spreads around it
+    }
+    let interval = CONN_INTERVAL_TICKS;
+    // Placement room = one unit inside the peer's first-event RX window, so we
+    // never sit exactly on its far edge.
+    let win = ((MUX_WIN_SIZE as u64 - 1) * 1250 * embassy_time::TICK_HZ) / 1_000_000;
+    let base = conn.anchor.as_ticks();
+    let mut phases: Vec<u64, MUX_MAX> = Vec::new();
+    for l in existing {
+        let _ = phases.push(l.conn.anchor.as_ticks() % interval);
+    }
+    let steps = 24u64;
+    let mut best_off = 0u64;
+    let mut best_score = 0u64;
+    for s in 0..=steps {
+        let off = win * s / steps;
+        let ph = (base + off) % interval;
+        let mut mind = interval;
+        for &p in phases.iter() {
+            let d = ph.abs_diff(p);
+            let cd = d.min(interval - d);
+            mind = mind.min(cd);
+        }
+        if mind > best_score {
+            best_score = mind;
+            best_off = off;
+        }
+    }
+    conn.anchor += Duration::from_ticks(best_off);
+    if best_score < MUX_MIN_GAP_TICKS {
+        ulogf!(
+            "  mux: WARN anchor gap {}us below {}us target — links may collide\r\n",
+            best_score * 1_000_000 / embassy_time::TICK_HZ,
+            MUX_MIN_GAP_TICKS * 1_000_000 / embassy_time::TICK_HZ
+        );
+    }
+}
+
+/// One connection event for a link during multiplexed listen: send our empty (or
+/// owed) PDU, then decode any notification the peer pushed. Returns `false` when
+/// the link has gone silent past [`MAX_CONSEC_MISS`].
+async fn mux_listen_step(l: &mut MuxLink) -> bool {
+    let tx_len = match &l.owed {
+        Some((b, n)) => stage_att(&l.conn, &b[..*n]),
+        None => stage_empty(&l.conn),
+    };
+    let Some(rx) = conn_event(&mut l.conn, tx_len).await else {
+        l.miss += 1;
+        return l.miss < MAX_CONSEC_MISS;
+    };
+    l.miss = 0;
+    let (new_data, acked) = update_flow(&mut l.conn, &rx);
+    if acked {
+        l.owed = None;
+    }
+    if !new_data || rx.len == 0 {
+        return true;
+    }
+    let buf = unsafe { &*RX_BUF.0.get() };
+    let payload = &buf[2..2 + rx.len as usize];
+    match rx.llid {
+        0b11 => handle_ll_control(payload),
+        0b10 | 0b01 => {
+            if !l.asm.push(rx.llid, payload) {
+                return true;
+            }
+            let cid = l.asm.cid;
+            let mut reply = None;
+            {
+                use core::fmt::Write;
+                let frame = l.asm.frame();
+                if cid == 0x0004 && !frame.is_empty() {
+                    l.notifs += 1;
+                    let op = frame[0];
+                    if frame.len() >= 3 && matches!(op, ATT_HANDLE_VALUE_NTF | ATT_HANDLE_VALUE_IND)
+                    {
+                        let h = u16::from_le_bytes([frame[1], frame[2]]);
+                        let value = &frame[3..];
+                        let kind = if op == ATT_HANDLE_VALUE_IND { "IND" } else { "NTF" };
+                        // One self-contained header line: address, count, kind, the
+                        // handle stated once, its characteristic UUID+name (from the
+                        // walk), and the value length.
+                        let mut s = decoder::LogStr::new();
+                        let _ = write!(
+                            s,
+                            "  mux[{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}] notif #{} {} h={:04X} ",
+                            l.label[5], l.label[4], l.label[3], l.label[2], l.label[1], l.label[0],
+                            l.notifs, kind, h
+                        );
+                        // Resolve the name and attempt a value decode; hexdump only
+                        // whatever the decode did not account for.
+                        let mut consumed = 0usize;
+                        let mut decode_line: Option<decoder::LogStr> = None;
+                        if let Some(cr) = l.chars.iter().find(|c| c.handle == h) {
+                            let uuid = &cr.uuid[..cr.uuid_len as usize];
+                            decoder::gatt::write_uuid(&mut s, uuid);
+                            let mut d = decoder::LogStr::new();
+                            if let Some(n) = decoder::gatt::uweave::describe(uuid, value, &mut d) {
+                                consumed = n.min(value.len());
+                                decode_line = Some(d);
+                            }
+                        } else {
+                            let _ = s.push_str("(unknown handle)");
+                        }
+                        let _ = write!(s, " len={}", value.len());
+                        decoder::emit(s);
+                        if let Some(d) = decode_line {
+                            decoder::emit(d);
+                        }
+                        if consumed < value.len() {
+                            decoder::hexdump(&value[consumed..], consumed, 8);
+                        }
+                    } else {
+                        // A peer request or other ATT PDU on the bearer (not a
+                        // notification): log and field-decode it as before.
+                        let mut s = decoder::LogStr::new();
+                        let _ = write!(
+                            s,
+                            "  mux[{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}] peer ATT 0x{:02X} {} len={}",
+                            l.label[5], l.label[4], l.label[3], l.label[2], l.label[1], l.label[0],
+                            op, att_opcode_name(op), frame.len()
+                        );
+                        decoder::emit(s);
+                        decoder::protocol::l2cap::att::Att.decode(frame);
+                    }
+                    reply = peer_att_reply(op);
+                }
+            }
+            if let Some(r) = reply {
+                l.owed = Some(r);
+            }
+            l.asm.clear();
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Advance every link's anchor — and, in lockstep, its CSA#1 channel — past `now`
+/// to the next event its peer is still counting toward. Any radio-stealing gap
+/// (initial setup, or a mid-listen backfill survey) leaves the survivors' anchors
+/// in the past; without hopping `unmapped` the same number of skipped intervals a
+/// link resumes N channels behind and the peer never hears it. See the failure this
+/// fixed in [`multiplex_listen_session`].
+fn catch_up_anchors(links: &mut [MuxLink], now: Instant) {
+    for l in links.iter_mut() {
+        while l.conn.anchor <= now {
+            l.conn.anchor += Duration::from_ticks(CONN_INTERVAL_TICKS);
+            l.conn.unmapped = (l.conn.unmapped + l.conn.hop) % 37;
+        }
+    }
+}
+
+/// Connect one candidate, place its anchor clear of `existing`, subscribe (MTU +
+/// discovery + walk, no listen), and return the ready link — capturing its
+/// handle→UUID table for notification naming. `None` if the connect fails or the
+/// peer never replies (`ev_addr == 0`: a half-open link that would only occupy a
+/// slot and time out). Freezes `existing`; the caller must `catch_up_anchors` after.
+async fn establish_link(rng: &mut Rng, cand: &Candidate, existing: &[MuxLink]) -> Option<MuxLink> {
+    use core::sync::atomic::Ordering::Relaxed;
+    CONN_AA.store(pick_access_address(rng), Relaxed);
+    pick_conn_params(rng);
+    randomize_our_addr(rng);
+    let mut st = ConnectStats::default();
+    let Some(mut conn) = try_connect(cand, &mut st).await else {
+        ulogf!(
+            "  mux: connect failed {:02X}:{:02X} (target={} connectable={})\r\n",
+            cand.addr[5], cand.addr[0], st.target, st.connectable
+        );
+        ensure_disabled();
+        configure_ble();
+        return None;
+    };
+    // This link's data-channel identity, then place its anchor off the ones already
+    // up, then subscribe.
+    configure_conn_radio();
+    snap_anchor(&mut conn, existing);
+    exchange_mtu(&mut conn).await;
+    let mut services: Vec<Service, MAX_SERVICES> = Vec::new();
+    discover_services(&mut conn, &mut services).await;
+    let mut chars: Vec<CharRef, MUX_CHARS> = Vec::new();
+    let subs = walk_services(&mut conn, &services, |vh, uuid| {
+        let n = uuid.len().min(16);
+        let mut cr = CharRef { handle: vh, uuid: [0; 16], uuid_len: n as u8 };
+        cr.uuid[..n].copy_from_slice(&uuid[..n]);
+        let _ = chars.push(cr);
+    })
+    .await;
+    if conn.ev_addr == 0 {
+        // The peer never transmitted — CONNECT_IND ignored, or our anchor missed
+        // its window. Not a link, just a slot-and-timeout waster.
+        ulogf!(
+            "  mux: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} no peer reply — dropping\r\n",
+            cand.addr[5], cand.addr[4], cand.addr[3], cand.addr[2], cand.addr[1], cand.addr[0]
+        );
+        ensure_disabled();
+        configure_ble();
+        return None;
+    }
+    ulogf!(
+        "  mux: link up {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} services={} subs={}\r\n",
+        cand.addr[5], cand.addr[4], cand.addr[3], cand.addr[2], cand.addr[1], cand.addr[0],
+        services.len(), subs
+    );
+    Some(MuxLink {
+        conn,
+        asm: Reasm::new(),
+        owed: None,
+        miss: 0,
+        label: cand.addr,
+        notifs: 0,
+        chars,
+    })
+}
+
+/// Test drive: hold up to [`MUX_MAX`] links open and listen to all of them at once
+/// for `secs`, **backfilling freed slots** with freshly-surveyed devices so the
+/// window stays full instead of the listen monopolizing the radio for its whole
+/// duration. Establishment is serial (one radio initiates one link at a time); the
+/// widened supervision timeout keeps existing links alive through each setup gap,
+/// after which `catch_up_anchors` resyncs them. HARDWARE-UNVERIFIED.
+pub(crate) async fn multiplex_listen_session(rng: &mut Rng, cands: &[Candidate], secs: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if cands.is_empty() {
+        return;
+    }
+    TX_WIN_SIZE_UNITS.store(MUX_WIN_SIZE, Relaxed);
+    CONN_TIMEOUT_UNITS.store(MUX_CONN_TIMEOUT, Relaxed);
+
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut links: Vec<MuxLink, MUX_MAX> = Vec::new();
+
+    // Initial fill from the candidates the caller surveyed.
+    for cand in cands.iter().take(MUX_MAX) {
+        if let Some(l) = establish_link(rng, cand, &links).await {
+            let _ = links.push(l);
+        }
+    }
+    catch_up_anchors(&mut links, Instant::now());
+    ulogf!("  mux: listening up to {}s ({} link(s), backfilling as slots free)\r\n", secs, links.len());
+
+    let mut next_beat = Instant::now() + Duration::from_secs(5);
+    let mut next_backfill = Instant::now() + Duration::from_secs(MUX_BACKFILL_EVERY_S);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        // Backfill a freed slot with a device we are not already holding — this is
+        // what interleaves discovery into the listen instead of blocking on it.
+        // Rate-limited: each survey freezes the survivors for its duration.
+        if links.len() < MUX_MAX
+            && now >= next_backfill
+            && deadline.saturating_duration_since(now)
+                > Duration::from_secs(MUX_BACKFILL_MIN_LEFT_S)
+        {
+            let mut fresh: Vec<Candidate, MUX_MAX> = Vec::new();
+            survey_multi(rng, &mut fresh).await;
+            for cand in fresh.iter() {
+                if links.len() >= MUX_MAX {
+                    break;
+                }
+                if links.iter().any(|l| l.label == cand.addr) {
+                    continue; // already holding this device
+                }
+                if let Some(l) = establish_link(rng, cand, &links).await {
+                    let _ = links.push(l);
+                }
+            }
+            catch_up_anchors(&mut links, Instant::now());
+            next_backfill = Instant::now() + Duration::from_secs(MUX_BACKFILL_EVERY_S);
+            next_beat = Instant::now() + Duration::from_secs(5);
+        }
+
+        if links.is_empty() {
+            // Nothing to service; wait a little for the next backfill window rather
+            // than spinning.
+            Timer::after_millis(200).await;
+            continue;
+        }
+
+        // Heartbeat: a mostly-silent listen produces no output for a long time,
+        // which reads as a hang. Every 5 s, show each link is still being serviced.
+        if Instant::now() >= next_beat {
+            for l in links.iter() {
+                ulogf!(
+                    "  mux: alive {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} ev={} notifs={}\r\n",
+                    l.label[5], l.label[4], l.label[3], l.label[2], l.label[1], l.label[0],
+                    l.conn.ev_total, l.notifs
+                );
+            }
+            next_beat += Duration::from_secs(5);
+        }
+
+        // Service the live link whose anchor is soonest.
+        let mut bi = 0usize;
+        for (i, l) in links.iter().enumerate() {
+            if l.conn.anchor < links[bi].conn.anchor {
+                bi = i;
+            }
+        }
+        if !mux_listen_step(&mut links[bi]).await {
+            let (label, notifs) = {
+                let l = &links[bi];
+                (l.label, l.notifs)
+            };
+            ulogf!(
+                "  mux: link {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} lost (notifs={})\r\n",
+                label[5], label[4], label[3], label[2], label[1], label[0], notifs
+            );
+            let _ = links.swap_remove(bi);
+        }
+    }
+
+    for l in links.iter_mut() {
+        if l.conn.ev_addr != 0 {
+            terminate(&mut l.conn).await;
+        }
+        ulogf!(
+            "  mux: link {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} closed notifs={}\r\n",
+            l.label[5], l.label[4], l.label[3], l.label[2], l.label[1], l.label[0], l.notifs
+        );
+    }
+    ensure_disabled();
+    configure_ble();
+    TX_WIN_SIZE_UNITS.store(WIN_SIZE, Relaxed);
+    CONN_TIMEOUT_UNITS.store(CONN_TIMEOUT, Relaxed);
 }
 
 /// Whether this connection attempt should be spent on the accept probe rather
@@ -658,7 +1139,7 @@ pub(crate) async fn peer_readv_count(cand: &Candidate, window_ms: u64) -> u32 {
         }
         r.shorts().write(|_w| {});
         r.tasks_disable().write_value(1);
-        while r.events_disabled().read() == 0 {}
+        let _ = wait_disabled();
         r.events_disabled().write_value(0);
     }
     count
@@ -917,11 +1398,11 @@ fn build_connect_ind(cand: &Candidate) {
     let ll = &mut buf[14..36];
     ll[0..4].copy_from_slice(&conn_aa().to_le_bytes());
     ll[4..7].copy_from_slice(&conn_crc_init().to_le_bytes()[0..3]);
-    ll[7] = WIN_SIZE;
+    ll[7] = TX_WIN_SIZE_UNITS.load(core::sync::atomic::Ordering::Relaxed);
     ll[8..10].copy_from_slice(&WIN_OFFSET.to_le_bytes());
     ll[10..12].copy_from_slice(&CONN_INTERVAL.to_le_bytes());
     ll[12..14].copy_from_slice(&CONN_LATENCY.to_le_bytes());
-    ll[14..16].copy_from_slice(&CONN_TIMEOUT.to_le_bytes());
+    ll[14..16].copy_from_slice(&CONN_TIMEOUT_UNITS.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
     // Channel map: all 37 data channels usable (bits 0..36) → FF FF FF FF 1F.
     ll[16..21].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x1F]);
     // Hop (bits 0..4) + SCA (bits 5..7, 0 = worst-case, fine as master).
@@ -962,6 +1443,15 @@ pub(crate) struct Conn {
     /// Negotiated ATT MTU. Starts at [`ATT_MTU_DEFAULT`]; [`exchange_mtu`] raises
     /// it toward [`ATT_MTU_MAX`] to the smaller of the two peers' Rx MTUs.
     att_mtu: u16,
+    /// This link's access address, CRC init, and CSA#1 hop increment. A single
+    /// radio can hold several connections only if every event reprograms the radio
+    /// with the identity of the link it is servicing and hops *its* channel
+    /// sequence; [`conn_event`] does that from these fields. For a lone connection
+    /// they equal the globals set at connect, so the single-connection path is
+    /// unchanged.
+    aa: u32,
+    crc_init: u32,
+    hop: u8,
     /// Ring of the first [`TRACE_EVENTS`] events, dumped after the link ends.
     trace: [EvTrace; TRACE_EVENTS],
 }
@@ -1240,6 +1730,11 @@ fn finish_connect(cand: &Candidate, st: &mut ConnectStats) -> Option<Conn> {
         first_late_us: i32::MIN,
         saw_reply: false,
         att_mtu: ATT_MTU_DEFAULT as u16,
+        // Capture the identity this link was established with, so a multiplexed
+        // driver can restore it on the radio before each of this link's events.
+        aa: conn_aa(),
+        crc_init: conn_crc_init(),
+        hop: conn_hop(),
     })
 }
 
@@ -1255,6 +1750,10 @@ pub(crate) fn configure_conn_radio() {
     set_access_address(conn_aa());
     r.crcpoly().write(|w| w.set_crcpoly(ADV_CRC_POLY));
     r.crcinit().write(|w| w.set_crcinit(conn_crc_init()));
+    // Maximum TX power (+8 dBm) for connection events, so distant peers hear our
+    // master packets. Persists from `configure_ble` already, but set explicitly on
+    // the connection path too.
+    r.txpower().write(|w| w.set_txpower(vals::Txpower::Pos8dBm));
     // `configure_ble` leaves MAXLEN at 255 so that large AUX_ADV_IND
     // payloads survive aux following, but the connection buffers are only
     // CONN_BUF_LEN bytes. EasyDMA honours MAXLEN, not the buffer, so a length
@@ -1297,8 +1796,10 @@ pub(crate) async fn conn_event(conn: &mut Conn, tx_len: u8) -> Option<RxPdu> {
     Timer::at(conn.anchor).await;
     conn.anchor += Duration::from_ticks(CONN_INTERVAL_TICKS);
 
-    // CSA#1: next data channel = (last + hop) mod 37 (full map → no remap).
-    conn.unmapped = (conn.unmapped + conn_hop()) % 37;
+    // CSA#1: next data channel = (last + hop) mod 37 (full map → no remap). The
+    // hop increment is this link's own, not the global — several multiplexed links
+    // each walk their own channel sequence.
+    conn.unmapped = (conn.unmapped + conn.hop) % 37;
     let freq = match data_ch_freq(conn.unmapped) {
         Some(f) => f,
         None => return None,
@@ -1306,6 +1807,12 @@ pub(crate) async fn conn_event(conn: &mut Conn, tx_len: u8) -> Option<RxPdu> {
 
     let r = pac::RADIO;
     ensure_disabled();
+    // Restore this link's identity. With one connection these already hold the
+    // values `configure_conn_radio` programmed; with several multiplexed on the
+    // one radio, the previous event serviced a *different* link, so the access
+    // address and CRC init must be set back to this connection's before it fires.
+    set_access_address(conn.aa);
+    r.crcinit().write(|w| w.set_crcinit(conn.crc_init));
     r.frequency().write(|w| {
         w.set_frequency(freq);
         w.set_map(vals::Map::Default);
@@ -1469,7 +1976,12 @@ fn cleanup_radio() {
     let r = pac::RADIO;
     r.shorts().write(|_w| {});
     r.tasks_disable().write_value(1);
-    while r.events_disabled().read() == 0 {}
+    // Bounded wait, not a raw `while events_disabled==0 {}`: TASKS_DISABLE on an
+    // already-DISABLED radio never re-fires the DISABLED event, so the raw spin
+    // never exits — and with no `.await` it starves the whole cooperative executor
+    // (observed as a total recon-mode hang the moment a survey's conn_event timed
+    // out on a dead peer and called cleanup_radio). wait_disabled() caps the poll.
+    let _ = wait_disabled();
     r.events_disabled().write_value(0);
 }
 
@@ -1624,15 +2136,17 @@ pub(crate) fn log_notification(att: &[u8]) -> bool {
 /// response arrives, copying its bytes into `resp`. Returns the ATT payload
 /// length, or `None` on link loss / timeout. Retransmits the request until the
 /// peer acknowledges it, then sends empty PDUs while awaiting the response.
+/// ATT request/response with the default event budget.
 async fn att_txn(conn: &mut Conn, req: &[u8], resp: &mut [u8]) -> Option<usize> {
+    att_txn_within(conn, req, resp, MAX_EVENTS_PER_TXN).await
+}
+
+/// ATT request/response, giving up after `max_events` connection events. Callers
+/// that can proceed without an answer (Exchange MTU is optional) pass a short
+/// budget so a silent peer costs a fraction of a second instead of ~1.9 s.
+async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events: u32) -> Option<usize> {
     let mut sent = false; // request acknowledged by the peer's link layer
     let mut miss = 0u32;
-    // Events waited since the request was last acknowledged, and how many times it
-    // has been re-sent. See [`ATT_RETRY_EVENTS`]: an LL ack is not proof the ATT
-    // server saw the request, so a silent peer gets the request again rather than
-    // burning the whole budget on one attempt.
-    let mut waited = 0u32;
-    let mut retries = 0u32;
     // The one response opcode that answers `req`. Everything else arriving on
     // CID 0x0004 is the peer acting as a client on the same bearer.
     let want = req[0].wrapping_add(1);
@@ -1641,20 +2155,14 @@ async fn att_txn(conn: &mut Conn, req: &[u8], resp: &mut [u8]) -> Option<usize> 
     let mut owed: Option<([u8; 5], usize)> = None;
     let mut asm = Reasm::new();
 
-    for _ in 0..MAX_EVENTS_PER_TXN {
-        // Re-arm the request if it was acked but never answered. Only while we owe
-        // the peer nothing: clearing a debt is what unblocks its answer, so a
-        // pending `owed` must not be pre-empted by our own retransmission.
-        if sent && owed.is_none() {
-            waited += 1;
-            if waited >= ATT_RETRY_EVENTS {
-                sent = false;
-                waited = 0;
-                retries += 1;
-                ulogf!("  ATT 0x{:02X} no response in {} events — resend #{}\r\n",
-                    req[0], ATT_RETRY_EVENTS, retries);
-            }
-        }
+    for _ in 0..max_events {
+        // ATT is strictly sequential: at most one request may be outstanding on a
+        // bearer at a time. We therefore never re-send `req` mid-transaction — a
+        // duplicate request makes a slow peer answer twice, and the second (orphan)
+        // response, carrying the same opcode, is picked up by the *next* transaction
+        // as its answer, corrupting characteristic discovery. A request that goes
+        // unanswered simply exhausts the budget and returns `None`; retries that
+        // need a fresh attempt live one layer up (e.g. the handshake's `resend_await`).
         let tx_len = match (&owed, sent) {
             // Clear the debt first: the peer will not answer us while its own
             // request is outstanding, so our reply unblocks both directions.
@@ -1764,7 +2272,7 @@ async fn att_txn(conn: &mut Conn, req: &[u8], resp: &mut [u8]) -> Option<usize> 
 /// Nothing is requested here; this exists because a CCCD write only takes effect
 /// for as long as the link lives, so a subscription with no listening period
 /// after it produces no data at all.
-async fn listen_notifications(conn: &mut Conn, events: u32) {
+pub(crate) async fn listen_notifications(conn: &mut Conn, events: u32) {
     let mut asm = Reasm::new();
     let mut owed: Option<([u8; 5], usize)> = None;
     let mut miss = 0u32;
@@ -1963,47 +2471,6 @@ pub(crate) fn handle_ll_control(payload: &[u8]) {
 
 // ── GATT decode (this module owns it) ─────────────────────────────────────────
 
-/// If `uuid_le` (little-endian, on-air order) is a 16-bit UUID widened to the
-/// Bluetooth base UUID `0000xxxx-0000-1000-8000-00805F9B34FB`, return the 16-bit
-/// value. `None` for a genuinely 128-bit (vendor) UUID.
-fn base_uuid_16(uuid_le: &[u8]) -> Option<u16> {
-    // The base UUID in on-air (little-endian) order, with the two 16-bit-value
-    // bytes at [12..14] left out and the top two bytes at [14..16] zero.
-    const BASE_LE: [u8; 12] =
-        [0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00];
-    if uuid_le.len() == 16 && uuid_le[..12] == BASE_LE && uuid_le[14] == 0 && uuid_le[15] == 0 {
-        Some(u16::from_le_bytes([uuid_le[12], uuid_le[13]]))
-    } else {
-        None
-    }
-}
-
-/// Name for a well-known 16-bit GATT UUID: declarations, descriptors, services
-/// and characteristics.
-///
-/// This used to be a hand-picked shortlist of ~35 UUIDs, so a discovery on any
-/// device outside it printed bare numbers. The shared `decoder::uuid_name`
-/// table is built from the SIG's own `uuids/*.yaml` and now carries the
-/// declaration, descriptor and characteristic lists alongside the service ones
-/// — about 1,100 names, refreshed by `scripts/refresh_data.py`. It is read from
-/// the external-flash asset image, so names need a provisioned device.
-fn gatt_uuid16_name(u: u16) -> Option<&'static str> {
-    // U-tec / ULTRALOQ vendor GATT UUIDs (0x72xx range, sent as the Bluetooth
-    // base-UUID short form). These are not SIG-assigned, so they are named here
-    // before the SIG table. Which key characteristic a lock exposes even reveals
-    // its auth handshake (static vs MD5 vs ECC). UUIDs from the utecio library:
-    // https://github.com/inventor7777/ultraloq-ble-ha
-    let vendor = match u {
-        0x7200 => Some("U-tec Lock"),
-        0x7201 => Some("U-tec Data"),
-        0x7220 => Some("U-tec Key (static)"),
-        0x7221 => Some("U-tec Key (ECC)"),
-        0x7223 => Some("U-tec Key (MD5)"),
-        _ => None,
-    };
-    vendor.or_else(|| crate::decoder::uuid_name(u))
-}
-
 /// Decodes the characteristic-properties bitfield (from a 0x2803 declaration).
 fn char_props(props: u8, out: &mut heapless::String<48>) {
     use core::fmt::Write;
@@ -2171,17 +2638,16 @@ fn exchange_mtu_rsp() -> ([u8; 5], usize) {
 /// Negotiates a larger ATT MTU as the first transaction on the bearer, so a full
 /// characteristic value fits in one Read Response. Best-effort: on a peer that
 /// declines, errors, or never answers, the link keeps [`ATT_MTU_DEFAULT`].
-async fn exchange_mtu(conn: &mut Conn) {
+pub(crate) async fn exchange_mtu(conn: &mut Conn) {
     let m = ATT_MTU_MAX as u16;
     let req = [0x02, (m & 0xFF) as u8, (m >> 8) as u8];
     let mut resp = [0u8; ATT_MTU_MAX];
     // One uniform line whatever the outcome: `mtu = <settled value> (<result>)`.
     // The settled value is what every read below will use, so it leads; the
-    // parenthetical says how we got there. Silence still costs up to
-    // MAX_EVENTS_PER_TXN events before the bearer moves on, so it earns a line —
-    // an enumeration running at ATT_MTU_DEFAULT looks identical to one that never
-    // asked.
-    let Some(n) = att_txn(conn, &req, &mut resp).await else {
+    // parenthetical says how we got there. Exchange MTU is optional, so it runs on
+    // a short budget ([`MTU_EVENTS`]) — a peer that ignores it costs ~0.5 s, not the
+    // full ~1.9 s, before discovery proceeds at ATT_MTU_DEFAULT.
+    let Some(n) = att_txn_within(conn, &req, &mut resp, MTU_EVENTS).await else {
         ulogf!("  mtu = {} (unanswered)\r\n", conn.att_mtu);
         return;
     };
@@ -2198,123 +2664,28 @@ async fn exchange_mtu(conn: &mut Conn) {
 }
 
 #[derive(Clone, Copy)]
-struct Service {
-    start: u16,
-    end: u16,
+pub(crate) struct Service {
+    pub(crate) start: u16,
+    pub(crate) end: u16,
     /// The service UUID as it appeared on air (little-endian, 2 or 16 bytes),
     /// kept so the service header can be printed grouped with its characteristics
     /// rather than at discovery time.
-    uuid: [u8; 16],
-    uuid_len: u8,
+    pub(crate) uuid: [u8; 16],
+    pub(crate) uuid_len: u8,
 }
 
 #[derive(Clone, Copy)]
-struct Characteristic {
-    decl_handle: u16,
-    value_handle: u16,
-    props: u8,
+pub(crate) struct Characteristic {
+    pub(crate) decl_handle: u16,
+    pub(crate) value_handle: u16,
+    pub(crate) props: u8,
     /// The characteristic's 16-bit SIG UUID, or `None` for a 128-bit UUID. Lets
     /// `read_value` recognize well-known values (e.g. Current Time) to decode.
-    uuid16: Option<u16>,
+    pub(crate) uuid16: Option<u16>,
     /// The full UUID on air (little-endian, 2 or 16 bytes), kept so the
     /// characteristic can be printed grouped with its value and descriptors.
-    uuid: [u8; 16],
-    uuid_len: u8,
-}
-
-/// Formats a UUID (16-bit or 128-bit) plus any known name into a log fragment.
-fn write_uuid(s: &mut decoder::LogStr, uuid_le: &[u8]) {
-    use core::fmt::Write;
-    if uuid_le.len() == 2 {
-        let u = u16::from_le_bytes([uuid_le[0], uuid_le[1]]);
-        let _ = write!(s, "0x{:04X}", u);
-        if let Some(n) = gatt_uuid16_name(u) {
-            let _ = write!(s, " ({})", n);
-        }
-    } else if let Some(u) = base_uuid_16(uuid_le) {
-        // A 16-bit UUID a peer widened to the full Bluetooth base UUID; show and
-        // name it as the 16-bit it really is rather than 32 hex digits.
-        let _ = write!(s, "0x{:04X}", u);
-        if let Some(n) = gatt_uuid16_name(u) {
-            let _ = write!(s, " ({})", n);
-        }
-    } else {
-        // 128-bit UUID, big-endian display.
-        let _ = s.push_str("0x");
-        for b in uuid_le.iter().rev() {
-            let _ = write!(s, "{:02X}", b);
-        }
-        // Name the well-known Apple vendor UUIDs. The on-air bytes are
-        // little-endian; reverse them to the display (big-endian) order the table
-        // is written in, then look up.
-        if uuid_le.len() == 16 {
-            let mut be = [0u8; 16];
-            for (i, b) in uuid_le.iter().rev().enumerate() {
-                be[i] = *b;
-            }
-            if let Some(n) = gatt_uuid128_name(&be) {
-                let _ = write!(s, " ({})", n);
-            }
-        }
-    }
-}
-
-/// Name for a well-known 128-bit GATT UUID, given in display (big-endian) order.
-///
-/// Apple's ANCS and AMS service/characteristic UUIDs are from Apple's published
-/// specifications (Apple Notification Center Service / Apple Media Service). The
-/// Continuity and Nearby UUIDs are from community reverse-engineering and appear
-/// in this firmware's own captures of an Apple Watch. `None` for anything else,
-/// which then prints as the raw 128-bit value.
-fn gatt_uuid128_name(uuid_be: &[u8; 16]) -> Option<&'static str> {
-    const T: &[(&str, [u8; 16])] = &[
-        ("Apple ANCS", [0x79, 0x05, 0xF4, 0x31, 0xB5, 0xCE, 0x4E, 0x99,
-                        0xA4, 0x0F, 0x4B, 0x1E, 0x12, 0x2D, 0x00, 0xD0]),
-        ("ANCS Notification Source", [0x9F, 0xBF, 0x12, 0x0D, 0x63, 0x01, 0x42, 0xD9,
-                                      0x8C, 0x58, 0x25, 0xE6, 0x99, 0xA2, 0x1D, 0xBD]),
-        ("ANCS Control Point", [0x69, 0xD1, 0xD8, 0xF3, 0x45, 0xE1, 0x49, 0xA8,
-                                0x98, 0x21, 0x9B, 0xBD, 0xFD, 0xAA, 0xD9, 0xD9]),
-        ("ANCS Data Source", [0x22, 0xEA, 0xC6, 0xE9, 0x24, 0xD6, 0x4B, 0xB5,
-                              0xBE, 0x44, 0xB3, 0x6A, 0xCE, 0x7C, 0x7B, 0xFB]),
-        ("Apple AMS", [0x89, 0xD3, 0x50, 0x2B, 0x0F, 0x36, 0x43, 0x3A,
-                       0x8E, 0xF4, 0xC5, 0x02, 0xAD, 0x55, 0xF8, 0xDC]),
-        ("AMS Remote Command", [0x9B, 0x3C, 0x81, 0xD8, 0x57, 0xB1, 0x4A, 0x8A,
-                                0xB8, 0xDF, 0x0E, 0x56, 0xF7, 0xCA, 0x51, 0xC2]),
-        ("AMS Entity Update", [0x2F, 0x7C, 0xAB, 0xCE, 0x80, 0x8D, 0x41, 0x1F,
-                               0x9A, 0x0C, 0xBB, 0x92, 0xBA, 0x96, 0xC1, 0x02]),
-        ("AMS Entity Attribute", [0xC6, 0xB2, 0xF3, 0x8C, 0x23, 0xAB, 0x46, 0xD8,
-                                  0xA6, 0xAB, 0xA3, 0xA8, 0x70, 0xBB, 0xD5, 0xD7]),
-        ("Apple Continuity", [0xD0, 0x61, 0x1E, 0x78, 0xBB, 0xB4, 0x45, 0x91,
-                              0xA5, 0xF8, 0x48, 0x79, 0x10, 0xAE, 0x43, 0x66]),
-        ("Apple Continuity char", [0x86, 0x67, 0x55, 0x6C, 0x9A, 0x37, 0x4C, 0x91,
-                                   0x84, 0xED, 0x54, 0xEE, 0x27, 0xD9, 0x00, 0x49]),
-        ("Apple Nearby", [0x9F, 0xA4, 0x80, 0xE0, 0x49, 0x67, 0x45, 0x42,
-                          0x93, 0x90, 0xD3, 0x43, 0xDC, 0x5D, 0x04, 0xAE]),
-        ("Apple Nearby char", [0xAF, 0x0B, 0xAD, 0xB1, 0x5B, 0x99, 0x43, 0xCD,
-                               0x91, 0x7A, 0xA7, 0x7B, 0xC5, 0x49, 0xE3, 0xCC]),
-        // Daikin Madoka (BRC1H) — 2141e1XX-213a-11e6-b67b-9e71128cae77. The two
-        // services and their characteristics differ only in the fourth byte.
-        ("Daikin Firmware-Mgmt", [0x21, 0x41, 0xE1, 0x00, 0x21, 0x3A, 0x11, 0xE6,
-                                  0xB6, 0x7B, 0x9E, 0x71, 0x12, 0x8C, 0xAE, 0x77]),
-        ("Daikin Firmware-Mgmt notify", [0x21, 0x41, 0xE1, 0x01, 0x21, 0x3A, 0x11, 0xE6,
-                                         0xB6, 0x7B, 0x9E, 0x71, 0x12, 0x8C, 0xAE, 0x77]),
-        ("Daikin Firmware-Mgmt write", [0x21, 0x41, 0xE1, 0x02, 0x21, 0x3A, 0x11, 0xE6,
-                                        0xB6, 0x7B, 0x9E, 0x71, 0x12, 0x8C, 0xAE, 0x77]),
-        ("Daikin Firmware-Mgmt notify2", [0x21, 0x41, 0xE1, 0x03, 0x21, 0x3A, 0x11, 0xE6,
-                                          0xB6, 0x7B, 0x9E, 0x71, 0x12, 0x8C, 0xAE, 0x77]),
-        ("Daikin AC-Mgmt", [0x21, 0x41, 0xE1, 0x10, 0x21, 0x3A, 0x11, 0xE6,
-                            0xB6, 0x7B, 0x9E, 0x71, 0x12, 0x8C, 0xAE, 0x77]),
-        ("Daikin AC-Mgmt notify (RX)", [0x21, 0x41, 0xE1, 0x11, 0x21, 0x3A, 0x11, 0xE6,
-                                        0xB6, 0x7B, 0x9E, 0x71, 0x12, 0x8C, 0xAE, 0x77]),
-        ("Daikin AC-Mgmt write (TX)", [0x21, 0x41, 0xE1, 0x12, 0x21, 0x3A, 0x11, 0xE6,
-                                       0xB6, 0x7B, 0x9E, 0x71, 0x12, 0x8C, 0xAE, 0x77]),
-    ];
-    for (name, u) in T {
-        if u == uuid_be {
-            return Some(name);
-        }
-    }
-    None
+    pub(crate) uuid: [u8; 16],
+    pub(crate) uuid_len: u8,
 }
 
 // ── GATT walk ─────────────────────────────────────────────────────────────────
@@ -2322,7 +2693,7 @@ fn gatt_uuid128_name(uuid_be: &[u8; 16]) -> Option<&'static str> {
 /// Discovers all primary services (Read By Group Type, UUID 0x2800), collecting
 /// them into `services`. Each service is printed later by [`enumerate`], grouped
 /// above the characteristics it contains.
-async fn discover_services(conn: &mut Conn, services: &mut Vec<Service, MAX_SERVICES>) {
+pub(crate) async fn discover_services(conn: &mut Conn, services: &mut Vec<Service, MAX_SERVICES>) {
     let mut start: u16 = 0x0001;
     loop {
         let req = [
@@ -2382,7 +2753,7 @@ async fn discover_services(conn: &mut Conn, services: &mut Vec<Service, MAX_SERV
 /// Discovers the characteristics of one service (Read By Type, UUID 0x2803),
 /// collecting them for the caller to print, read and subscribe. Each is printed
 /// later by [`enumerate`], grouped under its service.
-async fn discover_characteristics(
+pub(crate) async fn discover_characteristics(
     conn: &mut Conn,
     svc: &Service,
     chars: &mut Vec<Characteristic, MAX_CHARS_PER_SVC>,
@@ -2441,7 +2812,7 @@ async fn discover_characteristics(
 ///
 /// Returns the handle of this characteristic's CCCD (`0x2902`) if it has one, so
 /// the caller can subscribe. There is at most one per characteristic.
-async fn discover_descriptors(conn: &mut Conn, from: u16, to: u16) -> Option<u16> {
+pub(crate) async fn discover_descriptors(conn: &mut Conn, from: u16, to: u16) -> Option<u16> {
     let mut cccd = None;
     if from > to {
         return None;
@@ -2474,7 +2845,7 @@ async fn discover_descriptors(conn: &mut Conn, from: u16, to: u16) -> Option<u16
             let mut s = decoder::LogStr::new();
             use core::fmt::Write;
             let _ = write!(s, "        - dsc h={:04X} ", h);
-            write_uuid(&mut s, uuid);
+            decoder::gatt::write_uuid(&mut s, uuid);
             decoder::emit(s);
             last = h;
         }
@@ -2492,7 +2863,7 @@ async fn discover_descriptors(conn: &mut Conn, from: u16, to: u16) -> Option<u16
 /// Returns true if the subscription was accepted. Most failures are
 /// `insufficient-authentication` (0x05) — the same gate that blocks reads of
 /// encrypted attributes, since a CCCD write is a write to the peer's database.
-async fn subscribe(conn: &mut Conn, cccd: u16, props: u8) -> bool {
+pub(crate) async fn subscribe(conn: &mut Conn, cccd: u16, props: u8) -> bool {
     // Prefer notification when the characteristic offers both: an indication
     // costs a confirmation round-trip per value and carries no extra data.
     let val: u16 = if props & 0x10 != 0 { 0x0001 } else { 0x0002 };
@@ -2523,187 +2894,6 @@ async fn subscribe(conn: &mut Conn, cccd: u16, props: u8) -> bool {
 
 /// Reads a characteristic value (ATT Read Request) and prints it (hex + ASCII),
 /// or the ATT error the peer returned.
-/// Bluetooth "Day of Week" code (1 = Monday … 7 = Sunday, 0 = unknown) → label.
-fn dow_name(d: u8) -> &'static str {
-    match d {
-        1 => "Mon",
-        2 => "Tue",
-        3 => "Wed",
-        4 => "Thu",
-        5 => "Fri",
-        6 => "Sat",
-        7 => "Sun",
-        _ => "?",
-    }
-}
-
-/// A broken-down wall-clock decoded from a Current Time / Date Time value.
-struct WallTime {
-    year: u16,
-    month: u8,
-    day: u8,
-    hour: u8,
-    min: u8,
-    sec: u8,
-    /// Day-of-week code (0 = unknown, 1 = Monday … 7 = Sunday); 0 if absent.
-    dow: u8,
-    /// Current Time adjust-reason bitfield; 0 if absent.
-    adj: u8,
-    /// Unix epoch seconds for the fields above.
-    epoch: u32,
-}
-
-/// Decode the 7-byte Date Time prefix shared by Current Time (0x2A2B), Exact
-/// Time 256 (0x2A0C) and Date Time (0x2A08), plus the day-of-week / adjust-reason
-/// bytes where present — but only when the value passes a plausibility gate (so a
-/// garbage read never anchors a bogus clock). `None` for any other characteristic
-/// or an implausible value.
-fn decode_time(uuid16: u16, v: &[u8]) -> Option<WallTime> {
-    if !matches!(uuid16, 0x2A2B | 0x2A0C | 0x2A08) || v.len() < 7 {
-        return None;
-    }
-    let year = u16::from_le_bytes([v[0], v[1]]);
-    let (month, day, hour, min, sec) = (v[2], v[3], v[4], v[5], v[6]);
-    if !(2000..=2100).contains(&year)
-        || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour >= 24
-        || min >= 60
-        || sec >= 60
-    {
-        return None;
-    }
-    Some(WallTime {
-        year,
-        month,
-        day,
-        hour,
-        min,
-        sec,
-        dow: if v.len() >= 8 { v[7] } else { 0 },
-        // adjust_reason is the trailing byte of Current Time only (index 9).
-        adj: if uuid16 == 0x2A2B && v.len() >= 10 { v[9] } else { 0 },
-        epoch: crate::wallclock::to_epoch(year, month, day, hour, min, sec),
-    })
-}
-
-/// Name for a high-prevalence USB Implementer's Forum vendor id, as carried by a
-/// PnP ID (0x2A50) with source 0x02. USB VIDs are a registry separate from the
-/// SIG Company Identifiers, so [`decoder::company_name`] cannot name them; this
-/// is a curated set of the consumer vendors that actually appear on BLE
-/// peripherals (Sony, Telink and Microsoft were all seen with src=0x02 in
-/// captures). `None` for anything outside the set — the raw VID still prints.
-fn usb_vid_name(vid: u16) -> Option<&'static str> {
-    Some(match vid {
-        0x05AC => "Apple",
-        0x04E8 => "Samsung",
-        0x18D1 => "Google",
-        0x054C => "Sony",
-        0x045E => "Microsoft",
-        0x05A7 => "Bose",
-        0x046D => "Logitech",
-        0x1915 => "Nordic Semiconductor",
-        0x091E => "Garmin",
-        0x057E => "Nintendo",
-        0x2717 => "Xiaomi",
-        0x248A => "Telink Semiconductor",
-        0x0A12 => "Cambridge Silicon Radio",
-        0x0BDA => "Realtek",
-        0x8087 => "Intel",
-        0x22B8 => "Motorola",
-        0x0BB4 => "HTC",
-        0x1949 => "Amazon",
-        _ => return None,
-    })
-}
-
-/// Decode a small set of well-known SIG characteristic values into a readable
-/// one-line form, returning the decoded line and the number of leading bytes it
-/// consumed — so the caller hex-dumps only whatever trails the decoded fields.
-/// `None` for anything not specifically handled (the caller then dumps the whole
-/// value). Time characteristics are handled separately by [`decode_time`], which
-/// also anchors the wall-clock.
-fn decode_known_value(uuid16: u16, v: &[u8]) -> Option<(decoder::LogStr, usize)> {
-    use core::fmt::Write;
-    let mut s = decoder::LogStr::new();
-    let consumed = match uuid16 {
-        // Device Name + Device Information Service strings: UTF-8, NUL-trimmed.
-        // The whole value is the string (trailing NULs are padding, not data),
-        // so nothing is left to dump.
-        0x2A00 | 0x2A24 | 0x2A25 | 0x2A26 | 0x2A27 | 0x2A28 | 0x2A29 => {
-            let end = v.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-            let text = core::str::from_utf8(&v[..end]).ok()?;
-            let _ = write!(s, "        = \"{}\"", text);
-            v.len()
-        }
-        // Battery Level: one byte, percent.
-        0x2A19 if !v.is_empty() => {
-            let _ = write!(s, "        = {}%", v[0]);
-            1
-        }
-        // Appearance: 16-bit GAP category.
-        0x2A01 if v.len() >= 2 => {
-            let a = u16::from_le_bytes([v[0], v[1]]);
-            let _ = write!(s, "        = appearance 0x{:04X} ({})", a, decoder::appearance_name(a));
-            2
-        }
-        // Peripheral Preferred Connection Parameters: 4× u16 (interval unit
-        // 1.25 ms, timeout unit 10 ms).
-        0x2A04 if v.len() >= 8 => {
-            let mn = u16::from_le_bytes([v[0], v[1]]) as u32 * 5 / 4;
-            let mx = u16::from_le_bytes([v[2], v[3]]) as u32 * 5 / 4;
-            let lat = u16::from_le_bytes([v[4], v[5]]);
-            let to = u16::from_le_bytes([v[6], v[7]]) as u32 * 10;
-            let _ = write!(s, "        = conn {}-{}ms latency={} timeout={}ms", mn, mx, lat, to);
-            8
-        }
-        // PnP ID: source(1) + vendor(2) + product(2) + version(2). Source 0x01
-        // means the vendor id is a SIG Company Identifier.
-        0x2A50 if v.len() >= 7 => {
-            let src = v[0];
-            let vid = u16::from_le_bytes([v[1], v[2]]);
-            let pid = u16::from_le_bytes([v[3], v[4]]);
-            let ver = u16::from_le_bytes([v[5], v[6]]);
-            let _ = write!(s, "        = pnp src={} vid=0x{:04X}", src, vid);
-            // src 0x01 = Bluetooth SIG Company ID; src 0x02 = USB-IF Vendor ID.
-            // The USB form is common in the wild (Sony/Telink/MS seen in captures)
-            // and needs its own table — the SIG company DB doesn't cover USB VIDs.
-            let vendor = match src {
-                0x01 => decoder::company_name(vid),
-                0x02 => usb_vid_name(vid),
-                _ => None,
-            };
-            if let Some(name) = vendor {
-                let _ = write!(s, " ({})", name);
-            }
-            let _ = write!(s, " pid=0x{:04X} ver=0x{:04X}", pid, ver);
-            7
-        }
-        // System ID: 40-bit manufacturer id (v[0..5]) + 24-bit OUI (v[5..8]),
-        // each least-significant octet first.
-        0x2A23 if v.len() >= 8 => {
-            let oui = (v[7] as u32) << 16 | (v[6] as u32) << 8 | v[5] as u32;
-            let _ = write!(s, "        = systemid oui={:06X}", oui);
-            if let Some(name) = decoder::oui_vendor(oui, None) {
-                let _ = write!(s, " ({})", name);
-            }
-            8
-        }
-        // Database Hash: 128-bit AES-CMAC over the peer's attribute table (GATT
-        // caching, BLE 5.1+). Opaque, but a stable fingerprint of the GATT layout
-        // — render it as one hash line instead of a hexdump.
-        0x2B2A if v.len() == 16 => {
-            let _ = s.push_str("        = db-hash ");
-            for b in v {
-                let _ = write!(s, "{:02X}", b);
-            }
-            16
-        }
-        _ => return None,
-    };
-    Some((s, consumed))
-}
-
 async fn read_value(conn: &mut Conn, ch: &Characteristic) {
     let h = ch.value_handle;
     let req = [ATT_READ_REQ, (h & 0xFF) as u8, (h >> 8) as u8];
@@ -2791,21 +2981,24 @@ async fn read_value(conn: &mut Conn, ch: &Characteristic) {
     // switches from uptime to UTC.
     let mut consumed = 0usize;
     if let Some(u) = ch.uuid16 {
-        if let Some(t) = decode_time(u, value) {
+        if let Some(t) = decoder::gatt::decode_time(u, value) {
             crate::wallclock::anchor(t.epoch, Instant::now());
             let mut ln = decoder::LogStr::new();
-            use core::fmt::Write;
-            let _ = write!(
-                ln,
-                "        walltime: {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z src=0x{:04X} dow={} adj=0x{:02X}",
-                t.year, t.month, t.day, t.hour, t.min, t.sec, u, dow_name(t.dow), t.adj
-            );
+            decoder::gatt::format_walltime(&t, u, &mut ln);
             decoder::emit(ln);
             consumed = value.len();
-        } else if let Some((ln, used)) = decode_known_value(u, value) {
+        } else if let Some((ln, used)) = decoder::gatt::known_value(u, value) {
             decoder::emit(ln);
             consumed = used.min(value.len());
         }
+    }
+    // 128-bit known values (e.g. Android Information Service API level).
+    if consumed == 0
+        && ch.uuid_len == 16
+        && let Some((ln, used)) = decoder::gatt::known_value_128(&ch.uuid, value)
+    {
+        decoder::emit(ln);
+        consumed = used.min(value.len());
     }
     if consumed < value.len() {
         decoder::hexdump(&value[consumed..], consumed, 8);
@@ -2831,7 +3024,7 @@ async fn read_value(conn: &mut Conn, ch: &Characteristic) {
 /// control profile) without this shared walk knowing any device's protocol.
 pub(crate) async fn enumerate(
     conn: &mut Conn,
-    mut on_char: impl FnMut(u16, &[u8]),
+    on_char: impl FnMut(u16, &[u8]),
 ) -> usize {
     // Raise the MTU first so a full characteristic value fits in one Read
     // Response; every read below then benefits from the negotiated size.
@@ -2842,15 +3035,33 @@ pub(crate) async fn enumerate(
     // line no longer repeats it.
     ulogf!("  services = {}\r\n", services.len());
 
+    let subscribed = walk_services(conn, &services, on_char).await;
+
+    if subscribed > 0 {
+        ulogf!("  listening on {} subscription(s)\r\n", subscribed);
+        listen_notifications(conn, LISTEN_EVENTS).await;
+    }
+    services.len()
+}
+
+/// Walk each already-discovered service: list its characteristics, read readable
+/// values, discover descriptors, and subscribe to notifiables. Returns the number
+/// of subscriptions written. Split out of [`enumerate`] so a caller that must act
+/// between service discovery and the full walk (the Midea handshake runs on the
+/// fresh link before this heavier pass) can drive the same walk itself.
+pub(crate) async fn walk_services(
+    conn: &mut Conn,
+    services: &[Service],
+    mut on_char: impl FnMut(u16, &[u8]),
+) -> u32 {
     let mut subscribed = 0u32;
-    for si in 0..services.len() {
-        let svc = services[si];
+    for &svc in services {
         // Service header (list item), printed grouped above its characteristics.
         {
             let mut s = decoder::LogStr::new();
             use core::fmt::Write;
             let _ = write!(s, "  - svc [{:04X}-{:04X}] ", svc.start, svc.end);
-            write_uuid(&mut s, &svc.uuid[..svc.uuid_len as usize]);
+            decoder::gatt::write_uuid(&mut s, &svc.uuid[..svc.uuid_len as usize]);
             decoder::emit(s);
         }
 
@@ -2871,7 +3082,7 @@ pub(crate) async fn enumerate(
                 char_props(ch.props, &mut pf);
                 let _ = write!(s, "    - chr h={:04X} val={:04X} [{}] ",
                     ch.decl_handle, ch.value_handle, pf);
-                write_uuid(&mut s, &ch.uuid[..ch.uuid_len as usize]);
+                decoder::gatt::write_uuid(&mut s, &ch.uuid[..ch.uuid_len as usize]);
                 decoder::emit(s);
             }
 
@@ -2901,12 +3112,7 @@ pub(crate) async fn enumerate(
             }
         }
     }
-
-    if subscribed > 0 {
-        ulogf!("  listening on {} subscription(s)\r\n", subscribed);
-        listen_notifications(conn, LISTEN_EVENTS).await;
-    }
-    services.len()
+    subscribed
 }
 
 // ── Teardown ──────────────────────────────────────────────────────────────────

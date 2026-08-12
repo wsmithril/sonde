@@ -243,6 +243,12 @@ pub fn configure_ble() {
     });
     r.crcpoly().write(|w| w.set_crcpoly(ADV_CRC_POLY));
     r.crcinit().write(|w| w.set_crcinit(ADV_CRC_INIT));
+    // Maximum TX power (+8 dBm). Boosts what we transmit — CONNECT_IND and
+    // connection-event packets reach weaker/more distant peers, so more links form
+    // and hold. It does NOT change the RSSI we *receive* (that is the peer's TX).
+    // Passive sniffing never transmits, so this is harmless there. TXPOWER persists
+    // across DISABLE, so setting it in the base config covers every mode.
+    r.txpower().write(|w| w.set_txpower(vals::Txpower::Pos8dBm));
 }
 
 // ── IEEE 802.15.4 ─────────────────────────────────────────────────────────────

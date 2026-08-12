@@ -402,7 +402,7 @@ fn disable_radio() {
     let r = pac::RADIO;
     r.shorts().write(|_w| {});
     r.tasks_disable().write_value(1);
-    while r.events_disabled().read() == 0 {}
+    let _ = crate::hal::radio::wait_disabled();
     r.events_disabled().write_value(0);
 }
 
@@ -1064,7 +1064,7 @@ fn cleanup_radio() {
     let r = pac::RADIO;
     r.shorts().write(|_w| {});
     r.tasks_disable().write_value(1);
-    while r.events_disabled().read() == 0 {}
+    let _ = crate::hal::radio::wait_disabled();
     r.events_disabled().write_value(0);
     // Release the TIMER1+PPI one-shot that armed this event's RXEN. The compare
     // has already fired and stopped the timer by now; this only disables the PPI

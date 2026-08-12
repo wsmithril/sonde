@@ -295,7 +295,7 @@ async fn indicate(mode: BootMode) {
         BootMode::GattEnum => led::RED,
         BootMode::ConnFollow => led::WHITE,
         BootMode::ZigbeeSniff => led::CYAN,
-        BootMode::MideaCtl => led::MAGENTA,
+        BootMode::Recon => led::MAGENTA,
     });
     embassy_time::Timer::after_millis(1000).await;
     leds.set(led::OFF);
@@ -372,6 +372,6 @@ async fn main(spawner: Spawner) {
         BootMode::GattEnum => spawner.spawn(callback::gatt::run(spawner, qspi(), leds()).unwrap()),
         BootMode::ConnFollow => spawner.spawn(callback::conn_follow::run(spawner, qspi(), leds()).unwrap()),
         BootMode::ZigbeeSniff => spawner.spawn(callback::zigbee::run(spawner, leds()).unwrap()),
-        BootMode::MideaCtl => spawner.spawn(callback::midea::run(spawner, qspi(), leds()).unwrap()),
+        BootMode::Recon => spawner.spawn(callback::recon::run(spawner, qspi(), leds()).unwrap()),
     }
 }

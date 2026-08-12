@@ -11,6 +11,9 @@
 pub mod asset;
 /// Advertising-payload deep decoders, dispatched by Company ID / service UUID.
 mod advert;
+/// GATT attribute decoding (UUID names, characteristic values, vendor transports),
+/// used by the connection role in [`crate::central`].
+pub mod gatt;
 /// Link-layer and L2CAP-borne protocol decoders for connected links.
 pub mod protocol;
 
