@@ -48,15 +48,73 @@ use crate::{Rng, decoder, device, led};
 const TABLE_MAX: usize = 128;
 /// Distinct devices a single scan window tracks before folding into the table.
 const SCAN_MAX: usize = 64;
-/// Listen for adverts this long each cycle.
-const SCAN_WINDOW_MS: u64 = 5_000;
-/// Don't re-probe a device probed within this window.
-const PROBE_COOLDOWN_MS: u64 = 15 * 60 * 1000;
-/// Maximum time to listen for subscriptions / status after enumerating.
-const LISTEN_SECS: u64 = 5;
-/// Minimum gap between advert-liveness LED winks — rate-limits the per-advert
-/// flash so it reads as a ~4 Hz heartbeat, not an invisible blur.
+/// Minimum gap between advert-liveness LED winks (rate-limit for the per-advert
+/// flash so it reads as a ~4 Hz heartbeat, not an invisible blur).
 const ADV_FLASH_MS: u64 = 250;
+
+/// Tuning knobs that differ between the two operating modes.
+struct ReconParams {
+    /// How long to listen for adverts each cycle.
+    scan_window_ms: u64,
+    /// Stop scanning and connect the moment a qualifying Midea advert is seen
+    /// (interrupt-driven). When `false`, the full `scan_window_ms` always elapses
+    /// before the first connection attempt.
+    interrupt_on_midea: bool,
+    /// Ignore candidates with RSSI below this threshold. On-the-go, a weak signal
+    /// means the device will be out of range before the probe completes; sit-still
+    /// can afford to try marginal signals because the device is not moving.
+    rssi_floor: i16,
+    /// After a completed probe, keep the device out of the candidate pool for this
+    /// long. Shorter on-the-go (the device will be gone anyway; if it reappears,
+    /// re-probe sooner).
+    cooldown_ms: u64,
+    /// Maximum time to listen for subscriptions / decrypted status after a probe.
+    /// Adaptive early-exit (first status frame) still applies; this is the cap.
+    listen_secs: u64,
+    /// When `true`, walk every GATT service after the handshake for the full data-
+    /// collection log. When `false`, skip the walk — the credential and one status
+    /// frame are enough for on-the-go. The walk is the largest single time sink.
+    full_walk: bool,
+}
+
+/// Stationary data-collection. Devices come and go at leisure; missing one is not
+/// catastrophic because it may reappear. Full GATT walk is desirable for the log.
+const SIT_STILL: ReconParams = ReconParams {
+    scan_window_ms: 5_000,
+    interrupt_on_midea: false,
+    rssi_floor: -100, // accept everything in range
+    cooldown_ms: 15 * 60 * 1000,
+    listen_secs: 5,
+    full_walk: true,
+};
+
+/// Mobile data-collection. Devices pass by with ~30 s windows; maximise the
+/// probability of getting the credential before the peer leaves range. No full walk
+/// — the handshake + one status frame is the goal.
+///
+/// Params tuned from the 2026-08-12T18:06:05 midea log (9 435 s, 166 attempts):
+///   scan→connect latency median ~300 ms → 1 500 ms gives 4+ advert-channel sweeps
+///   before interrupt fires (or the window ends).
+///   RSSI floor −82: ev_addr=0 (bidirectional failure) clusters at −78 to −90 with
+///   no clean separator, but failures below −82 outnumber successes ~3:1; cutting
+///   there avoids the worst tail without missing too many genuine close devices.
+///   Cooldown 3 min: walking at ~1 m/s covers 180 m in 3 min; device is gone anyway.
+///   Listen 2 s: adaptive early-exit fires on first status frame (usually <1 s once
+///   the handshake bug is fixed); 2 s is the cap so we don't linger.
+#[allow(dead_code)]
+const ON_THE_GO: ReconParams = ReconParams {
+    scan_window_ms: 1_500,
+    interrupt_on_midea: true,
+    rssi_floor: -82,
+    cooldown_ms: 3 * 60 * 1000,
+    listen_secs: 2,
+    full_walk: false,
+};
+
+/// Active parameter set.
+#[allow(dead_code)]
+const SIT_STILL_PARAMS: &ReconParams = &SIT_STILL;
+const PARAMS: &ReconParams = &ON_THE_GO;
 
 // ── Timestamps (Option<NonZeroU64>: ms since boot, None = never) ───────────────
 
@@ -249,10 +307,14 @@ fn refresh_seen(table: &mut Table, found: &[Candidate]) {
     }
 }
 
-/// Pick the strongest-RSSI scan candidate not currently in probe cooldown.
+/// Pick the strongest-RSSI scan candidate not currently in probe cooldown and
+/// above the RSSI floor in the active params.
 fn pick_candidate(found: &[Candidate], recent: &RecentRing) -> Option<usize> {
     let mut best: Option<usize> = None;
     for i in 0..found.len() {
+        if found[i].rssi < PARAMS.rssi_floor {
+            continue; // too weak — likely out of range before probe completes
+        }
         if in_cooldown(recent, &found[i].addr) {
             continue;
         }
@@ -367,8 +429,9 @@ pub async fn run() -> ! {
         //    a device only enters the table once a probe classifies it Midea/Airoha.
         set_phase(Phase::Scan);
         log_table(table);
-        ulogf!("rscan: scan start (passive RX, {}ms)\r\n", SCAN_WINDOW_MS);
-        let found = scan(&mut rng).await;
+        ulogf!("rscan: scan start (passive RX, {}ms rssi_floor={})\r\n",
+            PARAMS.scan_window_ms, PARAMS.rssi_floor);
+        let found = scan(&mut rng, &recent).await;
         refresh_seen(table, &found);
 
         // 2. Pick the strongest scan candidate not in probe cooldown. `scan` only
@@ -399,7 +462,7 @@ pub async fn run() -> ! {
         //     picker moves on; a *failed* probe (no link / discovery lost) is left
         //     uncooled so it stays a candidate next round.
         if !matches!(probe_state, ProbeState::ProbeFailed) {
-            mark_recent(&mut recent, cand.addr, PROBE_COOLDOWN_MS);
+            mark_recent(&mut recent, cand.addr, PARAMS.cooldown_ms);
         }
         // 4b. Only Midea/Airoha are tracked in the table; unknown and generic are
         //     probed and logged but never added.
@@ -676,7 +739,7 @@ fn sn_matches(sn: &[u8; 14]) -> bool {
 /// One scan window: sweep the advertising channels for [`SCAN_WINDOW_MS`], return
 /// the Midea appliances heard (deduped by SN, strongest RSSI), and log a capture
 /// tally. A brief white LED wink per advert (rate-limited) shows the radio alive.
-async fn scan(rng: &mut Rng) -> heapless::Vec<Candidate, SCAN_MAX> {
+async fn scan(rng: &mut Rng, recent: &RecentRing) -> heapless::Vec<Candidate, SCAN_MAX> {
     configure_ble();
     let r = pac::RADIO;
     let mut found: heapless::Vec<Candidate, SCAN_MAX> = heapless::Vec::new();
@@ -684,7 +747,7 @@ async fn scan(rng: &mut Rng) -> heapless::Vec<Candidate, SCAN_MAX> {
     let mut adv_seen = 0u32; // every CRC-ok advertising PDU this round
     let mut midea_seen = 0u32; // …of which carried a Midea 0x06A8 serial
     let mut last_flash: Option<Instant> = None; // rate-limit for the liveness wink
-    let end = Instant::now() + Duration::from_millis(SCAN_WINDOW_MS);
+    let end = Instant::now() + Duration::from_millis(PARAMS.scan_window_ms);
     while Instant::now() < end {
         for &(ch_idx, freq) in ADV_CHANNELS.iter() {
             ensure_disabled();
@@ -726,7 +789,11 @@ async fn scan(rng: &mut Rng) -> heapless::Vec<Candidate, SCAN_MAX> {
                         let buf = unsafe { &*RX_BUF.0.get() };
                         let pdu_type = buf[0] & 0x0F;
                         let len = buf[1] as usize;
-                        if matches!(pdu_type, 0x00 | 0x01) && len >= 6 {
+                        // ADV_IND (0x00) only — ADV_DIRECT_IND (0x01) carries an
+                        // InitA field naming its intended initiator; our CONNECT_IND
+                        // is silently ignored if InitA doesn't match our address.
+                        // Midea appliances always use undirected ADV_IND anyway.
+                        if pdu_type == 0x00 && len >= 6 {
                             let addr = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
                             let addr_random = (buf[0] >> 6) & 1 == 1;
                             // Midea serial when the advert carries one.
@@ -758,6 +825,23 @@ async fn scan(rng: &mut Rng) -> heapless::Vec<Candidate, SCAN_MAX> {
                                     }
                                 } else {
                                     let _ = found.push(Candidate { addr, addr_random, rssi, sn });
+                                }
+                                // On-the-go: stop scanning the moment we see a
+                                // qualifying Midea advert above the RSSI floor that
+                                // is NOT in cooldown. Without the cooldown check, a
+                                // device that was just probed triggers ~30 scan
+                                // restarts per second (Midea advertises at ~100 ms).
+                                if PARAMS.interrupt_on_midea
+                                    && rssi >= PARAMS.rssi_floor
+                                    && !in_cooldown(recent, &addr)
+                                {
+                                    r.shorts().write(|_w| {});
+                                    r.tasks_disable().write_value(1);
+                                    let _ = wait_disabled();
+                                    ulogf!("rscan: interrupt — midea adv rssi={} (on-the-go)\r\n", rssi);
+                                    ulogf!("rscan: captured adv={} midea={} distinct={}\r\n",
+                                        adv_seen, midea_seen, found.len());
+                                    return found;
                                 }
                             }
                         }
@@ -945,6 +1029,32 @@ async fn airoha_assess(conn: &mut Conn, prof: &device::airoha::Profile) -> bool 
     exposed
 }
 
+/// The Bluetooth Base UUID prefix (on-air LE) — identifies 16-bit UUIDs widened to
+/// the full 128-bit form. Bytes [12..14] carry the 16-bit value; [14..16] are zero.
+const BASE_UUID_PREFIX_LE: [u8; 12] =
+    [0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00];
+
+/// Extract a 16-bit service UUID from the on-air (LE) form, whether stored as 2 or
+/// 16 bytes. `None` for vendor 128-bit UUIDs (no 16-bit equivalent).
+fn svc_uuid16(s: &Service) -> Option<u16> {
+    let u = &s.uuid[..s.uuid_len as usize];
+    if u.len() == 2 {
+        return Some(u16::from_le_bytes([u[0], u[1]]));
+    }
+    if u.len() == 16 && u[..12] == BASE_UUID_PREFIX_LE && u[14] == 0 && u[15] == 0 {
+        return Some(u16::from_le_bytes([u[12], u[13]]));
+    }
+    None
+}
+
+/// Services that the Midea-BLE protocol actually uses — the targeted walk set for
+/// on-the-go mode. FFA0 = Midea control (FFA1 write + FFA2 notify), FF90 = second
+/// Midea family present on some models, 0x180A = Device Information (model / FW
+/// version), 0x1800 = GAP (device name). Matches what midea-ble-go probes.
+fn is_midea_service(s: &Service) -> bool {
+    matches!(svc_uuid16(s), Some(0xFFA0 | 0xFF90 | 0x180A | 0x1800))
+}
+
 /// Tear the link down and leave the radio ready for the next cycle.
 async fn close(conn: &mut Conn) {
     if conn.ev_addr != 0 {
@@ -1020,11 +1130,22 @@ async fn probe_device(rng: &mut Rng, e: &DeviceEntry) -> (ProbeState, DeviceKind
         };
     }
 
-    // Enum the rest: walk every service (logs the tree, reads readable values —
-    // including insufficient-auth failures — and subscribes to notifiables). The
-    // survey's data-collection pass, run for every kind.
+    // Post-handshake walk. Sit-still: the full GATT tree (log everything).
+    // On-the-go: targeted walk of only the Midea-protocol services — the same set
+    // midea-ble-go probes (FFA0, FF90, Device Info, GAP). Gives the char handles,
+    // readable values and subscription state without the 8–14 s cost of a 13-service
+    // walk while the device may be walking away.
     set_phase(Phase::Enumerate);
-    let subscribed = walk_services(&mut conn, &services, |_vh, _uuid| {}).await;
+    let subscribed = if PARAMS.full_walk {
+        walk_services(&mut conn, &services, |_vh, _uuid| {}).await
+    } else {
+        let targeted: heapless::Vec<Service, MAX_SERVICES> = services
+            .iter()
+            .filter(|s| is_midea_service(s))
+            .copied()
+            .collect();
+        walk_services(&mut conn, &targeted, |_vh, _uuid| {}).await
+    };
 
     // Report. A handshaked Midea device gets the session-key status listen (FFA2,
     // decrypted); everything else holds the link briefly for pushed notifications.
@@ -1033,7 +1154,7 @@ async fn probe_device(rng: &mut Rng, e: &DeviceEntry) -> (ProbeState, DeviceKind
         flash(led::GREEN, 2); // credential acquired
         let sns = e.sn.map(|s| sn_string(&s)).unwrap_or_default();
         let dtype = e.sn.as_ref().map(device::midea::device_type).unwrap_or("");
-        midea_listen(&mut conn, &prof, hsv, &sns, dtype, LISTEN_SECS, &mut stats).await;
+        midea_listen(&mut conn, &prof, hsv, &sns, dtype, PARAMS.listen_secs, &mut stats).await;
         hs_state = HandshakeState::HandshakeSuccessful;
         ulogf!("rprobe: midea OK status={} services={} in {}ms\r\n",
             stats.status, services.len(), (Instant::now() - t0).as_millis());

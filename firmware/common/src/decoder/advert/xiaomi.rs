@@ -1,25 +1,39 @@
-//! Xiaomi advertising decoders. Two distinct formats:
+//! Xiaomi advertising decoders. Three formats share one dispatcher:
 //!
 //! * `decode_mibeacon` — the public MiBeacon *service data* (UUID 0xFE95):
 //!   Frame Control (2B LE) + Product ID (2B LE) + counter (1B), optional
 //!   MAC/capability, then TLV sensor objects. Encrypted payloads stay hex.
+//! * `decode_fdaa` — Xiaomi Mi Connect / HyperConnect *service data*
+//!   (UUID 0xFDAA): byte-0 frame tag `0x83`, two opaque header bytes, then
+//!   the handset model name as printable ASCII ("Xiaomi 14T Pro", "Redmi …").
+//!   Frame is emitted only while the user has the Mi Connect / Quick Share
+//!   picker open. RE:
+//!   github.com/bensmith83/adwatch/blob/main/docs/protocols/xiaomi-fdaa.md
 //! * `decode_mfg` — Xiaomi *manufacturer-specific data* (Company ID 0x038F),
-//!   which is proprietary/undocumented (see below).
+//!   which is the SIG Mesh vendor CID for Mijia mesh devices (per Xiaomi's own
+//!   developer doc, github.com/MiEcosystem/miio_open/blob/master/ble/
+//!   04-蓝牙Mesh接入开发.md); frame semantics past the opcode header are
+//!   proprietary. See the block comment on `decode_mfg` below.
 
 use core::fmt::Write;
 
 use super::{emit, hexdump, write_hex, LogStr};
 
-/// Xiaomi — MiBeacon service data (UUID 0xFE95) and manufacturer data
-/// (Company ID 0x038F); dispatched by frame kind.
+/// Xiaomi — MiBeacon service data (UUID 0xFE95), Mi Connect service data
+/// (UUID 0xFDAA), and manufacturer data (Company ID 0x038F); dispatched by
+/// frame kind and key.
 pub(super) struct Xiaomi;
 impl super::VendorDecoder for Xiaomi {
     fn company_ids(&self) -> &'static [u16] { &[0x038F] }
-    fn service_uuids(&self) -> &'static [u16] { &[0xFE95] }
+    fn service_uuids(&self) -> &'static [u16] { &[0xFE95, 0xFDAA] }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         match ctx.kind {
             super::FrameKind::Mfg => Self::decode_mfg(body, ctx.base),
-            super::FrameKind::Service => Self::decode_mibeacon(body, ctx.base),
+            super::FrameKind::Service => match ctx.key {
+                0xFE95 => Self::decode_mibeacon(body, ctx.base),
+                0xFDAA => Self::decode_fdaa(body, ctx.base),
+                _ => hexdump(body, ctx.base, 6),
+            },
         }
     }
 }
@@ -206,12 +220,52 @@ impl Xiaomi {
         }
     }
 
+    /// Xiaomi Mi Connect / HyperConnect pairing-discoverable service data
+    /// (UUID 0xFDAA). Frame layout observed on four independent Xiaomi 14T
+    /// Pro units (all emitted the identical payload for the same model,
+    /// consistent with a stateless model-identity broadcast):
+    ///
+    /// ```text
+    ///   byte 0     : 0x83                     ← frame-type tag
+    ///   bytes 1..3 : opaque header             ← plausibly product-id / len
+    ///   bytes 3..n : printable-ASCII model    ← "Xiaomi 14T Pro" etc.
+    /// ```
+    ///
+    /// The frame carries no per-device anchor — every unit of the same model
+    /// sends the same payload — so the useful field is the plaintext model.
+    fn decode_fdaa(f: &[u8], base: usize) {
+        if f.is_empty() { return; }
+        let mut s: LogStr = LogStr::new();
+        let _ = write!(s, "    Xiaomi FDAA (Mi Connect): tag=0x{:02X}", f[0]);
+        if f.len() >= 3 {
+            let _ = write!(s, " hdr=");
+            write_hex(&mut s, &f[1..3]);
+        }
+        // ASCII model name: any trailing run of printable ASCII that starts
+        // by position 3 and covers the rest of the payload. Guard on every
+        // byte being printable so a binary tail can't produce a garbled name.
+        if f.len() > 3
+            && f[3..].iter().all(|&b| (0x20..=0x7E).contains(&b))
+            && let Ok(name) = core::str::from_utf8(&f[3..])
+        {
+            let _ = write!(s, " model=\"{}\"", name);
+        }
+        emit(s);
+        // Always dump the body for offset visibility, including for units
+        // where the tail isn't fully printable (leaves the ASCII gutter).
+        hexdump(f, base, 6);
+    }
+
     // ── Manufacturer-specific data (Company ID 0x038F) ───────────────────────
     //
-    // This format is proprietary and undocumented — no public tool (ble_monitor,
-    // ESPHome, Theengs, reelyActive advlib) decodes it; they all target the 0xFE95
-    // MiBeacon service data instead. The field layout below is reverse-engineered
-    // from captured traffic and is best-effort, not a spec:
+    // 0x038F is Xiaomi's SIG-registered Company ID and, per Xiaomi's own
+    // developer doc (github.com/MiEcosystem/miio_open/blob/master/ble/
+    // 04-蓝牙Mesh接入开发.md), is used as the Bluetooth Mesh vendor CID for
+    // Mijia mesh devices — Vendor Models `0x038F0000` (MIOT Spec Server) and
+    // `0x038F0002` (Mijia Server). Bytes past the opcode header are proprietary
+    // and no public decoder covers them (theengs/decoder, Bluetooth-Devices/
+    // xiaomi-ble, ESPHome xiaomi_ble, reelyactive advlib — all target FE95,
+    // not 038F). The field-shape guesses below come from captured traffic:
     //
     //   * The first two bytes are a frame opcode from a small fixed set
     //     (0x0A10, 0x1601, 0x2C11 observed).

@@ -33,5 +33,5 @@ assets_blob.bin
 #   firmware/memory.x   — the linker script
 
 .idea
-
+.claude
 logs

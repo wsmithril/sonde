@@ -1,8 +1,12 @@
 //! Bluetrum (AB56xx) manufacturer data (Company ID 0x0642).
 //!
-//! Another low-cost audio SoC vendor behind many generic earbuds/speakers. The
-//! advertising frame is rotating binary state with no public layout; we label
-//! the SoC (it would otherwise show as a raw vendor blob) and dump the payload.
+//! Low-cost BLE-audio SoC vendor behind many generic earbuds/speakers. The
+//! advertising frame is rotating binary state with **no public byte-level
+//! RE** (searches across theengs/decoder, reelyactive advlib, Nordic bt-numbers
+//! DB, and Github code search returned nothing). Vendor attribution is
+//! confirmed against the SIG canonical CID registry. We label the SoC (it
+//! would otherwise show as a raw vendor blob) and dump the payload — the
+//! ASCII gutter often shows an embedded firmware/build string.
 
 use core::fmt::Write;
 

@@ -1,7 +1,10 @@
 //! Yichip Microelectronics manufacturer data (Company ID 0x050E).
 //!
-//! Frames are two bytes — a product code and a revision — with no payload
-//! beyond that, so the whole frame is a beacon-presence marker.
+//! Yichip (Hangzhou) is a BLE-SoC vendor (YC-series chips). Vendor
+//! attribution is SIG-confirmed. Observed frames are two bytes — a product
+//! code and a revision — with no payload beyond that, so the whole frame is
+//! a beacon-presence marker. **No public byte-level RE** maps product codes
+//! to Yichip chip families, so we surface the raw bytes only.
 
 use core::fmt::Write;
 

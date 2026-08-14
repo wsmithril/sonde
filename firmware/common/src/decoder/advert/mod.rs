@@ -42,6 +42,7 @@ mod huawei;
 mod jieli;
 mod leaudio;
 mod lego;
+mod libratone;
 mod lucimed;
 mod macframe;
 pub(super) mod mesh;
@@ -49,6 +50,7 @@ mod miconnect;
 mod microsoft;
 mod midea;
 mod mobike;
+mod ninebot;
 mod motive;
 mod nintendo;
 mod olafriends;
@@ -126,6 +128,8 @@ static DECODERS: &[&dyn VendorDecoder] = &[
     &baidu::Baidu,
     &alibaba::Alibaba,
     &oppo::Oppo,
+    &oppo::OnePlus,
+    &oppo::Realme,
     &vivo::Vivo,
     &opple::Opple,
     &midea::Midea,
@@ -136,6 +140,7 @@ static DECODERS: &[&dyn VendorDecoder] = &[
     &telink::Telink,
     &jieli::Jieli,
     &bluetrum::Bluetrum,
+    &libratone::Libratone,
     &samsung::Samsung,
     &hp::Hp,
     &harman::Harman,
@@ -144,6 +149,7 @@ static DECODERS: &[&dyn VendorDecoder] = &[
     &bose::Bose,
     &qualcomm::Qualcomm,
     &mobike::Mobike,
+    &ninebot::Ninebot,
     &ti::TexasInstruments,
     &tomtom::TomTom,
     &haier::Haier,

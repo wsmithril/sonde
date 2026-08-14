@@ -31,21 +31,57 @@ pub(crate) fn uuid16_name(u: u16) -> Option<&'static str> {
     // auth handshake (static vs MD5 vs ECC). UUIDs from the utecio library:
     // https://github.com/inventor7777/ultraloq-ble-ha
     let vendor = match u {
+        // U-tec / ULTRALOQ vendor GATT UUIDs (0x72xx range).
+        // UUIDs from the utecio library: https://github.com/inventor7777/ultraloq-ble-ha
         0x7200 => Some("U-tec Lock"),
         0x7201 => Some("U-tec Data"),
         0x7220 => Some("U-tec Key (static)"),
         0x7221 => Some("U-tec Key (ECC)"),
         0x7223 => Some("U-tec Key (MD5)"),
-        // Google member services, named more specifically than the SIG table's bare
-        // "Google LLC". FE2C = Fast Pair; FEF3 = Nearby Connections / Quick Share
-        // (its chars are the uWeave transport, see [`uuid128_name`]); FCF1 = the
-        // Play Services container (here surfacing a Fast Pair char).
+        // Google member services. FE2C = Fast Pair; FEF3 = Nearby Connections /
+        // Quick Share (uWeave transport, see uuid128_name); FCF1 = Play Services.
         0xFE2C => Some("Google Fast Pair"),
         0xFEF3 => Some("Google Nearby/Quick Share"),
         0xFCF1 => Some("Google Play Services"),
-        // Amazon FE03 = Alexa Mobile Accessory (AMA) service, more specific than the
-        // SIG table's bare "Amazon.com Services, Inc.".
+        // Amazon FE03 = Alexa Mobile Accessory (AMA).
         0xFE03 => Some("Amazon Alexa (AMA)"),
+        // HM-10 / JNHuaMao CC2540/CC2541 UART-over-BLE clone. 0xFF00–0xFFFF is the
+        // SIG-reserved vendor range. FFE0 is the root service; FFE1 = write+notify on
+        // the same char (original HM-10). Variants: FFE4 = InMotion V1 notify (under
+        // FFE0), FFE5 = InMotion write service, FFE9 = InMotion write char (under FFE5).
+        // Source: eried/eucplanet WheelAdapter.kt.
+        0xFFE0 => Some("HM-10/EUC UART svc"),
+        0xFFE1 => Some("HM-10 UART write+notify"),
+        0xFFE4 => Some("InMotion V1 notify (FFE0-svc)"),
+        0xFFE5 => Some("InMotion write svc"),
+        0xFFE9 => Some("InMotion V1 write (FFE5-svc)"),
+        // Tuya BLE data service (two SDK generations). V1: service 0xA201, chars
+        // 0x2B10 (notify) / 0x2B11 (write); V2: service 0xFD50 (SIG-registered to
+        // Hangzhou Tuya). Source: ha_tuya_ble const.py, bensmith83/adwatch tuya-ble.md.
+        0xA201 => Some("Tuya BLE V1 data svc"),
+        0x2B10 => Some("Tuya BLE notify"),
+        0x2B11 => Some("Tuya BLE write"),
+        // Note: 0xFD50 (Tuya V2) is handled by the SIG member table; labelled here for
+        // explicitness.
+        0xFD50 => Some("Tuya BLE V2 data svc"),
+        // HUAWEI Band / fitness wearable. 0xFE86 = SIG member UUID for Huawei;
+        // 0xFE01 = write char, 0xFE02 = read/notify char. Source: Gadgetbridge
+        // HuaweiConstants.java.
+        0xFE86 => Some("Huawei Band svc"),
+        0xFE01 => Some("Huawei Band write"),
+        0xFE02 => Some("Huawei Band notify"),
+        // Zeekr/Brioess EV wallbox charger. ABF0 = secondary service (shared by Zeekr
+        // and possibly Narwal robot vacuum on the same Geely/Zhejiang platform).
+        // Source: geoffwatts/zeekr_evse_hass protocol.md.
+        0xFFFF => Some("Zeekr/Brioess EVSE primary"),
+        0xABF0 => Some("Zeekr/Brioess EVSE svc"),
+        0xABF1 => Some("EVSE write"),
+        0xABF2 => Some("EVSE notify"),
+        0xABF4 => Some("EVSE notify (alt)"),
+        // Xiaomi authentication service (SIG member, FE95). Used by Mi Scooter,
+        // Ninebot G30, and Xiaomi BLE devices for ECDH key exchange.
+        // Source: Bl0ck154/G30-Rokid-HUD consts.rs.
+        0xFE95 => Some("Xiaomi auth svc"),
         _ => None,
     };
     vendor.or_else(|| crate::decoder::uuid_name(u))
@@ -98,6 +134,48 @@ pub(crate) fn uuid128_name(uuid_be: &[u8; 16]) -> Option<&'static str> {
                                         0xB6, 0x7B, 0x9E, 0x71, 0x12, 0x8C, 0xAE, 0x77]),
         ("Daikin AC-Mgmt write (TX)", [0x21, 0x41, 0xE1, 0x12, 0x21, 0x3A, 0x11, 0xE6,
                                        0xB6, 0x7B, 0x9E, 0x71, 0x12, 0x8C, 0xAE, 0x77]),
+        // Nordic UART Service (NUS) — de-facto BLE serial tunnel used by Ninebot/Segway
+        // scooters, many dev boards, and BLE-serial adapters.
+        ("Nordic UART", [0x6E, 0x40, 0x00, 0x01, 0xB5, 0xA3, 0xF3, 0x93,
+                         0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E]),
+        ("Nordic UART TX (write)", [0x6E, 0x40, 0x00, 0x02, 0xB5, 0xA3, 0xF3, 0x93,
+                                    0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E]),
+        ("Nordic UART RX (notify)", [0x6E, 0x40, 0x00, 0x03, 0xB5, 0xA3, 0xF3, 0x93,
+                                     0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E]),
+        // Ninebot G2/G3/F2 custom UART variant — "ninebot" embedded in base bytes.
+        // Source: BobMcGlobus/ha-ninebot README.
+        ("Ninebot custom UART", [0x6E, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+                                 0x00, 0x6E, 0x69, 0x6E, 0x65, 0x62, 0x6F, 0x74]),
+        // Supvan label printer (E11/E12 thermal series). NOT Tuya — this UUID belongs
+        // to Supvan. Tuya uses 16-bit services 0xA201 / 0xFD50.
+        // Source: heeen/supvan-cups crates/supvan-proto/src/ble.rs.
+        ("Supvan printer svc", [0x00, 0x00, 0xE0, 0xFF, 0x3C, 0x17, 0xD2, 0x93,
+                                0x8E, 0x48, 0x14, 0xFE, 0x2E, 0x4D, 0xA2, 0x12]),
+        // Huawei Band secondary SDP service. Source: Gadgetbridge HuaweiConstants.java.
+        ("Huawei Band SDP svc", [0x82, 0xFF, 0x38, 0x20, 0x84, 0x11, 0x40, 0x0C,
+                                 0xB8, 0x5A, 0x55, 0xBD, 0xB3, 0x2C, 0xF0, 0x60]),
+        // BYD EV BLE — "BYD AUTO" embedded in bytes 0..8, Nordic UART UUID suffix
+        // in bytes 8..16. 246-byte notify char (all zeros at idle) + write-no-response.
+        ("BYD AUTO svc", [0x42, 0x59, 0x44, 0x20, 0x41, 0x55, 0x54, 0x4F,
+                          0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E]),
+        ("BYD AUTO notify", [0x42, 0x59, 0x00, 0x03, 0x41, 0x55, 0x54, 0x4F,
+                             0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E]),
+        ("BYD AUTO write", [0x42, 0x59, 0x00, 0x02, 0x41, 0x55, 0x54, 0x4F,
+                            0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E]),
+        // Mobike (Meituan Bike) GATT — "Rmobike" embedded in UUID bytes. Two services:
+        // FAA8 (primary data) and FAA0 (secondary), each with notify + wr-no-rsp pair.
+        ("Mobike svc A", [0xA0, 0x00, 0xFA, 0xA8, 0x00, 0x47, 0x00, 0x5A,
+                          0x00, 0x52, 0x6D, 0x6F, 0x62, 0x69, 0x6B, 0x65]),
+        ("Mobike svc B", [0xA0, 0x00, 0xFA, 0xA0, 0x00, 0x47, 0x00, 0x5A,
+                          0x00, 0x52, 0x6D, 0x6F, 0x62, 0x69, 0x6B, 0x65]),
+        ("Mobike notify A", [0xA0, 0x00, 0xFD, 0xE1, 0x00, 0x47, 0x00, 0x5A,
+                             0x00, 0x52, 0x6D, 0x6F, 0x62, 0x69, 0x6B, 0x65]),
+        ("Mobike write A", [0xA0, 0x00, 0xFD, 0xE0, 0x00, 0x47, 0x00, 0x5A,
+                            0x00, 0x52, 0x6D, 0x6F, 0x62, 0x69, 0x6B, 0x65]),
+        ("Mobike notify B", [0xA0, 0x00, 0xFE, 0xE1, 0x00, 0x47, 0x00, 0x5A,
+                             0x00, 0x52, 0x6D, 0x6F, 0x62, 0x69, 0x6B, 0x65]),
+        ("Mobike write B", [0xA0, 0x00, 0xFE, 0xE0, 0x00, 0x47, 0x00, 0x5A,
+                            0x00, 0x52, 0x6D, 0x6F, 0x62, 0x69, 0x6B, 0x65]),
         // Google "uWeave" (BLE Weave) message transport carried under service
         // 0xFEF3 (Nearby Connections / Quick Share) and by CryptAuth "Better
         // Together". The 00:1A:11 base is a Google OUI; ...0101 = TX (client→peer,

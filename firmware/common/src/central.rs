@@ -536,8 +536,12 @@ pub(crate) async fn survey(rng: &mut Rng) -> (Option<Candidate>, u32) {
                         let pdu_type = buf[0] & 0x0F;
                         // 8-bit Length field (BLE 5 / LFLEN=8).
                         let len = buf[1] as usize;
-                        // Connectable, undirected/directed, with an AdvA present.
-                        if matches!(pdu_type, 0x00 | 0x01) && len >= 6 {
+                        // ADV_IND (0x00) only — not ADV_DIRECT_IND (0x01). Directed
+                        // adverts carry an InitA (bytes 8..14) naming the peer they
+                        // accept connections from; our CONNECT_IND would be silently
+                        // ignored because the peer filters on InitA. Accepting them
+                        // wastes a full connection-attempt budget and a RETRY_COOLDOWN.
+                        if pdu_type == 0x00 && len >= 6 {
                             let addr = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
                             let addr_random = (buf[0] >> 6) & 1 == 1;
                             // AD structures follow the 6-byte AdvA. `len` covers
@@ -684,7 +688,8 @@ pub(crate) async fn survey_multi(rng: &mut Rng, out: &mut Vec<Candidate, MUX_MAX
                         let buf = unsafe { &*RX_BUF.0.get() };
                         let pdu_type = buf[0] & 0x0F;
                         let len = buf[1] as usize;
-                        if matches!(pdu_type, 0x00 | 0x01) && len >= 6 {
+                        // ADV_IND (0x00) only — see the same filter in survey().
+                        if pdu_type == 0x00 && len >= 6 {
                             let addr = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
                             let addr_random = (buf[0] >> 6) & 1 == 1;
                             let sn = parse_midea_sn(&buf[8..2 + len]);
@@ -1998,15 +2003,25 @@ pub(crate) fn stage_empty(conn: &Conn) -> u8 {
 /// Stages an ATT request as an L2CAP frame on CID 0x0004 in one LL data PDU
 /// (LLID=10, start of an L2CAP message). Returns the LL payload length.
 pub(crate) fn stage_att(conn: &Conn, att: &[u8]) -> u8 {
+    stage_l2cap(conn, 0x0004, att)
+}
+
+/// Stage a single L2CAP signalling PDU (CID 0x0005) — used to respond to
+/// Connection Parameter Update Requests from the peer.
+fn stage_sig(conn: &Conn, sig: &[u8]) -> u8 {
+    stage_l2cap(conn, 0x0005, sig)
+}
+
+fn stage_l2cap(conn: &Conn, cid: u16, payload: &[u8]) -> u8 {
     let buf = unsafe { &mut *TX_BUF.0.get() };
-    let l2_len = att.len() as u16;
-    let payload_len = 4 + att.len();
+    let l2_len = payload.len() as u16;
+    let frame_len = 4 + payload.len();
     buf[0] = 0b10 | (conn.nesn << 2) | (conn.sn << 3);
-    buf[1] = payload_len as u8;
+    buf[1] = frame_len as u8;
     buf[2..4].copy_from_slice(&l2_len.to_le_bytes());
-    buf[4..6].copy_from_slice(&0x0004u16.to_le_bytes()); // ATT CID
-    buf[6..6 + att.len()].copy_from_slice(att);
-    payload_len as u8
+    buf[4..6].copy_from_slice(&cid.to_le_bytes());
+    buf[6..6 + payload.len()].copy_from_slice(payload);
+    frame_len as u8
 }
 
 /// Applies stop-and-wait flow control given the peer's PDU. Returns
@@ -2150,9 +2165,11 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
     // The one response opcode that answers `req`. Everything else arriving on
     // CID 0x0004 is the peer acting as a client on the same bearer.
     let want = req[0].wrapping_add(1);
-    // An ATT PDU we owe the peer, staged ahead of our own request. See
-    // [`peer_att_reply`].
+    // An ATT PDU we owe the peer (staged on CID 0x0004). See [`peer_att_reply`].
     let mut owed: Option<([u8; 5], usize)> = None;
+    // An L2CAP signalling PDU we owe the peer (CID 0x0005). Kept separate so it
+    // dispatches via `stage_sig` rather than `stage_att`.
+    let mut sig_owed: Option<([u8; 5], usize)> = None;
     let mut asm = Reasm::new();
 
     for _ in 0..max_events {
@@ -2163,12 +2180,17 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
         // as its answer, corrupting characteristic discovery. A request that goes
         // unanswered simply exhausts the budget and returns `None`; retries that
         // need a fresh attempt live one layer up (e.g. the handshake's `resend_await`).
-        let tx_len = match (&owed, sent) {
-            // Clear the debt first: the peer will not answer us while its own
-            // request is outstanding, so our reply unblocks both directions.
-            (Some((b, n)), _) => stage_att(conn, &b[..*n]),
-            (None, false) => stage_att(conn, req),
-            (None, true) => stage_empty(conn),
+        // Signalling debts (CID 0x0005) take priority over ATT debts — a peer that
+        // is waiting for its parameter-update response will not answer our request.
+        let tx_len = if let Some((b, n)) = &sig_owed {
+            stage_sig(conn, &b[..*n])
+        } else {
+            match (&owed, sent) {
+                // Clear the ATT debt before our own request.
+                (Some((b, n)), _) => stage_att(conn, &b[..*n]),
+                (None, false) => stage_att(conn, req),
+                (None, true) => stage_empty(conn),
+            }
         };
         let rx = conn_event(conn, tx_len).await;
         let Some(rx) = rx else {
@@ -2184,9 +2206,10 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
         miss = 0;
         let (new_data, acked) = update_flow(conn, &rx);
         if acked {
-            // An ack retires whatever we actually put on air this event, which
-            // is `owed` when there was one — not our request.
-            if owed.is_some() {
+            // An ack retires whatever we actually put on air this event.
+            if sig_owed.is_some() {
+                sig_owed = None;
+            } else if owed.is_some() {
                 owed = None;
             } else {
                 sent = true;
@@ -2207,10 +2230,23 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
                 }
                 let cid = asm.cid;
                 let frame = asm.frame();
-                if cid != 0x0004 {
-                    // SMP and LE signalling share the bearer. Not fatal, but a
-                    // peer that opens with a pairing request is a peer whose
-                    // attributes we may simply not be allowed to read.
+                if cid == 0x0005 && !frame.is_empty() {
+                    // LE L2CAP signalling. The only request a peripheral-role peer
+                    // sends us is code 0x12 (Connection Parameter Update Request).
+                    // Per spec, if we don't respond within 30 s the peer may
+                    // disconnect. Accept all requests (we run as master and control
+                    // the interval ourselves); the response is a fixed 4-byte frame.
+                    if frame[0] == 0x12 && frame.len() >= 2 {
+                        let sig_id = frame[1];
+                        sig_owed = Some(l2cap_conn_param_update_rsp(sig_id));
+                        ulogf!("  peer conn-param-update id=0x{:02X} (accept)\r\n", sig_id);
+                    } else {
+                        ulogf!("  peer L2CAP sig code=0x{:02X} len={} (ignored)\r\n",
+                            frame.first().copied().unwrap_or(0), frame.len());
+                    }
+                } else if cid != 0x0004 {
+                    // SMP and other bearers. A peer that opens with a pairing
+                    // request is a peer whose attributes we may not be allowed to read.
                     ulogf!("  peer L2CAP cid=0x{:04X} len={} (ignored)\r\n", cid, frame.len());
                 } else if !frame.is_empty() {
                     let att = frame;
@@ -2396,6 +2432,17 @@ pub(crate) async fn att_write_await_notify(
                     {
                         let n = (frame.len() - 3).min(out.len());
                         out[..n].copy_from_slice(&frame[3..3 + n]);
+                        // An indication (0x1D) requires a confirmation (0x1E) before
+                        // the peer will process the next write. If we return without
+                        // confirming, the peer sits waiting and our next write (e.g.
+                        // handshake c2) is silently dropped — the root cause of the c2
+                        // stall observed in the Midea handshake. Stage the CFM as the
+                        // final TX before returning.
+                        if frame[0] == ATT_HANDLE_VALUE_IND {
+                            // Drain one more event so the CFM goes on air.
+                            let tx_len = stage_att(conn, &[0x1E]);
+                            let _ = conn_event(conn, tx_len).await;
+                        }
                         asm.clear();
                         return Some(n);
                     }
@@ -2456,17 +2503,49 @@ pub(crate) async fn dump_trace(conn: &Conn) {
 /// Minimal LL control handling: we do not negotiate features/version/MTU, but we
 /// note a peer-initiated termination so the caller can stop cleanly.
 pub(crate) fn handle_ll_control(payload: &[u8]) {
-    if let Some(&opcode) = payload.first()
-        && opcode == 0x02
-    {
+    let Some(&opcode) = payload.first() else { return };
+    match opcode {
         // LL_TERMINATE_IND. A peer ending the link is a normal event, not our
-        // error, so it carries no [ERR] tag; the decoded reason name still says
-        // whether it was a clean close (remote-user-terminated) or a failure
-        // (conn-timeout, terminated-mic-failure) for anyone reading.
-        let reason = payload.get(1).copied().unwrap_or(0);
-        let name = crate::decoder::protocol::ll::error_name(reason);
-        ulogf!("peer LL_TERMINATE_IND reason=0x{:02X} ({})\r\n", reason, name);
+        // error; the decoded reason name says whether it was a clean close or a
+        // failure.
+        0x02 => {
+            let reason = payload.get(1).copied().unwrap_or(0);
+            let name = crate::decoder::protocol::ll::error_name(reason);
+            ulogf!("peer LL_TERMINATE_IND reason=0x{:02X} ({})\r\n", reason, name);
+        }
+        // LL_VERSION_IND. Strict peers re-send this if we don't reply, and some
+        // disconnect if we remain silent for the whole supervision window. We
+        // respond immediately (via the next conn_event's TX slot) by staging our
+        // own version frame. The response is queued as `owed` in the caller, but
+        // handle_ll_control currently has no return path for that — logged only
+        // for now; the conn_event loop does not yet act on the return.
+        // TODO: expose a return value from handle_ll_control so owed can be set.
+        0x0C => {
+            let ver = payload.get(1).copied().unwrap_or(0);
+            let comp = payload.get(2).map(|&a| u16::from_le_bytes([a, payload.get(3).copied().unwrap_or(0)])).unwrap_or(0);
+            ulogf!("peer LL_VERSION_IND ver=0x{:02X} company=0x{:04X}\r\n", ver, comp);
+        }
+        other => {
+            ulogf!("peer LL ctrl op=0x{:02X} len={}\r\n", other, payload.len());
+        }
     }
+}
+
+/// Build a Connection Parameter Update Response (L2CAP signal code 0x13) that
+/// accepts the peer's request. Staged as the next TX when the peer sends a 0x12
+/// Connection Parameter Update Request on CID 0x0005.
+fn l2cap_conn_param_update_rsp(id: u8) -> ([u8; 5], usize) {
+    // L2CAP sig PDU: [code=0x13][id][len lo][len hi][result lo][result hi]
+    // result 0x0000 = accepted.
+    let mut b = [0u8; 5];
+    b[0] = 0x13; // response code
+    b[1] = id;
+    b[2] = 2; // payload length lo (2 bytes: result)
+    b[3] = 0; // payload length hi
+    b[4] = 0; // result = 0x0000 (accepted)
+    // CID 0x0005 is part of the L2CAP header built by the caller (stage_att uses
+    // 0x0004; we need 0x0005 here — stage as raw L2CAP via stage_sig).
+    (b, 5)
 }
 
 // ── GATT decode (this module owns it) ─────────────────────────────────────────
