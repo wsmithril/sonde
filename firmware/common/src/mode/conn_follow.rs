@@ -122,8 +122,18 @@ const T_IFS_US: u16 = 150; // inter-frame spacing enforced by the RADIO
 const RX_LEAD_US: u64 = 1200;
 
 /// How long past the predicted anchor to keep polling for the master packet,
-/// once locked. Total locked window is `RX_LEAD_US + MASTER_TAIL_US`.
-const MASTER_TAIL_US: u64 = 1500;
+/// once locked. Total locked window is `RX_LEAD_US + MASTER_TAIL_US` = 4.2 ms.
+///
+/// Was 1500 µs (2.7 ms total). In the 2026-08-14 capture, locked sessions on 1M
+/// PHY showed 60–90% silent-miss rate while 2M PHY sessions ran at 15%. The peer's
+/// packet was landing outside a window narrower than the transmit-window jitter
+/// caused by unmet re-anchor opportunities: a single missed event lets peer clock
+/// tolerance push the next packet's air-start past `anchor + 1500 µs`, which reads
+/// as silent-miss to us even though the peer is transmitting on the correct
+/// channel. Widening to 3000 µs (4.2 ms total, still well short of the 8.75 ms
+/// spec transmit-window ceiling) roughly doubles the recovery margin at the cost
+/// of ~50 µs of extra RX per event on a healthy link.
+const MASTER_TAIL_US: u64 = 3000;
 
 /// Extra tail added until the first packet lands, on top of the transmit-window
 /// widening. See the module note on hunt mode for why this is a *bounded*
@@ -510,20 +520,23 @@ pub async fn follow(
     // exchanging packets long after we started missing them, which is the
     // difference between a link that ended and a timeline that drifted.
     let mut n_relock: u32 = 0;
-    // Achieved lead before each RX window opened (see `lead_us`). `first_` is the
-    // first event's — dominated by the transmit-window offset it waits out, so it
-    // is large and positive by construction and says nothing about tracking.
-    // `min_` is the worst lead across the follow and is the real scheduling
-    // signal: negative means a window opened late because setup fell behind the
-    // clock, which loses the packet on a correctly selected channel.
-    let mut first_lead_us = i32::MIN;
-    let mut min_lead_us = i32::MAX;
-    // The same figures restricted to events that missed. `first_/min_lead` cover
-    // every event, while the per-event `miss @ev=… lead=` line prints only on the
-    // miss path — reading one against the other compares two different
-    // populations. These make the miss population directly comparable.
-    let mut miss_lead_min_us = i32::MAX;
-    let mut miss_lead_max_us = i32::MIN;
+    // Time we WAIT before RX opens, per event (see `pre_rx_wait_us` below). This is the
+    // slack `rx_open - now` measured at the top of each event's loop iteration:
+    //   positive = we finished the previous event with time to spare and will
+    //              sleep `pre_rx_wait_us` before the next RX window opens
+    //   negative = the anchor was already in the past (setup fell behind); the
+    //              window opens late and only the tail is protecting us
+    // NOT to be misread as "we arrived early relative to the master's transmit
+    // window" — the master transmits AT the anchor, and this is `anchor -
+    // RX_LEAD_US - now` measured before the wait. `first_` covers the first
+    // event; `min_` is the worst (most-negative) across the whole follow — the
+    // only value that carries a scheduling signal.
+    let mut first_pre_rx_wait_us = i32::MIN;
+    let mut min_pre_rx_wait_us = i32::MAX;
+    // Same figures restricted to events that missed, so the per-event `miss @ev=
+    // wait=` line and the summary refer to the same population.
+    let mut miss_pre_rx_wait_min_us = i32::MAX;
+    let mut miss_pre_rx_wait_max_us = i32::MIN;
     // Supervision budget: how many consecutive events may be missed before the
     // link is presumed lost. supervisionTimeout / connInterval, with a floor.
     // Recomputed whenever a connection update changes the interval/timeout.
@@ -690,18 +703,20 @@ pub async fn follow(
         // at 7.5 ms the hunt tail alone already exceeds one interval.
         let span = (RX_LEAD_US + tail).min(interval as u64 * 1250 * 3 / 4);
         let rx_open = anchor - Duration::from_micros(RX_LEAD_US);
-        // Achieved lead: how much slack there actually was before RX opened.
-        // Negative means the anchor was already in the past when we got here —
-        // the window is late by that much and only the tail is protecting us.
+        // Wait until RX opens: microseconds from now until `rx_open`. This is a
+        // schedule-slack measurement — how much time we have BEFORE the RX
+        // window's start, NOT how far we are from the master's transmit window.
+        // Positive = we finished early and will sleep `pre_rx_wait_us`; negative = the
+        // anchor is already in the past and the window will open late.
         let now = Instant::now();
-        let lead_us = match rx_open.checked_duration_since(now) {
+        let pre_rx_wait_us = match rx_open.checked_duration_since(now) {
             Some(d) => d.as_micros() as i32,
             None => -(now.duration_since(rx_open).as_micros() as i32),
         };
-        if first_lead_us == i32::MIN {
-            first_lead_us = lead_us;
+        if first_pre_rx_wait_us == i32::MIN {
+            first_pre_rx_wait_us = pre_rx_wait_us;
         }
-        min_lead_us = min_lead_us.min(lead_us);
+        min_pre_rx_wait_us = min_pre_rx_wait_us.min(pre_rx_wait_us);
         // Configure the receive window *before* waiting it out, then hardware-arm
         // RXEN to fire at rx_open through TIMER1+PPI. The wait yields to the
         // executor, where log_task decodes queued PDUs and drains USB; a software
@@ -728,10 +743,10 @@ pub async fn follow(
             w.set_disabled_rxen(true);
             w.set_address_rssistart(true);
         });
-        // lead_us is non-negative here: the catch-up loop above guarantees
+        // pre_rx_wait_us is non-negative here: the catch-up loop above guarantees
         // anchor ≥ now + RX_LEAD_US, so rx_open ≥ now. A lead inside
         // RXEN_MIN_LEAD_US fires immediately inside the helper.
-        arm_rxen_after(lead_us.max(0) as u32);
+        arm_rxen_after(pre_rx_wait_us.max(0) as u32);
         // Wait out the pre-anchor lead (yields to the executor so USB drains),
         // then busy-poll the reception window at µs precision. RX is already
         // opening on the hardware trigger while this waits.
@@ -769,12 +784,12 @@ pub async fn follow(
             }
             cleanup_radio();
             consec_miss += 1;
-            miss_lead_min_us = miss_lead_min_us.min(lead_us);
-            miss_lead_max_us = miss_lead_max_us.max(lead_us);
+            miss_pre_rx_wait_min_us = miss_pre_rx_wait_min_us.min(pre_rx_wait_us);
+            miss_pre_rx_wait_max_us = miss_pre_rx_wait_max_us.max(pre_rx_wait_us);
             // One line per missed event once the link has locked at least once, so
             // a run of misses shows *where* (channel) and *why* (ADDR vs silent,
             // and how late the window opened) rather than only that it happened.
-            // `lead_us` is that event's own achieved lead: negative here alongside
+            // `pre_rx_wait_us` is that event's own achieved lead: negative here alongside
             // a silent miss points at a late window, not a channel error.
             //
             // Every miss while still locked, then one in 64: a desynced follower
@@ -784,8 +799,8 @@ pub async fn follow(
             // and `miss_addr` / `miss_silent` on the closing line count them all.
             if ever_synced && (synced || consec_miss.is_multiple_of(64)) {
                 ulogf!(
-                    "    miss @ev={} ch={} lead={}us {}\r\n",
-                    ev, ch, lead_us,
+                    "    miss @ev={} ch={} pre_rx_wait={}us {}\r\n",
+                    ev, ch, pre_rx_wait_us,
                     if addr_seen { "on-channel (ADDR, no END)" } else { "silent (no ADDR)" }
                 );
             }
@@ -998,14 +1013,20 @@ pub async fn follow(
     drain_queue().await;
     // Sentinels mean the loop broke before a window ever opened (e.g. bad channel
     // on the first event); report 0 rather than the raw i32 extremes.
-    let first_lead = if first_lead_us == i32::MIN { 0 } else { first_lead_us };
-    let min_lead = if min_lead_us == i32::MAX { 0 } else { min_lead_us };
-    let miss_lo = if miss_lead_min_us == i32::MAX { 0 } else { miss_lead_min_us };
-    let miss_hi = if miss_lead_max_us == i32::MIN { 0 } else { miss_lead_max_us };
+    let first_pre_rx_wait = if first_pre_rx_wait_us == i32::MIN { 0 } else { first_pre_rx_wait_us };
+    let min_pre_rx_wait = if min_pre_rx_wait_us == i32::MAX { 0 } else { min_pre_rx_wait_us };
+    let miss_lo = if miss_pre_rx_wait_min_us == i32::MAX { 0 } else { miss_pre_rx_wait_min_us };
+    let miss_hi = if miss_pre_rx_wait_max_us == i32::MIN { 0 } else { miss_pre_rx_wait_max_us };
+    // `enc=on` here is diagnostic for the `reason=supervision` label. Once the
+    // link goes encrypted, `LL_TERMINATE_IND` is invisible to us — a clean peer
+    // terminate is indistinguishable from radio-side link loss. Print the flag so
+    // a supervision-timeout on an encrypted link reads as "peer probably ended
+    // it" rather than "we lost the link" for post-hoc analysis.
     ulogf!(
-        "  FOLLOW end reason={} events={} master={} slave={} empty={} addr={} crcok={} dropped={} miss_addr={} miss_silent={} relock={} phy={} lead_all_first={}us lead_all_min={}us lead_miss={}..{}us\r\n",
+        "  FOLLOW end reason={} events={} master={} slave={} empty={} addr={} crcok={} dropped={} miss_addr={} miss_silent={} relock={} enc={} phy={} pre_rx_wait_all_first={}us pre_rx_wait_all_min={}us pre_rx_wait_miss={}..{}us\r\n",
         tag, ev, n_m, n_s, n_empty, n_addr, n_crc, DROPPED.swap(0, Ordering::Relaxed),
-        n_miss_addr, n_miss_silent, n_relock, phy_name(phy), first_lead, min_lead, miss_lo, miss_hi
+        n_miss_addr, n_miss_silent, n_relock, if enc.on { "on" } else { "off" },
+        phy_name(phy), first_pre_rx_wait, min_pre_rx_wait, miss_lo, miss_hi
     );
 }
 

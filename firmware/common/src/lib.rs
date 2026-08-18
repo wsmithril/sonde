@@ -290,6 +290,7 @@ pub fn hexdump_dense(prefix: &str, payload: &[u8], indent: usize) {
 }
 
 pub mod boot;
+pub(crate) mod blacklist;
 pub mod central;
 pub mod hal;
 pub mod device;

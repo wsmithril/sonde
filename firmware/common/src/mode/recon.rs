@@ -548,8 +548,10 @@ async fn midea_handshake(
             attempt, (Instant::now() - t0).as_millis());
     }
     let n = c1_len.or_else(|| { ulogf!("  midea: FAIL state=c1 (no reply)\r\n"); None })?;
-    if let Some(Recv::C1(r)) = hs.on_recv(&out[..n]) {
-        ulogf!("  midea: c1 ack result={}\r\n", r);
+    match hs.on_recv(&out[..n]) {
+        Some(Recv::C1(r)) => ulogf!("  midea: c1 ack result={}\r\n", r),
+        Some(_) => ulogf!("  midea: c1 reply is not an ack (security error / version frame)\r\n"),
+        None => ulogf!("  midea: c1 reply unparseable\r\n"),
     }
 
     // c2: same frame on retry (a fresh c2 rotates the device's ephemeral key).

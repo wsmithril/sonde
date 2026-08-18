@@ -351,14 +351,24 @@ pub(crate) const DIAG_CONN_TRACE: bool = false;
 pub(crate) const DIAG_TURNAROUND_SWEEP: bool = false;
 
 // ── DMA buffers ───────────────────────────────────────────────────────────────
-// LL data PDUs are tiny (≤ 2-byte header + 27-byte payload); 64 bytes is plenty.
-const CONN_BUF_LEN: usize = 64;
+// Sized for a full negotiated-MTU PDU in both directions: 2-byte LL header +
+// 4-byte L2CAP header + 247-byte ATT payload = 253, rounded to 256. The Midea
+// handshake c3 write is ~126 bytes, and the peer replies to c2 with an 89-byte
+// indication; a 64-byte buffer staged c3 and panicked (central.rs:2023).
+const CONN_BUF_LEN: usize = 256;
 pub(crate) static RX_BUF: crate::SyncBuf<CONN_BUF_LEN> = crate::SyncBuf::new();
 static TX_BUF: crate::SyncBuf<CONN_BUF_LEN> = crate::SyncBuf::new();
 
 /// Largest LL payload the RADIO may DMA into [`RX_BUF`], after the 2-byte LL
 /// header. See the `MAXLEN` note in [`configure_conn_radio`].
 const CONN_MAX_PAYLOAD: usize = CONN_BUF_LEN - 2;
+
+/// Largest LL data-PDU payload we transmit when an L2CAP frame must be split
+/// across connection events. 27 is the BLE default every peer is guaranteed to
+/// receive; a peer with a small controller RX silently drops an oversized
+/// single PDU — the c3 write (120-byte value → 129-byte PDU) got no response
+/// until the request was segmented.
+const LL_PAYLOAD_MAX: usize = 27;
 
 // ── "Seen recently" tracking ──────────────────────────────────────────────────
 
@@ -692,7 +702,17 @@ pub(crate) async fn survey_multi(rng: &mut Rng, out: &mut Vec<Candidate, MUX_MAX
                         if pdu_type == 0x00 && len >= 6 {
                             let addr = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
                             let addr_random = (buf[0] >> 6) & 1 == 1;
-                            let sn = parse_midea_sn(&buf[8..2 + len]);
+                            let ad = &buf[8..2 + len];
+                            // Skip personal carry devices (phone, earbuds) from
+                            // the gitignored blacklist before they occupy a probe
+                            // slot or flood the report with rotating RPAs.
+                            if crate::blacklist::is_blacklisted(
+                                crate::blacklist::adv_name(ad).unwrap_or(&[]),
+                                &addr,
+                            ) {
+                                continue;
+                            }
+                            let sn = parse_midea_sn(ad);
                             record_candidate_multi(out, addr, addr_random, rssi, sn);
                         }
                     }
@@ -2024,6 +2044,49 @@ fn stage_l2cap(conn: &Conn, cid: u16, payload: &[u8]) -> u8 {
     frame_len as u8
 }
 
+/// Number of LL data PDUs an `req_len`-byte ATT request needs on the wire, and
+/// how many ATT bytes segment `seg` carries. Segment 0 also carries the 4-byte
+/// L2CAP header, so it holds [`LL_PAYLOAD_MAX`]`-4` ATT bytes; every
+/// continuation holds [`LL_PAYLOAD_MAX`]. A request whose L2CAP frame fits one
+/// PDU stays whole (the caller stages it with [`stage_att`]).
+fn att_req_seg_count(req_len: usize) -> usize {
+    if req_len + 4 <= LL_PAYLOAD_MAX {
+        1
+    } else {
+        1 + (req_len - (LL_PAYLOAD_MAX - 4)).div_ceil(LL_PAYLOAD_MAX)
+    }
+}
+
+fn att_req_seg_len(req_len: usize, seg: usize) -> usize {
+    let start = if seg == 0 {
+        0
+    } else {
+        (LL_PAYLOAD_MAX - 4) + (seg - 1) * LL_PAYLOAD_MAX
+    };
+    let cap = if seg == 0 { LL_PAYLOAD_MAX - 4 } else { LL_PAYLOAD_MAX };
+    cap.min(req_len.saturating_sub(start))
+}
+
+/// Stages one LL data-PDU fragment of an ATT request: LLID `0b10` on the first
+/// (carrying the L2CAP `len(2)+cid(2)` header), `0b01` on the rest — the same
+/// framing [`Reasm`] reassembles on the peer's side. Returns the LL payload
+/// length in `TX_BUF[1]`, matching [`stage_l2cap`].
+fn stage_att_req_segment(conn: &Conn, req: &[u8], seg: usize, n_att: usize) -> u8 {
+    let buf = unsafe { &mut *TX_BUF.0.get() };
+    buf[0] = (if seg == 0 { 0b10 } else { 0b01 }) | (conn.nesn << 2) | (conn.sn << 3);
+    if seg == 0 {
+        buf[1] = (4 + n_att) as u8;
+        buf[2..4].copy_from_slice(&(req.len() as u16).to_le_bytes());
+        buf[4..6].copy_from_slice(&0x0004u16.to_le_bytes());
+        buf[6..6 + n_att].copy_from_slice(&req[..n_att]);
+    } else {
+        buf[1] = n_att as u8;
+        let start = (LL_PAYLOAD_MAX - 4) + (seg - 1) * LL_PAYLOAD_MAX;
+        buf[2..2 + n_att].copy_from_slice(&req[start..start + n_att]);
+    }
+    buf[1]
+}
+
 /// Applies stop-and-wait flow control given the peer's PDU. Returns
 /// `(new_data, acked)`: whether the peer sent fresh data (advancing our NESN) and
 /// whether the peer acknowledged our last transmission (advancing our SN).
@@ -2172,6 +2235,14 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
     let mut sig_owed: Option<([u8; 5], usize)> = None;
     let mut asm = Reasm::new();
 
+    // An ATT request larger than one LL data PDU is sent as an L2CAP frame split
+    // across events (segment 0 with the header, then continuations), acked one
+    // segment at a time. `seg_sent` counts acked segments; `sent` stays false
+    // until the last one is on the wire, so the response is awaited only once
+    // the whole request arrived.
+    let n_segs = att_req_seg_count(req.len());
+    let mut seg_sent = 0usize;
+
     for _ in 0..max_events {
         // ATT is strictly sequential: at most one request may be outstanding on a
         // bearer at a time. We therefore never re-send `req` mid-transaction — a
@@ -2188,6 +2259,9 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
             match (&owed, sent) {
                 // Clear the ATT debt before our own request.
                 (Some((b, n)), _) => stage_att(conn, &b[..*n]),
+                (None, false) if n_segs > 1 => {
+                    stage_att_req_segment(conn, req, seg_sent, att_req_seg_len(req.len(), seg_sent))
+                }
                 (None, false) => stage_att(conn, req),
                 (None, true) => stage_empty(conn),
             }
@@ -2211,8 +2285,10 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
                 sig_owed = None;
             } else if owed.is_some() {
                 owed = None;
+            } else if seg_sent + 1 < n_segs {
+                seg_sent += 1; // this fragment acked — send the next
             } else {
-                sent = true;
+                sent = true; // whole request on the wire
             }
         }
         if !new_data || rx.len == 0 {
@@ -2389,7 +2465,14 @@ pub(crate) async fn att_write_await_notify(
     let vlen = value.len().min(req.len() - 3);
     req[3..3 + vlen].copy_from_slice(&value[..vlen]);
     let mut wrsp = [0u8; ATT_MTU_MAX];
-    att_txn(conn, &req[..3 + vlen], &mut wrsp).await?; // await Write Response
+    // Await the Write Response; a silent write means the peer never accepted the
+    // frame (e.g. it is still waiting on the confirmation of a prior indication,
+    // or the PDU carried a stale SN and was read as a retransmission). Distinct
+    // from the "write acked but no notification" case the caller reports later.
+    if att_txn(conn, &req[..3 + vlen], &mut wrsp).await.is_none() {
+        ulogf!("  central: write h={:04X} len={} got no Write Response\r\n", write_h, vlen);
+        return None;
+    }
 
     // 2. Await the reply notification from notify_h, keeping the link alive with
     // empty PDUs between events (mirrors listen_notifications).
@@ -2432,6 +2515,11 @@ pub(crate) async fn att_write_await_notify(
                     {
                         let n = (frame.len() - 3).min(out.len());
                         out[..n].copy_from_slice(&frame[3..3 + n]);
+                        ulogf!("    reply h={:04X} {} len={}\r\n",
+                            notify_h,
+                            if frame[0] == ATT_HANDLE_VALUE_IND { "IND" } else { "NTF" },
+                            n);
+                        decoder::hexdump(&out[..n], 0, 4);
                         // An indication (0x1D) requires a confirmation (0x1E) before
                         // the peer will process the next write. If we return without
                         // confirming, the peer sits waiting and our next write (e.g.
@@ -2439,9 +2527,16 @@ pub(crate) async fn att_write_await_notify(
                         // stall observed in the Midea handshake. Stage the CFM as the
                         // final TX before returning.
                         if frame[0] == ATT_HANDLE_VALUE_IND {
-                            // Drain one more event so the CFM goes on air.
+                            // Drain one more event so the CFM goes on air, and
+                            // apply the peer's ACK of it to our flow-control
+                            // state. Without update_flow the next PDU (e.g. the
+                            // handshake c2) carries the same SN the peer just
+                            // acked, which the peer reads as a retransmission
+                            // and silently drops — the observed c2 stall.
                             let tx_len = stage_att(conn, &[0x1E]);
-                            let _ = conn_event(conn, tx_len).await;
+                            if let Some(rx) = conn_event(conn, tx_len).await {
+                                let _ = update_flow(conn, &rx);
+                            }
                         }
                         asm.clear();
                         return Some(n);

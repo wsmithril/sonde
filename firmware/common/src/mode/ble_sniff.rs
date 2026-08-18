@@ -399,6 +399,14 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
     let mut sync_seen: Option<(decoder::SyncInfo, Instant, u8)> = None;
 
     while let Some(aux) = next {
+        // Disable the radio before any exit from this hop. Silent, not
+        // `ensure_disabled`: the primary scan is still in RX here — the
+        // channel-visit teardown is skipped on the path that reaches an aux
+        // chase — so a running radio is the expected state, not a fault. Doing
+        // it up front means the early `break`s (bad phy / channel, offset too
+        // far) also leave the radio disabled instead of tripping the restore's
+        // `ensure_disabled` as a spurious radio_stuck.
+        disable_silent();
         if hops >= AUX_MAX_HOPS { ulog!("[ERR] aux_max_hops\r\n"); break; }
         hops += 1;
 
@@ -435,11 +443,6 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
         //
         // Safe across the yield because the scan task is the sole owner of the
         // RADIO in this mode; the decode and log tasks never touch it.
-        //
-        // Silent, not `ensure_disabled`: the primary scan is still in RX
-        // here — the channel-visit teardown is skipped on the path that reaches
-        // an aux chase — so a running radio is the expected state, not a fault.
-        disable_silent();
         r.mode().write(|w| w.set_mode(mode));
         if coded { set_pcnf0_coded(); } else { set_pcnf0(plen); }
         r.frequency().write(|w| { w.set_frequency(freq); w.set_map(vals::Map::Default); });

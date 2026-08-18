@@ -35,3 +35,6 @@ assets_blob.bin
 .idea
 .claude
 logs
+
+# Personal carry-device blacklist config (device names) — gitignored per request.
+firmware/common/blacklist.conf
