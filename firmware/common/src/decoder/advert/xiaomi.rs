@@ -85,6 +85,8 @@ impl Xiaomi {
             product, counter, version, encrypted, auth_mode);
         if let Some(model) = Self::product_name(product) {
             let _ = write!(s, " model={}", model);
+        } else if Self::OBSERVED_UNIDENTIFIED.binary_search(&product).is_ok() {
+            let _ = write!(s, " (observed, model unidentified)");
         }
         if mesh       { let _ = write!(s, " mesh"); }
         if registered { let _ = write!(s, " registered"); }
@@ -161,6 +163,25 @@ impl Xiaomi {
             .ok()
             .map(|i| Self::PRODUCTS[i].1)
     }
+
+    /// Product IDs observed in captures that no public MiBeacon database names
+    /// (ble_monitor, theengs/decoder, Bluetooth-Devices/xiaomi-ble, ESPHome,
+    /// pvvx and GitHub search all checked 2026-08-19). Kept apart from
+    /// [`Self::PRODUCTS`] so a decode can say "seen before, model unidentified"
+    /// instead of pretending a model. Rename each entry into [`Self::PRODUCTS`]
+    /// the day it is identified. Sorted for binary search.
+    const OBSERVED_UNIDENTIFIED: &[u16] = &[
+        0x0C39, // mesh (auth=1), no public name
+        0x1590, // registered, clear MAC (44:27:F3…), solicits FDAB
+        0x18EB, // mesh (auth=1), clear MAC (CC:B5:D1:A9:20:4A)
+        0x206E, // registered presence beacon — 18 k frames, the dominant one
+        0x34D5, // mesh (auth=1)
+        0x44A8, // registered
+        0x4B82, // registered
+        0x59FC, // registered, very chatty (counter increments rapidly)
+        0x67CC, // encrypted + registered (MiBind)
+        0x72F7, // auth=2
+    ];
 
     fn decode_object(t: u16, d: &[u8], base: usize) {
         let mut s: LogStr = LogStr::new();

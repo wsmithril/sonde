@@ -919,49 +919,57 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
             // bytes as they came. A container: the company on its own child line,
             // then the vendor deep-decode (or a raw body dump if unknown).
             0xFF if data.len() >= 2 => {
-                let cid = u16::from_le_bytes([data[0], data[1]]);
                 emit_ad_header(ad_type);
-                let mut c: LogStr = LogStr::new();
-                let _ = write!(c, "    ");
-                if mfg_cid_is_own_prefix {
-                    // Company-ID == own MAC prefix: not a vendor, a privacy leak.
-                    let _ = write!(c, "0x{:04X} (own-MAC-prefix, unregistered) ", cid);
-                } else {
-                    match company_name(cid) {
-                        Some(n) => { let _ = write!(c, "{} (0x{:04X}) ", n, cid); }
-                        // 0xFFFF is the SIG "no company / internal use" value.
-                        None if cid == 0xFFFF => {
-                            let _ = write!(c, "0xFFFF (reserved/test — not a real company) ");
-                        }
-                        None => {
-                            let _ = write!(c, "0x{:04X} (unregistered", cid);
-                            // Some makers type two characters into the
-                            // Company-ID slot as a brand tag rather than
-                            // registering: 0x5944 is the ASCII "DY". The
-                            // bytes go out little-endian, so data[0] is the
-                            // first character.
-                            if data[0].is_ascii_graphic() && data[1].is_ascii_graphic() {
-                                let _ = write!(c, ", ascii \"{}{}\"",
-                                    data[0] as char, data[1] as char);
-                            }
-                            let _ = write!(c, ") ");
-                        }
-                    }
-                }
-                let _ = write!(c, "len={}", data.len() - 2);
-                emit(c);
-                if mfg_body_has_own_addr {
-                    let mut n: LogStr = LogStr::new();
-                    let _ = write!(n, "    own address embedded in manufacturer data (identity leak)");
-                    emit(n);
-                }
-                if mfg_cid_is_own_prefix || !verified {
-                    // Not a vendor, or a CRC-salvaged frame whose body is unproven —
-                    // show the raw body under the container instead of running a
-                    // vendor decoder that would invent phantom sub-messages.
+                if !verified {
+                    // CRC-salvaged: the Company-ID bytes are unproven — naming a
+                    // vendor (or flagging an own-MAC leak) from them would invent
+                    // a phantom. Show only the raw body.
+                    let mut c: LogStr = LogStr::new();
+                    let _ = write!(c, "    len={}", data.len() - 2);
+                    emit(c);
                     hexdump(&data[2..], 2, 6);
                 } else {
-                    advert::decode_mfg(data);
+                    let cid = u16::from_le_bytes([data[0], data[1]]);
+                    let mut c: LogStr = LogStr::new();
+                    let _ = write!(c, "    ");
+                    if mfg_cid_is_own_prefix {
+                        // Company-ID == own MAC prefix: not a vendor, a privacy leak.
+                        let _ = write!(c, "0x{:04X} (own-MAC-prefix, unregistered) ", cid);
+                    } else {
+                        match company_name(cid) {
+                            Some(n) => { let _ = write!(c, "{} (0x{:04X}) ", n, cid); }
+                            // 0xFFFF is the SIG "no company / internal use" value.
+                            None if cid == 0xFFFF => {
+                                let _ = write!(c, "0xFFFF (reserved/test — not a real company) ");
+                            }
+                            None => {
+                                let _ = write!(c, "0x{:04X} (unregistered", cid);
+                                // Some makers type two characters into the
+                                // Company-ID slot as a brand tag rather than
+                                // registering: 0x5944 is the ASCII "DY". The
+                                // bytes go out little-endian, so data[0] is the
+                                // first character.
+                                if data[0].is_ascii_graphic() && data[1].is_ascii_graphic() {
+                                    let _ = write!(c, ", ascii \"{}{}\"",
+                                        data[0] as char, data[1] as char);
+                                }
+                                let _ = write!(c, ") ");
+                            }
+                        }
+                    }
+                    let _ = write!(c, "len={}", data.len() - 2);
+                    emit(c);
+                    if mfg_body_has_own_addr {
+                        let mut n: LogStr = LogStr::new();
+                        let _ = write!(n, "    own address embedded in manufacturer data (identity leak)");
+                        emit(n);
+                    }
+                    if mfg_cid_is_own_prefix {
+                        // Own-MAC leak: no vendor to decode, show the raw body.
+                        hexdump(&data[2..], 2, 6);
+                    } else {
+                        advert::decode_mfg(data);
+                    }
                 }
                 handled = true;
             }

@@ -68,6 +68,7 @@ use crate::hal::radio::{
     wait_disabled, ADV_AA, ADV_CRC_POLY,
 };
 use crate::decoder::protocol::Decoder as _; // `.decode()` on the ATT channel decoder
+use crate::device::midea::parse_midea_sn;
 use crate::{decoder, led, Rng};
 
 // ── Connection parameters (our choices as master) ─────────────────────────────
@@ -462,43 +463,51 @@ pub(crate) const ADV_CHANNELS: [(u8, u8); 3] = [(37, 2), (38, 26), (39, 80)];
 pub(crate) const SURVEY_DWELL_MS: u64 = 60; // per channel; three channels ≈ 180 ms
 pub(crate) const SURVEY_ROUNDS: u32 = 3;
 
+/// The device-of-interest class a scan candidate was recognised as from its
+/// advertising payload alone. A generic advertiser is `None` — counted by the
+/// scan but never connected to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Interest {
+    /// Midea 0x06A8 appliance, carrying the 14-byte ASCII short serial needed to
+    /// derive the control-channel rootKey.
+    Midea([u8; 14]),
+    /// DESSMANN smart lock (advert name `LOCK_`).
+    Dessmann,
+    /// MiBeacon sensor (XMZNMS08LM door/window, LYWSD03MMC temp/humidity).
+    MiSensor,
+    /// Weight scale (Service UUID16 0x181D).
+    MiScale,
+}
+
+impl Interest {
+    /// Probe priority: a DESSMANN lock goes first (few, persistent, quick probe),
+    /// then the Midea fleet, then sensors/scales.
+    pub(crate) fn priority(&self) -> u8 {
+        match self {
+            Interest::Dessmann => 3,
+            Interest::Midea(_) => 2,
+            Interest::MiSensor => 1,
+            Interest::MiScale => 0,
+        }
+    }
+
+    /// The Midea short serial, when this is a Midea interest.
+    pub(crate) fn midea_sn(&self) -> Option<[u8; 14]> {
+        match self {
+            Interest::Midea(sn) => Some(*sn),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Candidate {
     pub(crate) addr: [u8; 6],
     pub(crate) addr_random: bool,
     pub(crate) rssi: i16,
-    /// 14-byte ASCII short serial from the target's 0x06A8 Midea advert, when it
-    /// carries one. Needed to derive the control-channel rootKey.
-    pub(crate) sn: Option<[u8; 14]>,
-    /// A DESSMANN smart-lock advert (name `LOCK_`), recognised from the scan so
-    /// the picker can probe it ahead of the Midea fleet.
-    pub(crate) dessmann: bool,
-    /// A MiBeacon sensor advert (XMZNMS08LM door sensor / LYWSD03MMC temp
-    /// monitor), recognised from the scan so recon can read its sensor values.
-    pub(crate) misensor: bool,
-}
-
-/// Walk the AD structures of an advertising payload (the bytes after AdvA) and
-/// return the 14-byte Midea short serial from a `[06 A8][01][SN14]` manufacturer
-/// frame, if present.
-pub(crate) fn parse_midea_sn(ad: &[u8]) -> Option<[u8; 14]> {
-    let mut i = 0;
-    while i + 1 < ad.len() {
-        let flen = ad[i] as usize;
-        if flen == 0 || i + 1 + flen > ad.len() {
-            break;
-        }
-        let atype = ad[i + 1];
-        let data = &ad[i + 2..i + 1 + flen];
-        // Manufacturer data, company 0x06A8 (little-endian A8 06), frame type 0x01.
-        if atype == 0xFF && data.len() >= 3 + 14 && data[0] == 0xA8 && data[1] == 0x06 && data[2] == 0x01 {
-            let mut sn = [0u8; 14];
-            sn.copy_from_slice(&data[3..3 + 14]);
-            return Some(sn);
-        }
-        i += 1 + flen;
-    }
-    None
+    /// The device-of-interest class recognised from the advert, if any. A generic
+    /// device is counted but never connected to.
+    pub(crate) interest: Option<Interest>,
 }
 
 /// Dwell on the primary advertising channels collecting connectable advertisers
@@ -606,7 +615,7 @@ fn record_candidate(
     if recently_enumerated(addr, Instant::now()) {
         return;
     }
-    *best = Some(Candidate { addr, addr_random, rssi, sn, dessmann: false, misensor: false });
+    *best = Some(Candidate { addr, addr_random, rssi, interest: sn.map(Interest::Midea) });
 }
 
 /// Whether this connection attempt should be spent on the accept probe rather

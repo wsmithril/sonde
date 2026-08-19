@@ -29,13 +29,13 @@ use embassy_nrf::pac::radio::vals;
 use embassy_time::{Duration, Instant, Timer};
 
 use crate::central::{
-    ADV_CHANNELS, ATT_HANDLE_VALUE_IND, ATT_HANDLE_VALUE_NTF, ATT_MTU_MAX, CONN_AA, CONN_INTERVAL,
-    Candidate, Characteristic, Conn, ConnectStats, LISTEN_EVENTS, MAX_CHARS_PER_SVC, MAX_CONSEC_MISS,
-    MAX_SERVICES, RX_BUF, Reasm, SURVEY_DWELL_MS, Service, att_write_await_notify, conn_event,
-    configure_conn_radio, discover_characteristics, discover_descriptors, discover_services,
-    exchange_mtu, listen_notifications, parse_midea_sn,
-    pick_access_address, pick_conn_params, randomize_our_addr, stage_empty,
-    subscribe, terminate, try_connect, update_flow, walk_services,
+    ADV_CHANNELS, ATT_MTU_MAX, CONN_AA,
+    Candidate, Characteristic, Conn, ConnectStats, Interest, LISTEN_EVENTS, MAX_CHARS_PER_SVC,
+    MAX_SERVICES, RX_BUF, SURVEY_DWELL_MS, Service, att_write_await_notify,
+    configure_conn_radio, discover_characteristics, discover_descriptors,
+    discover_services, exchange_mtu, listen_notifications,
+    pick_access_address, pick_conn_params, randomize_our_addr,
+    subscribe, terminate, try_connect, walk_services,
 };
 use super::drive_indicator;
 use crate::hal::radio::{configure_ble, ensure_disabled, wait_disabled};
@@ -274,8 +274,8 @@ fn track(
         if c.rssi > e.rssi {
             e.rssi = c.rssi;
         }
-        if c.sn.is_some() {
-            e.sn = c.sn;
+        if let Some(Interest::Midea(sn)) = c.interest {
+            e.sn = Some(sn);
         }
         e.kind = kind;
         e.probe_state = state;
@@ -290,7 +290,7 @@ fn track(
         table.swap_remove(oldest);
     }
     let _ = table.push(DeviceEntry {
-        sn: c.sn,
+        sn: c.interest.and_then(|i| i.midea_sn()),
         addr: c.addr,
         addr_random: c.addr_random,
         rssi: c.rssi,
@@ -331,8 +331,10 @@ fn pick_candidate(found: &[Candidate], recent: &RecentRing) -> Option<usize> {
             Some(j) => {
                 // A DESSMANN lock is probed first, ahead of the Midea fleet —
                 // they are few, persistent, and the command probe is quick.
-                if found[i].dessmann != found[j].dessmann {
-                    found[i].dessmann
+                let pi = found[i].interest.map_or(0, |i| i.priority());
+                let pj = found[j].interest.map_or(0, |i| i.priority());
+                if pi != pj {
+                    pi > pj
                 } else {
                     found[i].rssi > found[j].rssi
                 }
@@ -455,7 +457,7 @@ pub async fn run() -> ! {
         if found.len() >= 2 {
             ulogf!("rscan: candidates {}\r\n", found.len());
             for c in &found {
-                let sn = c.sn.map(|s| sn_string(&s)).unwrap_or_default();
+                let sn = c.interest.and_then(|i| i.midea_sn()).map(|s| sn_string(&s)).unwrap_or_default();
                 ulogf!("  cand {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} rssi={} sn={} cooled={}\r\n",
                     c.addr[5], c.addr[4], c.addr[3], c.addr[2], c.addr[1], c.addr[0],
                     c.rssi, sn, in_cooldown(&recent, &c.addr));
@@ -472,20 +474,18 @@ pub async fn run() -> ! {
         };
         let cand = found[ci];
         let e = DeviceEntry {
-            sn: cand.sn,
+            sn: cand.interest.and_then(|i| i.midea_sn()),
             addr: cand.addr,
             addr_random: cand.addr_random,
             rssi: cand.rssi,
             last_seen: Some(stamp()),
             last_probed: None,
-            kind: if cand.dessmann {
-                DeviceKind::Dessmann
-            } else if cand.misensor {
-                DeviceKind::Misensor
-            } else if cand.sn.is_some() {
-                DeviceKind::Midea
-            } else {
-                DeviceKind::Unknown
+            kind: match cand.interest {
+                Some(Interest::Dessmann) => DeviceKind::Dessmann,
+                Some(Interest::MiSensor) => DeviceKind::Misensor,
+                Some(Interest::MiScale) => DeviceKind::Miscale,
+                Some(Interest::Midea(_)) => DeviceKind::Midea,
+                None => DeviceKind::Unknown,
             },
             probe_state: ProbeState::Seen,
             handshake_state: HandshakeState::NoHandshake,
@@ -523,25 +523,23 @@ pub async fn led_task(mut leds: Pwm) -> ! {
 }
 
 // ── Midea protocol ────────────────────────────────────────────────────────────
+// The C1→C2→C3 handshake + status-query driver lives in [`midea`]; here we keep
+// the shared handshake timeout, the cooldown policy for an unsupported control
+// type, and the shared SN formatter.
 
-/// Connection events to wait for a handshake reply notification, and how many
-/// times to resend a step whose reply never arrives (the appliance drops the
-/// first frame of each step — midea-ble-go `session.go`).
+mod midea;
+mod dessmann;
+mod mi;
+
+/// Connection events to wait for a handshake reply notification — shared by the
+/// midea probe and the dessmann/mi probes that use the same write-and-notify
+/// exchange.
 const HS_REPLY_EVENTS: u32 = 60;
-const HS_RETRIES: u32 = 4;
 
 /// Cooldown for a device that rejected the control handshake with a security
 /// error (ff04): "unsupported type" will not change in a few minutes, so keep it
 /// out of the candidate pool this long instead of the normal [`PARAMS`] cooldown.
 const UNSUPPORTED_COOLDOWN_MS: u64 = 45 * 60 * 1000;
-
-/// Running counters for the per-device summary line.
-#[derive(Default)]
-struct MideaStats {
-    writes: u32, // ATT writes we sent (handshake frames)
-    notifs: u32, // notifications received on FFA2
-    status: u32, // decrypted 0xC0 status frames
-}
 
 /// Format the 14-byte ASCII short serial (printable characters only) for logging.
 fn sn_string(sn: &[u8; 14]) -> heapless::String<14> {
@@ -554,231 +552,26 @@ fn sn_string(sn: &[u8; 14]) -> heapless::String<14> {
     s
 }
 
-/// Handshake outcome, distinguished by why it aborted so the picker can choose
-/// the right cooldown: a device that *answered* with a security error is treated
-/// as an unsupported control type and cooled for far longer than a plain
-/// no-reply.
-enum MideaHsOutcome {
-    Complete(device::midea::handshake::Handshake),
-    /// The device rejected our frames with an ff04/ff05 security error (or sent
-    /// a frame that does not parse as the expected step) — unsupported type.
-    SecError,
-    /// The device never answered — retry on the normal cadence.
-    NoReply,
-}
-
-/// Run the Midea control-channel handshake over the live link and return the
-/// session state on success. Derives the rootKey from the advert (serial +
-/// address), completes the ECDH session; all key material comes from the hardware
-/// TRNG. Emits a detailed timing / packet trace for tuning.
-async fn midea_handshake(
-    conn: &mut Conn,
-    prof: &device::midea::gatt::Profile,
-    cand: &Candidate,
-    st: &mut MideaStats,
-) -> MideaHsOutcome {
-    use device::midea::{crypto, handshake::{Handshake, Recv}, rng::HwRng};
-
-    let sn = match cand.sn {
-        Some(s) => s,
-        None => return MideaHsOutcome::NoReply,
-    };
-    let ad = crypto::advertis_data(&sn, &cand.addr);
-    let mut rng = HwRng::new();
-    // Client open-id: a 6-byte identifier the app would supply; zeros work here.
-    let mut hs = match Handshake::new(&ad, [0u8; 6], &mut rng) {
-        Some(h) => h,
-        None => return MideaHsOutcome::NoReply,
-    };
-    let t_start = Instant::now();
-    ulogf!("  midea: state=c1 sn={} w={:04X} n={:04X} rootKey-derived (interval {}us, budget {} ev)\r\n",
-        sn_string(&sn), prof.write_h, prof.notify_h, CONN_INTERVAL as u32 * 1250, HS_REPLY_EVENTS);
-
-    let mut out = [0u8; ATT_MTU_MAX];
-
-    // c1: rebuilt each attempt (new seq/nonce), as the device ignores the first.
-    let mut c1_len = None;
-    for attempt in 1..=HS_RETRIES {
-        let f = match hs.build_c1(&mut rng) {
-            Some(f) => f,
-            None => return MideaHsOutcome::NoReply,
-        };
-        let t0 = Instant::now();
-        st.writes += 1;
-        if let Some(n) =
-            att_write_await_notify(conn, prof.write_h, &f, prof.notify_h, HS_REPLY_EVENTS, &mut out).await
-        {
-            st.notifs += 1;
-            flash(led::CYAN, 1); // peer answered this step
-            ulogf!("  midea[c1]: reply attempt={} in {}ms len={}\r\n",
-                attempt, (Instant::now() - t0).as_millis(), n);
-            c1_len = Some(n);
-            break;
-        }
-        ulogf!("  midea[c1]: attempt={} no reply after {}ms\r\n",
-            attempt, (Instant::now() - t0).as_millis());
-    }
-    // Gate c2 on a recognised c1 ack: a security error (ff04) or an unparseable
-    // reply means the device rejected the handshake — sending c2 anyway only
-    // wastes two more round trips on a device that will never validate us.
-    let n = match c1_len {
-        Some(n) => n,
-        None => {
-            ulogf!("  midea: FAIL state=c1 (no reply)\r\n");
-            return MideaHsOutcome::NoReply;
-        }
-    };
-    match hs.on_recv(&out[..n]) {
-        Some(Recv::C1(r)) => ulogf!("  midea: c1 ack result={}\r\n", r),
-        _ => {
-            ulogf!("  midea: c1 reply not an ack (security error / unparseable) — unsupported\r\n");
-            return MideaHsOutcome::SecError;
-        }
-    }
-
-    // c2: same frame on retry (a fresh c2 rotates the device's ephemeral key).
-    ulogf!("  midea: state=c2\r\n");
-    let c2 = match hs.build_c2(&mut rng) {
-        Some(f) => f,
-        None => return MideaHsOutcome::NoReply,
-    };
-    let n = match resend_await(conn, prof, &c2, &mut out, "c2", st).await {
-        Some(n) => n,
-        None => {
-            ulogf!("  midea: FAIL state=c2 (no reply)\r\n");
-            return MideaHsOutcome::NoReply;
-        }
-    };
-    let peer = match hs.on_recv(&out[..n]) {
-        Some(Recv::C2(p)) => p,
-        _ => {
-            ulogf!("  midea: c2 reply not a public key (security error) — unsupported\r\n");
-            return MideaHsOutcome::SecError;
-        }
-    };
-    let t_ecdh = Instant::now();
-    if hs.complete_c2(&peer, &mut rng).is_none() {
-        ulogf!("  midea: FAIL state=c2 (ECDH/session derivation)\r\n");
-        return MideaHsOutcome::NoReply;
-    }
-    ulogf!("  midea: sessionKey established (ECDH {}ms)\r\n", (Instant::now() - t_ecdh).as_millis());
-
-    // c3: our public key + sessionKey-encrypted advertisData, rootKey-wrapped.
-    ulogf!("  midea: state=c3\r\n");
-    let c3 = match hs.build_c3(&mut rng) {
-        Some(f) => f,
-        None => return MideaHsOutcome::NoReply,
-    };
-    let n = match resend_await(conn, prof, &c3, &mut out, "c3", st).await {
-        Some(n) => n,
-        None => {
-            ulogf!("  midea: FAIL state=c3 (no reply)\r\n");
-            return MideaHsOutcome::NoReply;
-        }
-    };
-    match hs.on_recv(&out[..n]) {
-        Some(Recv::C3(r)) if r != 0 => ulogf!(
-            "  midea: handshake complete (c3 result={}, {}ms total, tx={} rx={})\r\n",
-            r, (Instant::now() - t_start).as_millis(), st.writes, st.notifs),
-        Some(Recv::C3(r)) => {
-            ulogf!("  midea: FAIL state=c3 (rejected result={})\r\n", r);
-            return MideaHsOutcome::NoReply;
-        }
-        _ => {
-            ulogf!("  midea: FAIL state=c3 (unexpected reply)\r\n");
-            return MideaHsOutcome::NoReply;
-        }
-    }
-
-    // Post-handshake: probe the appliance status, following midea-ble-go — it
-    // sends a 0xC0 business query right after c3. The reply (a sessionKey-encrypted
-    // C4 status frame) is decoded below.
-    if let Some(biz) = hs.build_biz(32, &STATUS_QUERY, &mut rng) {
-        ulogf!("  midea: state=status-query\r\n");
-        if let Some(n) =
-            att_write_await_notify(conn, prof.write_h, &biz, prof.notify_h, HS_REPLY_EVENTS, &mut out).await
-        {
-            st.notifs += 1;
-            ulogf!("  midea[status]: reply len={}\r\n", n);
-            crate::decoder::hexdump(&out[..n], 0, 4);
-            if let Some(Recv::Biz(body)) = hs.on_recv(&out[..n]) {
-                log_midea_status(&body);
-            }
-        } else {
-            ulogf!("  midea[status]: no reply (device quiet)\r\n");
-        }
-    }
-    MideaHsOutcome::Complete(hs)
-}
-
-/// The 24-byte Midea AC status-query appliance frame (order=1, sound off), from
-/// midea-ble-go's `build_query_frame`. Sent as a biz(0x20) frame after c3.
-const STATUS_QUERY: [u8; 24] = [
-    0xAA, 0x17, 0xAC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x41, 0x21, 0x00,
-    0xFF, 0x03, 0xFF, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0xA9, 0x2B,
-];
-
-/// Log the key fields of a 0xC0 AC status reply (midea-ble-go's
-/// `parse_status_frame`): power (flags bit 0), mode + target temperature (one
-/// byte: mode high nibble, temp low nibble + 16), fan speed.
-fn log_midea_status(f: &[u8]) {
-    if f.len() < 14 || f.first() != Some(&0xAA) || f.get(10) != Some(&0xC0) {
-        ulogf!("  midea[status]: not a 0xC0 status frame (len={})\r\n", f.len());
-        return;
-    }
-    let on = f[11] & 1 != 0;
-    let mode = f[12] >> 4;
-    let temp = 16 + (f[12] & 0x0F);
-    let fan = f[13];
-    ulogf!(
-        "  midea[status]: power={} mode={} target={}°C fan={}\r\n",
-        if on { "ON" } else { "OFF" },
-        mode,
-        temp,
-        fan,
-    );
-}
-
-/// Resend one already-built handshake frame up to [`HS_RETRIES`] times, awaiting a
-/// reply notification each time; logs attempt/latency and counts packets.
-async fn resend_await(
-    conn: &mut Conn,
-    prof: &device::midea::gatt::Profile,
-    frame: &[u8],
-    out: &mut [u8],
-    phase: &str,
-    st: &mut MideaStats,
-) -> Option<usize> {
-    for attempt in 1..=HS_RETRIES {
-        let t0 = Instant::now();
-        st.writes += 1;
-        if let Some(n) =
-            att_write_await_notify(conn, prof.write_h, frame, prof.notify_h, HS_REPLY_EVENTS, out).await
-        {
-            st.notifs += 1;
-            flash(led::CYAN, 1); // peer answered this step
-            ulogf!("  midea[{}]: reply attempt={} in {}ms len={}\r\n",
-                phase, attempt, (Instant::now() - t0).as_millis(), n);
-            return Some(n);
-        }
-        ulogf!("  midea[{}]: attempt={} no reply after {}ms\r\n",
-            phase, attempt, (Instant::now() - t0).as_millis());
-    }
-    None
-}
-
 // ── Radio operations ──────────────────────────────────────────────────────────
-
-/// Accept every Midea appliance for survey — any device type. The scan already
-/// gates on a parsed 0x06A8 advert with a valid SN, so the only check is that the
-/// serial is well-formed (printable ASCII); a corrupt SN from a bit-flipped
-/// advert is skipped.
-fn sn_matches(sn: &[u8; 14]) -> bool {
-    sn.iter().all(|&b| b.is_ascii_graphic())
-}
+// Device-of-interest detection from an advert is [`crate::device::classify_interest`].
 
 /// One scan window: sweep the advertising channels for [`SCAN_WINDOW_MS`], return
 /// the Midea appliances heard (deduped by SN, strongest RSSI), and log a capture
+/// Log the per-round scan tally: packets received (`adv_seen`, every CRC-ok
+/// advertising PDU) and distinct devices of interest per type (from `found` —
+/// device counts, not packets).
+fn log_captured(adv_seen: u32, found: &[Candidate]) {
+    ulogf!(
+        "rscan: captured adv={} midea={} dessmann={} misensor={} miscale={} distinct={}\r\n",
+        adv_seen,
+        found.iter().filter(|c| matches!(c.interest, Some(Interest::Midea(_)))).count(),
+        found.iter().filter(|c| matches!(c.interest, Some(Interest::Dessmann))).count(),
+        found.iter().filter(|c| matches!(c.interest, Some(Interest::MiSensor))).count(),
+        found.iter().filter(|c| matches!(c.interest, Some(Interest::MiScale))).count(),
+        found.len(),
+    );
+}
+
 /// tally. A brief white LED wink per advert (rate-limited) shows the radio alive.
 async fn scan(rng: &mut Rng, recent: &RecentRing) -> heapless::Vec<Candidate, SCAN_MAX> {
     configure_ble();
@@ -786,7 +579,6 @@ async fn scan(rng: &mut Rng, recent: &RecentRing) -> heapless::Vec<Candidate, SC
     let mut found: heapless::Vec<Candidate, SCAN_MAX> = heapless::Vec::new();
     let mut others: heapless::Vec<[u8; 14], 32> = heapless::Vec::new();
     let mut adv_seen = 0u32; // every CRC-ok advertising PDU this round
-    let mut midea_seen = 0u32; // …of which carried a Midea 0x06A8 serial
     let mut last_flash: Option<Instant> = None; // rate-limit for the liveness wink
     let end = Instant::now() + Duration::from_millis(PARAMS.scan_window_ms);
     while Instant::now() < end {
@@ -837,42 +629,32 @@ async fn scan(rng: &mut Rng, recent: &RecentRing) -> heapless::Vec<Candidate, SC
                         if pdu_type == 0x00 && len >= 6 {
                             let addr = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
                             let addr_random = (buf[0] >> 6) & 1 == 1;
-                            // Midea serial when the advert carries one.
-                            let sn = match parse_midea_sn(&buf[8..2 + len]) {
-                                Some(sn) if sn_matches(&sn) => {
-                                    midea_seen += 1;
-                                    Some(sn)
-                                }
-                                Some(sn) => {
-                                    midea_seen += 1;
-                                    if !others.iter().any(|o| o == &sn) {
-                                        let _ = others.push(sn);
-                                        ulogf!("rscan: corrupt sn (skipped)\r\n");
-                                    }
-                                    None
-                                }
-                                None => None,
-                            };
                             // Only devices whose type is identifiable from the advert
                             // alone become probe targets — we do not connect just to
-                            // classify. Today that means a Midea 0x06A8 serial or a
-                            // DESSMANN lock (name `LOCK_`); every other advertiser is
-                            // still counted (`adv_seen`) but is never connected to.
-                            let dessmann = device::dessmann::is_dessmann_advert(&buf[8..2 + len]);
-                            let misensor = device::mi::is_sensor_advert(&buf[8..2 + len]);
-                            if sn.is_some() || dessmann || misensor {
+                            // classify: a Midea 0x06A8 serial, a DESSMANN lock (name
+                            // `LOCK_`), a MiBeacon sensor, or a weight scale. Every
+                            // other advertiser is still counted (`adv_seen`) but is
+                            // never connected to.
+                            let mut bad_sn = None;
+                            let interest = device::classify_interest(&buf[8..2 + len], &mut bad_sn);
+                            if let Some(sn) = bad_sn
+                                && !others.iter().any(|o| o == &sn)
+                            {
+                                let _ = others.push(sn);
+                                ulogf!("rscan: corrupt sn (skipped)\r\n");
+                            }
+                            if interest.is_some() {
                                 if let Some(c) = found.iter_mut().find(|c| c.addr == addr) {
                                     if rssi > c.rssi {
                                         c.rssi = rssi;
                                     }
-                                    if dessmann {
-                                        c.dessmann = true;
-                                    }
-                                    if misensor {
-                                        c.misensor = true;
+                                    // First classification wins — a device does not
+                                    // change type mid-scan.
+                                    if c.interest.is_none() {
+                                        c.interest = interest;
                                     }
                                 } else {
-                                    let _ = found.push(Candidate { addr, addr_random, rssi, sn, dessmann, misensor });
+                                    let _ = found.push(Candidate { addr, addr_random, rssi, interest });
                                 }
                                 // On-the-go: stop scanning the moment we see a
                                 // qualifying Midea advert above the RSSI floor that
@@ -887,8 +669,7 @@ async fn scan(rng: &mut Rng, recent: &RecentRing) -> heapless::Vec<Candidate, SC
                                     r.tasks_disable().write_value(1);
                                     let _ = wait_disabled();
                                     ulogf!("rscan: interrupt — midea adv rssi={} (on-the-go)\r\n", rssi);
-                                    ulogf!("rscan: captured adv={} midea={} distinct={}\r\n",
-                                        adv_seen, midea_seen, found.len());
+                                    log_captured(adv_seen, &found);
                                     return found;
                                 }
                             }
@@ -905,7 +686,7 @@ async fn scan(rng: &mut Rng, recent: &RecentRing) -> heapless::Vec<Candidate, SC
             r.events_disabled().write_value(0);
         }
     }
-    ulogf!("rscan: captured adv={} midea={} distinct={}\r\n", adv_seen, midea_seen, found.len());
+    log_captured(adv_seen, &found);
     found
 }
 
@@ -929,6 +710,17 @@ struct Classified {
     miscale: Option<device::mi::Profile>,
 }
 
+/// Reconstruct the scan-time interest for a table entry, for the handshake
+/// paths that take a `Candidate` (the table only stores the Midea SN + kind).
+fn entry_interest(e: &DeviceEntry) -> Option<Interest> {
+    e.sn.map(Interest::Midea).or(match e.kind {
+        DeviceKind::Dessmann => Some(Interest::Dessmann),
+        DeviceKind::Misensor => Some(Interest::MiSensor),
+        DeviceKind::Miscale => Some(Interest::MiScale),
+        _ => None,
+    })
+}
+
 async fn open(
     rng: &mut Rng,
     e: &DeviceEntry,
@@ -936,7 +728,7 @@ async fn open(
     CONN_AA.store(pick_access_address(rng), Ordering::Relaxed);
     pick_conn_params(rng);
     randomize_our_addr(rng);
-    let cand = Candidate { addr: e.addr, addr_random: e.addr_random, rssi: 0, sn: e.sn, dessmann: false, misensor: false };
+    let cand = Candidate { addr: e.addr, addr_random: e.addr_random, rssi: 0, interest: entry_interest(e) };
     let mut cstat = ConnectStats::default();
     let Some(mut conn) = try_connect(&cand, &mut cstat).await else {
         ulogf!("  connect failed (target={} connectable={})\r\n", cstat.target, cstat.connectable);
@@ -1118,172 +910,15 @@ async fn airoha_assess(conn: &mut Conn, prof: &device::airoha::Profile) -> bool 
     flash(if exposed { led::GREEN } else { led::YELLOW }, 2);
     exposed
 }
-
-/// DESSMANN smart-lock probe: walk the safe read-only commands (never changing
-/// device state), then — on a cipher-capable lock and only when the module's
-/// `PROBE_MUTATING` allows — the state-changing commands, which cannot succeed
-/// without the sekey-derived MAC. Every raw reply is hex-dumped so the
-/// SDK-derived framing can be confirmed or corrected on a live lock.
-async fn dessmann_probe(conn: &mut Conn, prof: &device::dessmann::Profile) {
-    use device::dessmann::{Cmd, build_cmd};
-    let mut out = [0u8; ATT_MTU_MAX];
-
-    // Cipher-capability: an 8-byte challenge reply means the open path is
-    // MAC-protected, so the state-changing commands below cannot succeed. Probe
-    // the challenge first — its reply length decides the rest.
-    let mut cipher = false;
-    let frame = build_cmd(Cmd::GetChallenge, &[]);
-    ulogf!("  dessmann: {} (0x{:02X})\r\n", Cmd::GetChallenge.name(), Cmd::GetChallenge.byte());
-    if let Some(n) =
-        att_write_await_notify(conn, prof.write_h, &frame, prof.notify_h, HS_REPLY_EVENTS, &mut out).await
-    {
-        ulogf!("    reply len={}\r\n", n);
-        crate::decoder::hexdump(&out[..n], 0, 4);
-        // A framed 8-byte challenge payload would be 14 bytes (FE 01 rsp 00 08
-        // <8 bytes> <chk2>). Anything that long is treated as cipher-capable.
-        cipher = n >= 14;
-    } else {
-        ulogf!("    no reply\r\n");
-    }
-
-    // Safe reads — always sent, never change state.
-    for cmd in Cmd::SAFE {
-        if cmd == Cmd::GetChallenge {
-            continue; // already probed
-        }
-        let frame = build_cmd(cmd, &[]);
-        ulogf!("  dessmann: {} (0x{:02X})\r\n", cmd.name(), cmd.byte());
-        if let Some(n) =
-            att_write_await_notify(conn, prof.write_h, &frame, prof.notify_h, HS_REPLY_EVENTS, &mut out).await
-        {
-            ulogf!("    reply len={}\r\n", n);
-            crate::decoder::hexdump(&out[..n], 0, 4);
-        } else {
-            ulogf!("    no reply\r\n");
-        }
-    }
-
-    // State-changing commands: only on a cipher-capable lock (they need the MAC
-    // and will error, mapping the response surface), and only when enabled.
-    if cipher && device::dessmann::PROBE_MUTATING {
-        ulogf!("  dessmann: cipher-capable — probing state-changing commands (inert without sekey MAC)\r\n");
-        for cmd in Cmd::MUTATING {
-            let frame = build_cmd(cmd, &[]);
-            ulogf!("  dessmann: {} (0x{:02X})\r\n", cmd.name(), cmd.byte());
-            if let Some(n) =
-                att_write_await_notify(conn, prof.write_h, &frame, prof.notify_h, HS_REPLY_EVENTS, &mut out).await
-            {
-                ulogf!("    reply len={}\r\n", n);
-                crate::decoder::hexdump(&out[..n], 0, 4);
-            } else {
-                ulogf!("    no reply\r\n");
-            }
-        }
-    } else if !cipher {
-        ulogf!("  dessmann: not cipher-capable — state-changing commands skipped\r\n");
-    }
-}
-
-/// Mi Body Composition Scale probe: hold the link with the measurement channel
-/// subscribed and wait for a weigh-in — the scale only pushes a 13-byte
-/// measurement (weight + impedance + timestamp) when someone stands on it.
-/// Decode and log any measurement seen during the window.
-async fn miscale_probe(conn: &mut Conn, prof: &device::mi::Profile) {
-    let mut asm = Reasm::new();
-    let mut miss = 0u32;
-    let mut got = 0u32;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    ulogf!("  miscale: awaiting a weigh-in on h={:04X} (60 s)\r\n", prof.notify_h);
-    while Instant::now() < deadline {
-        let Some(rx) = conn_event(conn, stage_empty(conn)).await else {
-            miss += 1;
-            if miss >= MAX_CONSEC_MISS {
-                break;
-            }
-            continue;
-        };
-        miss = 0;
-        let (new_data, _) = update_flow(conn, &rx);
-        if !new_data || rx.len == 0 {
-            continue;
-        }
-        let buf = unsafe { &*RX_BUF.0.get() };
-        let payload = &buf[2..2 + rx.len as usize];
-        if !asm.push(rx.llid, payload) {
-            continue;
-        }
-        if asm.cid == 0x0004 {
-            let frame = asm.frame();
-            if frame.len() >= 3
-                && matches!(frame[0], ATT_HANDLE_VALUE_NTF | ATT_HANDLE_VALUE_IND)
-                && u16::from_le_bytes([frame[1], frame[2]]) == prof.notify_h
-            {
-                let val = &frame[3..];
-                match device::mi::parse_measurement(val) {
-                    Some(m) => {
-                        ulogf!(
-                            "  miscale: WEIGH-IN {} {:04}-{:02}-{:02} {:02}:{:02}:{:02} weight={:.2} kg impedance={} {}\r\n",
-                            if m.lbs { "(lbs)" } else { "(kg)" },
-                            m.year, m.month, m.day, m.hour, m.minute, m.second,
-                            m.weight_kg(), m.impedance,
-                            if m.has_impedance { "(composition possible)" } else { "(no impedance)" }
-                        );
-                        got += 1;
-                    }
-                    None => {
-                        ulogf!("  miscale: notification h={:04X} len={} (not a measurement)\r\n",
-                            prof.notify_h, val.len());
-                        crate::decoder::hexdump(val, 0, 4);
-                    }
-                }
-                if got >= 4 {
-                    break;
-                }
-            }
-        }
-        asm.clear();
-    }
-    if got == 0 {
-        ulogf!("  miscale: no weigh-in during the window\r\n");
-    }
-}
-
-/// The Bluetooth Base UUID prefix (on-air LE) — identifies 16-bit UUIDs widened to
-/// the full 128-bit form. Bytes [12..14] carry the 16-bit value; [14..16] are zero.
-const BASE_UUID_PREFIX_LE: [u8; 12] =
-    [0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00];
-
-/// Extract a 16-bit service UUID from the on-air (LE) form, whether stored as 2 or
-/// 16 bytes. `None` for vendor 128-bit UUIDs (no 16-bit equivalent).
+/// 16-bit value of a service UUID — the shared extraction is
+/// [`crate::device::uuid16`].
 fn svc_uuid16(s: &Service) -> Option<u16> {
-    let u = &s.uuid[..s.uuid_len as usize];
-    if u.len() == 2 {
-        return Some(u16::from_le_bytes([u[0], u[1]]));
-    }
-    if u.len() == 16 && u[..12] == BASE_UUID_PREFIX_LE && u[14] == 0 && u[15] == 0 {
-        return Some(u16::from_le_bytes([u[12], u[13]]));
-    }
-    None
+    device::uuid16(&s.uuid[..s.uuid_len as usize])
 }
 
 /// Same 16-bit extraction as [`svc_uuid16`], for a characteristic UUID.
 fn char_uuid16(c: &Characteristic) -> Option<u16> {
-    let u = &c.uuid[..c.uuid_len as usize];
-    if u.len() == 2 {
-        return Some(u16::from_le_bytes([u[0], u[1]]));
-    }
-    if u.len() == 16 && u[..12] == BASE_UUID_PREFIX_LE && u[14] == 0 && u[15] == 0 {
-        return Some(u16::from_le_bytes([u[12], u[13]]));
-    }
-    None
-}
-
-/// Services that the Midea-BLE protocol actually uses — the targeted walk set for
-/// on-the-go mode. FFA0 = Midea control (FFA1 write + FFA2 notify), FF90 = second
-/// Midea family present on some models, 0x180A = Device Information (model / FW
-/// version), 0x1800 = GAP (device name). Matches what midea-ble-go probes.
-fn is_midea_service(s: &Service) -> bool {
-    matches!(svc_uuid16(s), Some(0xFFA0 | 0xFF90 | 0x180A | 0x1800))
+    device::uuid16(&c.uuid[..c.uuid_len as usize])
 }
 
 /// Tear the link down and leave the radio ready for the next cycle.
@@ -1334,11 +969,7 @@ async fn probe_device(rng: &mut Rng, e: &DeviceEntry) -> (ProbeState, DeviceKind
     // than skipping.
     if e.kind == DeviceKind::Misensor {
         set_phase(Phase::Enumerate);
-        let subscribed = walk_services(&mut conn, &services, |_vh, _uuid| {}).await;
-        set_phase(Phase::Listen);
-        if subscribed > 0 {
-            listen_notifications(&mut conn, LISTEN_EVENTS).await;
-        }
+        let subscribed = mi::probe_sensor(&mut conn, &services).await;
         ulogf!("rprobe: misensor done services={} subs={} in {}ms\r\n",
             services.len(), subscribed, (Instant::now() - t0).as_millis());
         set_phase(Phase::Idle);
@@ -1358,23 +989,24 @@ async fn probe_device(rng: &mut Rng, e: &DeviceEntry) -> (ProbeState, DeviceKind
 
     // Assessment on the fresh link, before the heavy walk — a peer can drop the
     // link during a long enumeration, so the credential/probe comes first.
-    let mut stats = MideaStats::default();
+    let mut stats = midea::HsStats::default();
     let mut hs = None;
     let mut hs_state = HandshakeState::NoHandshake;
     if let Some(prof) = cls.midea {
         set_phase(Phase::Handshake);
-        let cand = Candidate {
-            addr: e.addr,
-            addr_random: e.addr_random,
-            rssi: 0,
-            sn: e.sn,
-            dessmann: false,
-            misensor: false,
+        // The probe needs the advert serial (rootKey) + address, recorded in the
+        // table when the device was scanned.
+        let (sn, addr) = match (e.sn, e.addr) {
+            (Some(sn), addr) => (sn, addr),
+            _ => {
+                set_phase(Phase::Idle);
+                return (ProbeState::ProbeFailed, kind, HandshakeState::NoHandshake);
+            }
         };
-        match midea_handshake(&mut conn, &prof, &cand, &mut stats).await {
-            MideaHsOutcome::Complete(h) => hs = Some(h),
-            MideaHsOutcome::SecError => hs_state = HandshakeState::Unsupported,
-            MideaHsOutcome::NoReply => hs_state = HandshakeState::HandshakeFail,
+        match midea::probe(&mut conn, &prof, &sn, &addr, &mut stats).await {
+            midea::HsOutcome::Complete(h) => hs = Some(h),
+            midea::HsOutcome::SecError => hs_state = HandshakeState::Unsupported,
+            midea::HsOutcome::NoReply => hs_state = HandshakeState::HandshakeFail,
         }
     } else if let Some(prof) = cls.airoha {
         set_phase(Phase::Handshake);
@@ -1385,10 +1017,10 @@ async fn probe_device(rng: &mut Rng, e: &DeviceEntry) -> (ProbeState, DeviceKind
         };
     } else if let Some(prof) = cls.dessmann {
         set_phase(Phase::Handshake);
-        dessmann_probe(&mut conn, &prof).await;
+        dessmann::probe(&mut conn, &prof).await;
     } else if let Some(prof) = cls.miscale {
         set_phase(Phase::Handshake);
-        miscale_probe(&mut conn, &prof).await;
+        mi::probe_scale(&mut conn, &prof).await;
     }
 
     // Post-handshake walk. Sit-still: the full GATT tree (log everything).
@@ -1413,14 +1045,14 @@ async fn probe_device(rng: &mut Rng, e: &DeviceEntry) -> (ProbeState, DeviceKind
     } else {
         let targeted: heapless::Vec<Service, MAX_SERVICES> = services
             .iter()
-            .filter(|s| is_midea_service(s))
+            .filter(|s| device::midea::is_service(svc_uuid16(s)))
             .copied()
             .collect();
         walk_services(&mut conn, &targeted, |_vh, _uuid| {}).await
     };
 
     // Report. A handshaked Midea device already got its status via the active
-    // status-query probe (sent inside `midea_handshake` right after c3), so no
+    // status-query probe (sent inside `midea::probe` right after c3), so no
     // passive GATT notification listen runs here; the link is torn down directly.
     set_phase(Phase::Listen);
     if let (Some(_prof), Some(_hsv)) = (cls.midea, hs.as_ref()) {

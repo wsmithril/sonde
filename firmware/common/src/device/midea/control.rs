@@ -288,43 +288,137 @@ pub fn build_query_frame(order: u8, sound: u8) -> Frame {
     out
 }
 
-/// Parsed 0xC0 status reply.
+/// Parsed 0xC0 AC status reply — the fields the reference (`midea-ble-go`
+/// `parse_status_frame`) decodes. Temperatures are integer tenths °C (26.0 = 260).
+#[derive(Clone, Copy)]
 pub struct Status {
-    pub run_status: bool,
-    pub fault: bool,
+    pub is_on: bool,
+    pub has_fault: bool,
+    /// Operating-mode wire code 1..=6 (see [`MODE_AUTO`]..[`MODE_SMART_DRY`]).
     pub mode: u8,
-    pub temp_set: i32, // tenths
+    /// Target temperature, tenths °C.
+    pub temp_set: i32,
+    /// Fan-speed wire code (40/60/80/100/102).
     pub wind_speed: u8,
     pub swing_ud: bool,
     pub swing_lr: bool,
+    /// Indoor ambient, tenths °C. `i32::MIN` when the wire reports it unavailable.
+    pub temp_indoor: i32,
+    /// Outdoor ambient, tenths °C.
+    pub temp_outdoor: i32,
+    /// Secondary (eco/sleep) setpoint, tenths °C.
+    pub temp_secondary: i32,
+    pub eco: bool,
+    pub turbo: bool,
+    pub elec_heat: bool,
+    /// Screen-show state, 0..7.
+    pub screen: u8,
+    pub water_tank_full: bool,
+    /// Raw error code byte (38 = water tank full, see [`Status::water_tank_full`]).
+    pub error_code: u8,
 }
 
-/// Parse a 0xC0 appliance status frame. Verifies the trailing checksum and the
-/// opcode before reading fields.
+/// Status-body offsets, relative to `frame[10..]` (opcode-onward) — `body[N]` is
+/// `frame[10 + N]`. Same convention as [`super::status`] (midea-local) and the
+/// reference appliance.rs.
+const S_FLAGS: usize = 1;
+const S_MODE_TEMP: usize = 2;
+const S_FAN: usize = 3;
+const S_SWING: usize = 7;
+const S_TURBO: usize = 8;
+const S_ECO: usize = 9;
+const S_TEMP_INDOOR: usize = 11;
+const S_TEMP_OUTDOOR: usize = 12;
+const S_TEMP_SECONDARY: usize = 13;
+const S_SCREEN: usize = 14;
+const S_TEMP_TENTHS: usize = 15;
+const S_ERROR: usize = 16;
+const S_MIN_LEN: usize = 17;
+
+/// Water-tank-full marker in the error byte.
+const WATER_TANK_ERROR: u8 = 38;
+
+impl Status {
+    /// Write the one-line status summary (power/mode/target/fan plus the extended
+    /// fields) into `w` — what recon logs after a handshake.
+    pub fn fmt_to(&self, w: &mut impl core::fmt::Write) -> core::fmt::Result {
+        write!(
+            w,
+            "power={} mode={} target={}.{}°C fan={}",
+            if self.is_on { "ON" } else { "OFF" },
+            mode_name(self.mode),
+            self.temp_set / 10,
+            self.temp_set.abs() % 10,
+            wind_name(self.wind_speed),
+        )?;
+        if self.temp_indoor != i32::MIN {
+            write!(w, " indoor={}.{}°C", self.temp_indoor / 10, self.temp_indoor.abs() % 10)?;
+        }
+        if self.temp_outdoor != i32::MIN {
+            write!(w, " outdoor={}.{}°C", self.temp_outdoor / 10, self.temp_outdoor.abs() % 10)?;
+        }
+        if self.temp_secondary != 0 {
+            write!(w, " set2={}.{}°C", self.temp_secondary / 10, self.temp_secondary.abs() % 10)?;
+        }
+        if self.eco { write!(w, " eco")?; }
+        if self.turbo { write!(w, " turbo")?; }
+        if self.elec_heat { write!(w, " elec_heat")?; }
+        if self.water_tank_full { write!(w, " tank_full")?; }
+        if self.error_code != 0 { write!(w, " err={}", self.error_code)?; }
+        if self.has_fault { write!(w, " FAULT")?; }
+        Ok(())
+    }
+}
+
+/// Decode the indoor-ambient temperature: coarse wire byte (integer °C, the
+/// half-degree is truncated) plus a tenths nibble, negated for sub-zero.
+fn ambient_indoor(coarse: u8, tenths: u8) -> i32 {
+    let int = (coarse as i32 - 50) / 2;
+    let t = (tenths & 15).min(9) as i32;
+    if int < 0 { int * 10 - t } else { int * 10 + t }
+}
+
+/// Decode the outdoor-ambient temperature: coarse wire byte (half-degree
+/// resolution, not truncated) plus a tenths nibble.
+fn ambient_outdoor(coarse: u8, tenths: u8) -> i32 {
+    (coarse as i32 - 50) * 5 + (tenths & 15).min(9) as i32
+}
+
+/// Parse a 0xC0 AC status frame (the reference `parse_status_frame`). Verifies
+/// the sync byte, declared length + checksum (the shared [`super::status::frame_body`]
+/// framing gate), and the opcode before decoding. `None` on a malformed frame.
 pub fn parse_status_frame(t: &[u8]) -> Option<Status> {
-    if t.is_empty() || t[0] != 0xAA {
+    let b = super::status::frame_body(t)?; // body: b[N] == frame[10 + N]
+    if b.len() < S_MIN_LEN || b[0] != 0xC0 {
         return None;
     }
-    let n = t[1] as usize; // checksum covers t[1..1+n]
-    if 1 + n > t.len() || make_sum(&t[1..1 + n]) != 0 {
-        return None;
-    }
-    if t.len() < 14 || t[10] != 0xC0 {
-        return None;
-    }
-    let ss = &t[10..];
-    let mut temp = (16 + (15 & ss[2] as i32)) * 10; // whole degrees, in tenths
-    if 16 & ss[2] != 0 {
-        temp += 5;
-    }
-    let swing = (240 & ss[7]) == 48;
+    let swing = (b[S_SWING] & 0xF0) == 0x30;
     Some(Status {
-        fault: 128 & ss[1] != 0,
-        run_status: 1 & ss[1] != 0,
-        mode: (224 & ss[2]) >> 5,
-        temp_set: temp,
-        wind_speed: ss[3],
-        swing_lr: swing && ss[7] & 0x03 != 0,
-        swing_ud: swing && ss[7] & 0x0C != 0,
+        is_on: b[S_FLAGS] & 1 != 0,
+        has_fault: b[S_FLAGS] & 0x80 != 0,
+        mode: (b[S_MODE_TEMP] >> 5) & 7,
+        temp_set: (16 + (b[S_MODE_TEMP] & 15)) as i32 * 10
+            + if b[S_MODE_TEMP] & 16 != 0 { 5 } else { 0 },
+        wind_speed: b[S_FAN],
+        swing_ud: swing && b[S_SWING] & 0x0C != 0,
+        swing_lr: swing && b[S_SWING] & 0x03 != 0,
+        temp_indoor: if b[S_TEMP_INDOOR] == 0xFF {
+            i32::MIN
+        } else {
+            ambient_indoor(b[S_TEMP_INDOOR], b[S_TEMP_TENTHS] & 15)
+        },
+        temp_outdoor: if b[S_TEMP_OUTDOOR] == 0xFF {
+            i32::MIN
+        } else {
+            ambient_outdoor(b[S_TEMP_OUTDOOR], (b[S_TEMP_TENTHS] >> 4) & 15)
+        },
+        temp_secondary: (12 + (b[S_TEMP_SECONDARY] & 31)) as i32 * 10
+            + if b[S_MODE_TEMP] & 16 != 0 { 5 } else { 0 },
+        eco: b[S_ECO] & 0x10 != 0,
+        turbo: b[S_TURBO] & 0x20 != 0,
+        elec_heat: b[S_ECO] & 0x08 != 0,
+        screen: (b[S_SCREEN] & 0x70) >> 4,
+        water_tank_full: b[S_ERROR] == WATER_TANK_ERROR,
+        error_code: b[S_ERROR],
     })
 }

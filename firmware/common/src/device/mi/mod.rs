@@ -129,6 +129,34 @@ pub fn is_sensor_advert(ad: &[u8]) -> bool {
     false
 }
 
+/// Detect a *weight-scale* advert: an incomplete/complete Service UUID16 list
+/// (AD types 0x02/0x03) containing 0x181D, the SIG Weight Scale service. The Mi
+/// Body Composition Scale advertises the standard service, so any scale becomes a
+/// probe candidate; the GATT walk then confirms the Mi vendor profile
+/// ([`is_scale_service`]) before the weigh-in listen.
+pub fn is_scale_advert(ad: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < ad.len() {
+        let flen = ad[i] as usize;
+        if flen == 0 || i + 1 + flen > ad.len() {
+            break;
+        }
+        let t = ad[i + 1];
+        if (t == 0x02 || t == 0x03) && flen >= 3 {
+            let end = i + 1 + flen;
+            let mut j = i + 2;
+            while j + 1 < end {
+                if ad[j] == 0x1D && ad[j + 1] == 0x18 {
+                    return true;
+                }
+                j += 2;
+            }
+        }
+        i += 1 + flen;
+    }
+    false
+}
+
 const E7810B92_SERVICE: [u8; 16] = [
     0xF2, 0xC3, 0xF0, 0xAE, 0xA9, 0xFA, 0x15, 0x8C, 0x9D, 0x49, 0xAE, 0x73, 0x92, 0x0B, 0x81, 0xE7,
 ];

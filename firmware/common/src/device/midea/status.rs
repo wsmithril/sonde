@@ -25,7 +25,7 @@ use crate::decoder::LogStr;
 /// Validate the decrypted appliance frame (`0xAA`, length, checksum) and return
 /// the body slice `t[10..]`. Mirrors [`super::control::parse_status_frame`]'s
 /// framing checks so both agree on what a sound frame is.
-fn frame_body(t: &[u8]) -> Option<&[u8]> {
+pub(super) fn frame_body(t: &[u8]) -> Option<&[u8]> {
     if t.len() < 12 || t[0] != 0xAA {
         return None;
     }
