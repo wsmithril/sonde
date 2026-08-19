@@ -1,6 +1,12 @@
 //! Personal carry-device blacklist — devices the user carries (phone, earbuds)
 //! that would otherwise dominate every survey and report.
 //!
+//! Provides the candidate filter ([`is_blacklisted`]) and its build-time config
+//! file (`BLACKLIST_CONF`, gitignored `blacklist.conf`). No survey path calls it
+//! yet; a scan that wants to exclude the user's own devices routes its
+//! candidates through [`is_blacklisted`] before recording them.
+#![allow(dead_code)]
+//!
 //! The **list** lives in a build-time config file, `firmware/common/blacklist.conf`
 //! (gitignored — personal, never committed). It is optional: `build.rs` embeds
 //! the file's text into the crate as `BLACKLIST_CONF` (`include!` from
@@ -18,8 +24,8 @@
 //! needs a scan-response probe (SCAN_REQ → name in SCAN_RSP) to be identified
 //! before connecting; that is a follow-up, not handled here.
 
-/// Embedded at build time by `build.rs` from `firmware/common/blacklist.conf`
-/// (empty string when the file is absent).
+// Embedded at build time by `build.rs` from `firmware/common/blacklist.conf`
+// (empty string when the file is absent).
 include!(concat!(env!("OUT_DIR"), "/blacklist_conf.rs"));
 
 /// `true` when the advertised `name` (Name AD bytes) matches a config entry, or

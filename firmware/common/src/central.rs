@@ -207,9 +207,8 @@ const HOP_INCREMENT: u8 = 7; // CSA#1 hop (5..16)
 const TX_WIN_DELAY_US: u64 = 1250; // fixed transmitWindowDelay for a CONNECT_IND
 
 // The transmit-window size and supervision timeout the *next* CONNECT_IND will
-// carry. They default to the single-connection constants above; the multiplex
-// driver widens the window (for anchor placement) and stretches the timeout (so a
-// link set up early survives while the rest are established), then restores both.
+// carry. They default to the single-connection constants above; `try_connect`
+// reads them for every link it establishes.
 static TX_WIN_SIZE_UNITS: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(WIN_SIZE);
 static CONN_TIMEOUT_UNITS: core::sync::atomic::AtomicU16 =
@@ -471,6 +470,12 @@ pub(crate) struct Candidate {
     /// 14-byte ASCII short serial from the target's 0x06A8 Midea advert, when it
     /// carries one. Needed to derive the control-channel rootKey.
     pub(crate) sn: Option<[u8; 14]>,
+    /// A DESSMANN smart-lock advert (name `LOCK_`), recognised from the scan so
+    /// the picker can probe it ahead of the Midea fleet.
+    pub(crate) dessmann: bool,
+    /// A MiBeacon sensor advert (XMZNMS08LM door sensor / LYWSD03MMC temp
+    /// monitor), recognised from the scan so recon can read its sensor values.
+    pub(crate) misensor: bool,
 }
 
 /// Walk the AD structures of an advertising payload (the bytes after AdvA) and
@@ -601,504 +606,7 @@ fn record_candidate(
     if recently_enumerated(addr, Instant::now()) {
         return;
     }
-    *best = Some(Candidate { addr, addr_random, rssi, sn });
-}
-
-// ── Multiplexed listen (test drive) ─────────────────────────────────────────
-//
-// Hold several links open on the one radio and listen to all of them at once.
-// This is the low-risk slice of connection multiplexing: during listen a link only
-// sends empty PDUs and receives notifications (sub-ms per event, no ATT
-// sequencing), so staggering [`MUX_MAX`] links inside the 31.25 ms interval has
-// ample headroom. It still exercises the hard prerequisites — per-link radio
-// identity ([`Conn::aa`]/[`Conn::crc_init`], restored by [`conn_event`]), anchor
-// staggering, and holding links alive concurrently — before the harder
-// enumerate+handshake multiplex is attempted. HARDWARE-UNVERIFIED.
-
-/// How many links the multiplexed listen holds open at once.
-pub(crate) const MUX_MAX: usize = 4;
-/// Transmit-window size (×1.25 ms) for a multiplexed CONNECT_IND. The spec caps it
-/// at 10 ms; the wide window is the room within which each link's first anchor is
-/// placed on a distinct phase of the shared interval so the links do not collide.
-const MUX_WIN_SIZE: u8 = 8;
-/// Supervision timeout (×10 ms) for a multiplexed CONNECT_IND: 20 s, long enough
-/// that a link established first survives while the remaining links are set up
-/// (each setup is a several-second gap in which that link gets no events).
-const MUX_CONN_TIMEOUT: u16 = 2000;
-/// Target minimum spacing between two links' anchors, in ticks (~3 ms). Below this
-/// their events overlap on air and one starts missing every interval.
-const MUX_MIN_GAP_TICKS: u64 = (3_000 * embassy_time::TICK_HZ) / 1_000_000;
-/// Backfill: refill a freed slot at most this often — a survey freezes the
-/// survivors for its duration, so it must not run every loop iteration.
-const MUX_BACKFILL_EVERY_S: u64 = 8;
-/// …and only when at least this much listen time remains, so a fresh link is worth
-/// the survey cost and the survivors' freeze.
-const MUX_BACKFILL_MIN_LEFT_S: u64 = 15;
-
-/// A characteristic value handle and its UUID, remembered from the walk so a
-/// notification arriving on that handle can be named instead of shown as a bare
-/// number.
-#[derive(Clone, Copy)]
-struct CharRef {
-    handle: u16,
-    uuid: [u8; 16],
-    uuid_len: u8,
-}
-
-/// Characteristics remembered per link for notification resolution.
-const MUX_CHARS: usize = 24;
-
-/// One multiplexed link: its connection plus the per-link reassembly/flow state
-/// the listen loop keeps for it (each link is an independent ATT bearer), and the
-/// handle→UUID table used to name its notifications.
-struct MuxLink {
-    conn: Conn,
-    asm: Reasm,
-    owed: Option<([u8; 5], usize)>,
-    miss: u32,
-    label: [u8; 6],
-    notifs: u32,
-    chars: Vec<CharRef, MUX_CHARS>,
-}
-
-/// Survey the advertising channels and collect up to [`MUX_MAX`] distinct
-/// connectable advertisers (strongest RSSI per address, skipping recently
-/// enumerated ones). Mirrors [`survey`] but keeps a small set rather than one best.
-pub(crate) async fn survey_multi(rng: &mut Rng, out: &mut Vec<Candidate, MUX_MAX>) {
-    configure_ble();
-    let r = pac::RADIO;
-    for _ in 0..SURVEY_ROUNDS {
-        for &(ch_idx, freq) in ADV_CHANNELS.iter() {
-            ensure_disabled();
-            r.frequency().write(|w| {
-                w.set_frequency(freq);
-                w.set_map(vals::Map::Default);
-            });
-            r.datawhiteiv().write(|w| w.set_datawhiteiv(ch_idx));
-            r.packetptr().write_value(RX_BUF.0.get() as u32);
-            r.events_end().write_value(0);
-            r.events_crcok().write_value(0);
-            r.events_address().write_value(0);
-            r.events_disabled().write_value(0);
-            r.shorts().write(|w| {
-                w.set_rxready_start(true);
-                w.set_address_rssistart(true);
-            });
-            r.tasks_rxen().write_value(1);
-
-            let deadline = Instant::now() + Duration::from_millis(SURVEY_DWELL_MS);
-            while Instant::now() < deadline {
-                if r.events_end().read() != 0 {
-                    r.events_end().write_value(0);
-                    let crc_ok = r.events_crcok().read() != 0;
-                    let rssi = -(r.rssisample().read().rssisample() as i16);
-                    r.events_crcok().write_value(0);
-                    r.events_address().write_value(0);
-                    if crc_ok {
-                        let buf = unsafe { &*RX_BUF.0.get() };
-                        let pdu_type = buf[0] & 0x0F;
-                        let len = buf[1] as usize;
-                        // ADV_IND (0x00) only — see the same filter in survey().
-                        if pdu_type == 0x00 && len >= 6 {
-                            let addr = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
-                            let addr_random = (buf[0] >> 6) & 1 == 1;
-                            let ad = &buf[8..2 + len];
-                            // Skip personal carry devices (phone, earbuds) from
-                            // the gitignored blacklist before they occupy a probe
-                            // slot or flood the report with rotating RPAs.
-                            if crate::blacklist::is_blacklisted(
-                                crate::blacklist::adv_name(ad).unwrap_or(&[]),
-                                &addr,
-                            ) {
-                                continue;
-                            }
-                            let sn = parse_midea_sn(ad);
-                            record_candidate_multi(out, addr, addr_random, rssi, sn);
-                        }
-                    }
-                    r.tasks_start().write_value(1);
-                }
-                Timer::after_micros(200).await;
-                rng.stir(r.rssisample().read().rssisample() as u32);
-            }
-
-            r.shorts().write(|_w| {});
-            r.tasks_disable().write_value(1);
-            let _ = wait_disabled();
-            r.events_disabled().write_value(0);
-        }
-    }
-}
-
-/// Insert/refresh a candidate in the fixed set: refresh RSSI if already present,
-/// else push, else replace the weakest when this one is stronger.
-fn record_candidate_multi(
-    out: &mut Vec<Candidate, MUX_MAX>,
-    addr: [u8; 6],
-    addr_random: bool,
-    rssi: i16,
-    sn: Option<[u8; 14]>,
-) {
-    for c in out.iter_mut() {
-        if c.addr == addr {
-            if rssi > c.rssi {
-                c.rssi = rssi;
-            }
-            return;
-        }
-    }
-    if recently_enumerated(addr, Instant::now()) {
-        return;
-    }
-    if out.push(Candidate { addr, addr_random, rssi, sn }).is_err() {
-        let mut wi = 0usize;
-        let mut wr = i16::MAX;
-        for (i, c) in out.iter().enumerate() {
-            if c.rssi < wr {
-                wr = c.rssi;
-                wi = i;
-            }
-        }
-        if rssi > wr {
-            out[wi] = Candidate { addr, addr_random, rssi, sn };
-        }
-    }
-}
-
-/// Move a freshly-established link's first anchor within its transmit window to the
-/// phase of the shared interval farthest from every link already established, so
-/// the links' events do not land on top of each other. The first link keeps its
-/// nominal anchor; each later one is placed relative to it.
-fn snap_anchor(conn: &mut Conn, existing: &[MuxLink]) {
-    if existing.is_empty() {
-        return; // the reference link — everyone else spreads around it
-    }
-    let interval = CONN_INTERVAL_TICKS;
-    // Placement room = one unit inside the peer's first-event RX window, so we
-    // never sit exactly on its far edge.
-    let win = ((MUX_WIN_SIZE as u64 - 1) * 1250 * embassy_time::TICK_HZ) / 1_000_000;
-    let base = conn.anchor.as_ticks();
-    let mut phases: Vec<u64, MUX_MAX> = Vec::new();
-    for l in existing {
-        let _ = phases.push(l.conn.anchor.as_ticks() % interval);
-    }
-    let steps = 24u64;
-    let mut best_off = 0u64;
-    let mut best_score = 0u64;
-    for s in 0..=steps {
-        let off = win * s / steps;
-        let ph = (base + off) % interval;
-        let mut mind = interval;
-        for &p in phases.iter() {
-            let d = ph.abs_diff(p);
-            let cd = d.min(interval - d);
-            mind = mind.min(cd);
-        }
-        if mind > best_score {
-            best_score = mind;
-            best_off = off;
-        }
-    }
-    conn.anchor += Duration::from_ticks(best_off);
-    if best_score < MUX_MIN_GAP_TICKS {
-        ulogf!(
-            "  mux: WARN anchor gap {}us below {}us target — links may collide\r\n",
-            best_score * 1_000_000 / embassy_time::TICK_HZ,
-            MUX_MIN_GAP_TICKS * 1_000_000 / embassy_time::TICK_HZ
-        );
-    }
-}
-
-/// One connection event for a link during multiplexed listen: send our empty (or
-/// owed) PDU, then decode any notification the peer pushed. Returns `false` when
-/// the link has gone silent past [`MAX_CONSEC_MISS`].
-async fn mux_listen_step(l: &mut MuxLink) -> bool {
-    let tx_len = match &l.owed {
-        Some((b, n)) => stage_att(&l.conn, &b[..*n]),
-        None => stage_empty(&l.conn),
-    };
-    let Some(rx) = conn_event(&mut l.conn, tx_len).await else {
-        l.miss += 1;
-        return l.miss < MAX_CONSEC_MISS;
-    };
-    l.miss = 0;
-    let (new_data, acked) = update_flow(&mut l.conn, &rx);
-    if acked {
-        l.owed = None;
-    }
-    if !new_data || rx.len == 0 {
-        return true;
-    }
-    let buf = unsafe { &*RX_BUF.0.get() };
-    let payload = &buf[2..2 + rx.len as usize];
-    match rx.llid {
-        0b11 => handle_ll_control(payload),
-        0b10 | 0b01 => {
-            if !l.asm.push(rx.llid, payload) {
-                return true;
-            }
-            let cid = l.asm.cid;
-            let mut reply = None;
-            {
-                use core::fmt::Write;
-                let frame = l.asm.frame();
-                if cid == 0x0004 && !frame.is_empty() {
-                    l.notifs += 1;
-                    let op = frame[0];
-                    if frame.len() >= 3 && matches!(op, ATT_HANDLE_VALUE_NTF | ATT_HANDLE_VALUE_IND)
-                    {
-                        let h = u16::from_le_bytes([frame[1], frame[2]]);
-                        let value = &frame[3..];
-                        let kind = if op == ATT_HANDLE_VALUE_IND { "IND" } else { "NTF" };
-                        // One self-contained header line: address, count, kind, the
-                        // handle stated once, its characteristic UUID+name (from the
-                        // walk), and the value length.
-                        let mut s = decoder::LogStr::new();
-                        let _ = write!(
-                            s,
-                            "  mux[{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}] notif #{} {} h={:04X} ",
-                            l.label[5], l.label[4], l.label[3], l.label[2], l.label[1], l.label[0],
-                            l.notifs, kind, h
-                        );
-                        // Resolve the name and attempt a value decode; hexdump only
-                        // whatever the decode did not account for.
-                        let mut consumed = 0usize;
-                        let mut decode_line: Option<decoder::LogStr> = None;
-                        if let Some(cr) = l.chars.iter().find(|c| c.handle == h) {
-                            let uuid = &cr.uuid[..cr.uuid_len as usize];
-                            decoder::gatt::write_uuid(&mut s, uuid);
-                            let mut d = decoder::LogStr::new();
-                            if let Some(n) = decoder::gatt::uweave::describe(uuid, value, &mut d) {
-                                consumed = n.min(value.len());
-                                decode_line = Some(d);
-                            }
-                        } else {
-                            let _ = s.push_str("(unknown handle)");
-                        }
-                        let _ = write!(s, " len={}", value.len());
-                        decoder::emit(s);
-                        if let Some(d) = decode_line {
-                            decoder::emit(d);
-                        }
-                        if consumed < value.len() {
-                            decoder::hexdump(&value[consumed..], consumed, 8);
-                        }
-                    } else {
-                        // A peer request or other ATT PDU on the bearer (not a
-                        // notification): log and field-decode it as before.
-                        let mut s = decoder::LogStr::new();
-                        let _ = write!(
-                            s,
-                            "  mux[{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}] peer ATT 0x{:02X} {} len={}",
-                            l.label[5], l.label[4], l.label[3], l.label[2], l.label[1], l.label[0],
-                            op, att_opcode_name(op), frame.len()
-                        );
-                        decoder::emit(s);
-                        decoder::protocol::l2cap::att::Att.decode(frame);
-                    }
-                    reply = peer_att_reply(op);
-                }
-            }
-            if let Some(r) = reply {
-                l.owed = Some(r);
-            }
-            l.asm.clear();
-        }
-        _ => {}
-    }
-    true
-}
-
-/// Advance every link's anchor — and, in lockstep, its CSA#1 channel — past `now`
-/// to the next event its peer is still counting toward. Any radio-stealing gap
-/// (initial setup, or a mid-listen backfill survey) leaves the survivors' anchors
-/// in the past; without hopping `unmapped` the same number of skipped intervals a
-/// link resumes N channels behind and the peer never hears it. See the failure this
-/// fixed in [`multiplex_listen_session`].
-fn catch_up_anchors(links: &mut [MuxLink], now: Instant) {
-    for l in links.iter_mut() {
-        while l.conn.anchor <= now {
-            l.conn.anchor += Duration::from_ticks(CONN_INTERVAL_TICKS);
-            l.conn.unmapped = (l.conn.unmapped + l.conn.hop) % 37;
-        }
-    }
-}
-
-/// Connect one candidate, place its anchor clear of `existing`, subscribe (MTU +
-/// discovery + walk, no listen), and return the ready link — capturing its
-/// handle→UUID table for notification naming. `None` if the connect fails or the
-/// peer never replies (`ev_addr == 0`: a half-open link that would only occupy a
-/// slot and time out). Freezes `existing`; the caller must `catch_up_anchors` after.
-async fn establish_link(rng: &mut Rng, cand: &Candidate, existing: &[MuxLink]) -> Option<MuxLink> {
-    use core::sync::atomic::Ordering::Relaxed;
-    CONN_AA.store(pick_access_address(rng), Relaxed);
-    pick_conn_params(rng);
-    randomize_our_addr(rng);
-    let mut st = ConnectStats::default();
-    let Some(mut conn) = try_connect(cand, &mut st).await else {
-        ulogf!(
-            "  mux: connect failed {:02X}:{:02X} (target={} connectable={})\r\n",
-            cand.addr[5], cand.addr[0], st.target, st.connectable
-        );
-        ensure_disabled();
-        configure_ble();
-        return None;
-    };
-    // This link's data-channel identity, then place its anchor off the ones already
-    // up, then subscribe.
-    configure_conn_radio();
-    snap_anchor(&mut conn, existing);
-    exchange_mtu(&mut conn).await;
-    let mut services: Vec<Service, MAX_SERVICES> = Vec::new();
-    discover_services(&mut conn, &mut services).await;
-    let mut chars: Vec<CharRef, MUX_CHARS> = Vec::new();
-    let subs = walk_services(&mut conn, &services, |vh, uuid| {
-        let n = uuid.len().min(16);
-        let mut cr = CharRef { handle: vh, uuid: [0; 16], uuid_len: n as u8 };
-        cr.uuid[..n].copy_from_slice(&uuid[..n]);
-        let _ = chars.push(cr);
-    })
-    .await;
-    if conn.ev_addr == 0 {
-        // The peer never transmitted — CONNECT_IND ignored, or our anchor missed
-        // its window. Not a link, just a slot-and-timeout waster.
-        ulogf!(
-            "  mux: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} no peer reply — dropping\r\n",
-            cand.addr[5], cand.addr[4], cand.addr[3], cand.addr[2], cand.addr[1], cand.addr[0]
-        );
-        ensure_disabled();
-        configure_ble();
-        return None;
-    }
-    ulogf!(
-        "  mux: link up {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} services={} subs={}\r\n",
-        cand.addr[5], cand.addr[4], cand.addr[3], cand.addr[2], cand.addr[1], cand.addr[0],
-        services.len(), subs
-    );
-    Some(MuxLink {
-        conn,
-        asm: Reasm::new(),
-        owed: None,
-        miss: 0,
-        label: cand.addr,
-        notifs: 0,
-        chars,
-    })
-}
-
-/// Test drive: hold up to [`MUX_MAX`] links open and listen to all of them at once
-/// for `secs`, **backfilling freed slots** with freshly-surveyed devices so the
-/// window stays full instead of the listen monopolizing the radio for its whole
-/// duration. Establishment is serial (one radio initiates one link at a time); the
-/// widened supervision timeout keeps existing links alive through each setup gap,
-/// after which `catch_up_anchors` resyncs them. HARDWARE-UNVERIFIED.
-pub(crate) async fn multiplex_listen_session(rng: &mut Rng, cands: &[Candidate], secs: u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    if cands.is_empty() {
-        return;
-    }
-    TX_WIN_SIZE_UNITS.store(MUX_WIN_SIZE, Relaxed);
-    CONN_TIMEOUT_UNITS.store(MUX_CONN_TIMEOUT, Relaxed);
-
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    let mut links: Vec<MuxLink, MUX_MAX> = Vec::new();
-
-    // Initial fill from the candidates the caller surveyed.
-    for cand in cands.iter().take(MUX_MAX) {
-        if let Some(l) = establish_link(rng, cand, &links).await {
-            let _ = links.push(l);
-        }
-    }
-    catch_up_anchors(&mut links, Instant::now());
-    ulogf!("  mux: listening up to {}s ({} link(s), backfilling as slots free)\r\n", secs, links.len());
-
-    let mut next_beat = Instant::now() + Duration::from_secs(5);
-    let mut next_backfill = Instant::now() + Duration::from_secs(MUX_BACKFILL_EVERY_S);
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-
-        // Backfill a freed slot with a device we are not already holding — this is
-        // what interleaves discovery into the listen instead of blocking on it.
-        // Rate-limited: each survey freezes the survivors for its duration.
-        if links.len() < MUX_MAX
-            && now >= next_backfill
-            && deadline.saturating_duration_since(now)
-                > Duration::from_secs(MUX_BACKFILL_MIN_LEFT_S)
-        {
-            let mut fresh: Vec<Candidate, MUX_MAX> = Vec::new();
-            survey_multi(rng, &mut fresh).await;
-            for cand in fresh.iter() {
-                if links.len() >= MUX_MAX {
-                    break;
-                }
-                if links.iter().any(|l| l.label == cand.addr) {
-                    continue; // already holding this device
-                }
-                if let Some(l) = establish_link(rng, cand, &links).await {
-                    let _ = links.push(l);
-                }
-            }
-            catch_up_anchors(&mut links, Instant::now());
-            next_backfill = Instant::now() + Duration::from_secs(MUX_BACKFILL_EVERY_S);
-            next_beat = Instant::now() + Duration::from_secs(5);
-        }
-
-        if links.is_empty() {
-            // Nothing to service; wait a little for the next backfill window rather
-            // than spinning.
-            Timer::after_millis(200).await;
-            continue;
-        }
-
-        // Heartbeat: a mostly-silent listen produces no output for a long time,
-        // which reads as a hang. Every 5 s, show each link is still being serviced.
-        if Instant::now() >= next_beat {
-            for l in links.iter() {
-                ulogf!(
-                    "  mux: alive {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} ev={} notifs={}\r\n",
-                    l.label[5], l.label[4], l.label[3], l.label[2], l.label[1], l.label[0],
-                    l.conn.ev_total, l.notifs
-                );
-            }
-            next_beat += Duration::from_secs(5);
-        }
-
-        // Service the live link whose anchor is soonest.
-        let mut bi = 0usize;
-        for (i, l) in links.iter().enumerate() {
-            if l.conn.anchor < links[bi].conn.anchor {
-                bi = i;
-            }
-        }
-        if !mux_listen_step(&mut links[bi]).await {
-            let (label, notifs) = {
-                let l = &links[bi];
-                (l.label, l.notifs)
-            };
-            ulogf!(
-                "  mux: link {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} lost (notifs={})\r\n",
-                label[5], label[4], label[3], label[2], label[1], label[0], notifs
-            );
-            let _ = links.swap_remove(bi);
-        }
-    }
-
-    for l in links.iter_mut() {
-        if l.conn.ev_addr != 0 {
-            terminate(&mut l.conn).await;
-        }
-        ulogf!(
-            "  mux: link {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} closed notifs={}\r\n",
-            l.label[5], l.label[4], l.label[3], l.label[2], l.label[1], l.label[0], l.notifs
-        );
-    }
-    ensure_disabled();
-    configure_ble();
-    TX_WIN_SIZE_UNITS.store(WIN_SIZE, Relaxed);
-    CONN_TIMEOUT_UNITS.store(CONN_TIMEOUT, Relaxed);
+    *best = Some(Candidate { addr, addr_random, rssi, sn, dessmann: false, misensor: false });
 }
 
 /// Whether this connection attempt should be spent on the accept probe rather
@@ -1755,8 +1263,8 @@ fn finish_connect(cand: &Candidate, st: &mut ConnectStats) -> Option<Conn> {
         first_late_us: i32::MIN,
         saw_reply: false,
         att_mtu: ATT_MTU_DEFAULT as u16,
-        // Capture the identity this link was established with, so a multiplexed
-        // driver can restore it on the radio before each of this link's events.
+        // The radio identity this connection was established with, restored by
+        // `conn_event` on the radio before each of this connection's events.
         aa: conn_aa(),
         crc_init: conn_crc_init(),
         hop: conn_hop(),
@@ -1822,8 +1330,7 @@ pub(crate) async fn conn_event(conn: &mut Conn, tx_len: u8) -> Option<RxPdu> {
     conn.anchor += Duration::from_ticks(CONN_INTERVAL_TICKS);
 
     // CSA#1: next data channel = (last + hop) mod 37 (full map → no remap). The
-    // hop increment is this link's own, not the global — several multiplexed links
-    // each walk their own channel sequence.
+    // hop increment is this connection's own, stored on it when it was established.
     conn.unmapped = (conn.unmapped + conn.hop) % 37;
     let freq = match data_ch_freq(conn.unmapped) {
         Some(f) => f,
@@ -1832,10 +1339,10 @@ pub(crate) async fn conn_event(conn: &mut Conn, tx_len: u8) -> Option<RxPdu> {
 
     let r = pac::RADIO;
     ensure_disabled();
-    // Restore this link's identity. With one connection these already hold the
-    // values `configure_conn_radio` programmed; with several multiplexed on the
-    // one radio, the previous event serviced a *different* link, so the access
-    // address and CRC init must be set back to this connection's before it fires.
+    // Restore this connection's identity on the radio before the event fires:
+    // the radio may be left configured for the advertising channels or for
+    // nothing at all, so the access address and CRC init are set back explicitly
+    // on every event.
     set_access_address(conn.aa);
     r.crcinit().write(|w| w.set_crcinit(conn.crc_init));
     r.frequency().write(|w| {

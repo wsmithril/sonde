@@ -205,3 +205,28 @@ where
     pub64.copy_from_slice(&full[1..65]);
     (priv_b, pub64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::derive_root_key;
+
+    /// Golden conformance vector from the Go / midea-ble reference suite
+    /// (`src/proto/crypto.rs::root_key_golden_vector`): advertisData
+    /// `0xAC 31 32 33 34 35 36 37 38 AA BB CC DD EE FF` → rootKey
+    /// `3ab82c346a77b6593d5ebe9f25d3cf50`. Verified independently against a
+    /// Python HKDF recomputation. (Not runnable under `cargo test` while this
+    /// crate links thumb-only embassy deps; kept as the documented vector.)
+    #[test]
+    fn root_key_golden_vector() {
+        let ad = [
+            0xAC, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        ];
+        assert_eq!(
+            derive_root_key(&ad),
+            [
+                0x3a, 0xb8, 0x2c, 0x34, 0x6a, 0x77, 0xb6, 0x59, 0x3d, 0x5e, 0xbe, 0x9f, 0x25, 0xd3,
+                0xcf, 0x50,
+            ]
+        );
+    }
+}

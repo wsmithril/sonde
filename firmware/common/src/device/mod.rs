@@ -7,4 +7,6 @@
 
 pub mod airoha;
 pub mod daikin;
+pub mod dessmann;
 pub mod midea;
+pub mod mi;

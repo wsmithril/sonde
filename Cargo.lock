@@ -335,6 +335,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "dx-gp21-core"
+version = "0.1.0"
+dependencies = [
+ "defmt",
+]
+
+[[package]]
+name = "dx-gp21-embedded"
+version = "0.1.0"
+dependencies = [
+ "dx-gp21-core",
+ "embedded-io-async 0.7.0",
+ "heapless 0.9.3",
+]
+
+[[package]]
+name = "dx-gp21-nrf52840"
+version = "0.1.0"
+dependencies = [
+ "cortex-m-rt",
+ "critical-section",
+ "defmt",
+ "defmt-rtt",
+ "dx-gp21-core",
+ "dx-gp21-embedded",
+ "embassy-executor",
+ "embassy-nrf",
+ "embassy-time",
+ "panic-probe",
+ "static_cell",
+]
+
+[[package]]
 name = "elliptic-curve"
 version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1203,8 +1236,10 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "critical-section",
  "defmt",
  "defmt-rtt",
+ "dx-gp21-nrf52840",
  "embassy-executor",
  "embassy-futures",
  "embassy-nrf",

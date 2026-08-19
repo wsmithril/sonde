@@ -1,4 +1,7 @@
 [toolchain]
-channel    = "stable"
+# Pinned exact release: sonde targets edition 2024 (needs >= 1.85) and this is
+# the release the tree is verified against. A `stable` channel would silently
+# advance on the next rustup update.
+channel    = "1.97.1"
 components = ["rust-src", "rustfmt", "llvm-tools"]
 targets    = ["thumbv7em-none-eabi"]

@@ -1,5 +1,56 @@
 company_identifiers:
 
+  - value: 0x110C
+    name: 'rescuetrack GmbH'
+
+  - value: 0x110B
+    name: 'SIGMA CORPORATION'
+
+  - value: 0x110A
+    name: 'OnRace Motorsports'
+
+  - value: 0x1109
+    name: 'Hamodaz Corporation'
+
+  - value: 0x1108
+    name: 'BEMER Int. AG'
+
+  - value: 0x1107
+    name: 'Optrel AG'
+
+  - value: 0x1106
+    name: 'Flicfit inc.'
+
+  - value: 0x1105
+    name: 'Cirrus Design Corporation'
+
+  - value: 0x1104
+    name: 'Daiichi Elektronik Sanayi ve Ticaret. A.S.'
+
+  - value: 0x1103
+    name: 'BRISANT SECURE LTD'
+
+  - value: 0x1102
+    name: 'Temple Private Limited'
+
+  - value: 0x1101
+    name: 'Nearfaces UG (haftungsbeschränkt)'
+
+  - value: 0x1100
+    name: 'miThings'
+
+  - value: 0x10FF
+    name: 'Sonus Faber spa'
+
+  - value: 0x10FE
+    name: 'Daisen Electronic Industrial Co., Ltd.'
+
+  - value: 0x10FD
+    name: 'Neurabody Inc.'
+
+  - value: 0x10FC
+    name: 'CITECH CO.,LTD.'
+
   - value: 0x10FB
     name: 'Hydratune Australia Pty Ltd'
 
@@ -2767,7 +2818,7 @@ company_identifiers:
     name: 'TAG HEUER SA'
 
   - value: 0x0CE6
-    name: 'McWong International, Inc.'
+    name: 'mwConnect'
 
   - value: 0x0CE5
     name: 'Amina Distribution AS'

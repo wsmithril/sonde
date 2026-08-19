@@ -25,13 +25,14 @@ use super::{emit, hexdump, write_hex, LogStr};
 pub(super) struct Xiaomi;
 impl super::VendorDecoder for Xiaomi {
     fn company_ids(&self) -> &'static [u16] { &[0x038F] }
-    fn service_uuids(&self) -> &'static [u16] { &[0xFE95, 0xFDAA] }
+    fn service_uuids(&self) -> &'static [u16] { &[0xFE95, 0xFDAA, 0x181D] }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         match ctx.kind {
             super::FrameKind::Mfg => Self::decode_mfg(body, ctx.base),
             super::FrameKind::Service => match ctx.key {
                 0xFE95 => Self::decode_mibeacon(body, ctx.base),
                 0xFDAA => Self::decode_fdaa(body, ctx.base),
+                0x181D => Self::decode_scale(body, ctx.base),
                 _ => hexdump(body, ctx.base, 6),
             },
         }
@@ -39,6 +40,29 @@ impl super::VendorDecoder for Xiaomi {
 }
 
 impl Xiaomi {
+    /// Mi Body Composition Scale measurement service data (UUID 0x181D): the
+    /// scale broadcasts a 13-byte measurement — `[ctrl0][ctrl1][YY MM DD hh mm
+    /// ss][impedance LE][weight LE]` — weight = raw / 200. This follows the
+    /// documented Mi Scale 2 format; the Newbit `MI_Scale` clone's exact advert
+    /// AD is HARDWARE-UNVERIFIED (no captured scale advert to confirm against).
+    fn decode_scale(f: &[u8], base: usize) {
+        if let Some(m) = crate::device::mi::parse_measurement(f) {
+            let mut s: LogStr = LogStr::new();
+            let _ = write!(s, "    MiScale: weight={:.2} kg", m.weight_kg());
+            if m.lbs {
+                let _ = write!(s, " (lbs mode)");
+            }
+            let _ = write!(s, " at {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                m.year, m.month, m.day, m.hour, m.minute, m.second);
+            if m.has_impedance {
+                let _ = write!(s, " impedance={}", m.impedance);
+            }
+            emit(s);
+        } else {
+            hexdump(f, base, 6);
+        }
+    }
+
     fn decode_mibeacon(f: &[u8], base: usize) {
         if f.len() < 5 { return; }
         let fc        = u16::from_le_bytes([f[0], f[1]]);

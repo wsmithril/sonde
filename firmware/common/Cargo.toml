@@ -28,6 +28,7 @@ embassy-futures  = { workspace = true }
 static_cell      = { workspace = true }
 heapless         = { workspace = true }
 embedded-storage = { workspace = true }
+critical-section = { workspace = true }
 defmt            = { workspace = true }
 defmt-rtt        = { workspace = true }
 cortex-m         = { workspace = true }
@@ -35,3 +36,6 @@ cortex-m-rt      = { workspace = true }
 panic-probe      = { workspace = true }
 sha2             = { workspace = true }
 p256             = { workspace = true }
+# DX-GP21 GNSS module — the migrated Embassy board layer from the sibling
+# dx-gp21-rust repo (path + features live in the workspace root).
+dx-gp21-nrf52840 = { workspace = true }

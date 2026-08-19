@@ -1,0 +1,3 @@
+[submodule "vendor/dx-gp21"]
+	path = vendor/dx-gp21
+	url = git@github.com:wsmithril/dx-gp21-rust.git

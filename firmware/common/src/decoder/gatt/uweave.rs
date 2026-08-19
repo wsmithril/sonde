@@ -12,6 +12,11 @@
 //! * DATA bit 3 (0x08): first fragment; bit 2 (0x04): last fragment
 //!
 //! So e.g. `0x82` = CONTROL, counter 0, command 2 = CONNECTION_CLOSE.
+//!
+//! [`describe`] decodes a uWeave notification value into a log line; the
+//! connection code has not adopted it yet, so it is kept available for the
+//! value-read/decode path.
+#![allow(dead_code)]
 
 use core::fmt::Write;
 

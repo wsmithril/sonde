@@ -10,6 +10,7 @@
 use embassy_executor::Spawner;
 use embassy_nrf::qspi::{self, Qspi};
 use embassy_nrf::spim::{self, Spim};
+use embassy_nrf::uarte;
 use embassy_nrf::usb::{self, Driver, vbus_detect::HardwareVbusDetect};
 use embassy_nrf::{Peri, bind_interrupts, peripherals};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Sender, State};
@@ -23,7 +24,7 @@ use defmt_rtt as _;
 
 use sonde_common::boot::{self, BootMode, next_boot_mode};
 use sonde_common::led::OnBoardLed as _;
-use sonde_common::{LOG, LOG_DROPPED, Rng, decoder, hal, led, mode, panic, ulog, ulogf, wallclock};
+use sonde_common::{LOG, LOG_DROPPED, Rng, decoder, gnss, hal, led, mode, panic, ulog, ulogf, wallclock};
 
 mod callback;
 
@@ -34,6 +35,8 @@ bind_interrupts!(struct Irqs {
     QSPI        => qspi::InterruptHandler<peripherals::QSPI>;
     USBD        => usb::InterruptHandler<peripherals::USBD>;
     CLOCK_POWER => usb::vbus_detect::InterruptHandler;
+    // GNSS module (DX-GP21): the NMEA UART + the 1PPS input wait.
+    UARTE0 => uarte::InterruptHandler<peripherals::UARTE0>;
 });
 
 // ── Capture sink + context ──────────────────────────────────────────────────
@@ -355,6 +358,12 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb_run(usb, tx).unwrap());
 
     indicate(mode).await;
+
+    // GNSS (DX-GP21): wire the UART + 1PPS if the module is present. The boot
+    // probe leaves the 1PPS pin unbound when the module does not answer — a
+    // floating input must not drive the pulse handler.
+    let gnss = gnss::spawn(spawner, p.UARTE0, Irqs, p.P0_02, p.P0_03, p.P0_04, p.P0_05).await;
+    ulogf!("gnss: module {}\r\n", if gnss { "present — 1PPS armed" } else { "absent — 1PPS skipped" });
 
     // Spawn the selected mode's task. Each `callback::*` task builds the mode, then
     // hands it a build-specific `setup` future (QSPI/LED/provisioning) that the mode
