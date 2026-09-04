@@ -7,7 +7,7 @@
 
 use core::fmt::Write;
 
-use super::{error_name, line, send, u16le, u24le, write_interval, write_phys, Decoder};
+use super::{Decoder, error_name, line, send, u16le, u24le, write_interval, write_phys};
 
 pub(super) struct Iso;
 
@@ -52,13 +52,20 @@ impl Decoder<u8> for Iso {
                 let _ = write!(
                     s,
                     "nse={} sub_int={}us bn={}/{} ft={}/{} iso_int=",
-                    d[18], u24le(d, 19), d[22] & 0x0F, d[22] >> 4, d[23], d[24]
+                    d[18],
+                    u24le(d, 19),
+                    d[22] & 0x0F,
+                    d[22] >> 4,
+                    d[23],
+                    d[24]
                 );
                 write_interval(&mut s, u16le(d, 25));
                 let _ = write!(
                     s,
                     " cis_offset={}..{}us ref_ev={}",
-                    u24le(d, 27), u24le(d, 30), u16le(d, 33)
+                    u24le(d, 27),
+                    u24le(d, 30),
+                    u16le(d, 33)
                 );
                 send(s);
             }
@@ -68,7 +75,9 @@ impl Decoder<u8> for Iso {
                 let _ = write!(
                     s,
                     "cis_offset={}..{}us ref_ev={}",
-                    u24le(d, 0), u24le(d, 3), u16le(d, 6)
+                    u24le(d, 0),
+                    u24le(d, 3),
+                    u16le(d, 6)
                 );
                 send(s);
             }
@@ -80,7 +89,10 @@ impl Decoder<u8> for Iso {
                     s,
                     "aa=0x{:08X} cis_offset={}us cig_sync_delay={}us cis_sync_delay={}us ref_ev={}",
                     u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
-                    u24le(d, 4), u24le(d, 7), u24le(d, 10), u16le(d, 13)
+                    u24le(d, 4),
+                    u24le(d, 7),
+                    u24le(d, 10),
+                    u16le(d, 13)
                 );
                 send(s);
             }
@@ -90,7 +102,10 @@ impl Decoder<u8> for Iso {
                 let _ = write!(
                     s,
                     "cig={} cis={} error=0x{:02X} ({})",
-                    d[0], d[1], d[2], error_name(d[2])
+                    d[0],
+                    d[1],
+                    d[2],
+                    error_name(d[2])
                 );
                 send(s);
             }

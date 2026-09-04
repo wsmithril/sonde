@@ -17,15 +17,19 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// Xiaomi — MiBeacon service data (UUID 0xFE95), Mi Connect service data
 /// (UUID 0xFDAA), and manufacturer data (Company ID 0x038F); dispatched by
 /// frame kind and key.
 pub(super) struct Xiaomi;
 impl super::VendorDecoder for Xiaomi {
-    fn company_ids(&self) -> &'static [u16] { &[0x038F] }
-    fn service_uuids(&self) -> &'static [u16] { &[0xFE95, 0xFDAA, 0x181D] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x038F]
+    }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFE95, 0xFDAA, 0x181D]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         match ctx.kind {
             super::FrameKind::Mfg => Self::decode_mfg(body, ctx.base),
@@ -52,8 +56,11 @@ impl Xiaomi {
             if m.lbs {
                 let _ = write!(s, " (lbs mode)");
             }
-            let _ = write!(s, " at {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                m.year, m.month, m.day, m.hour, m.minute, m.second);
+            let _ = write!(
+                s,
+                " at {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                m.year, m.month, m.day, m.hour, m.minute, m.second
+            );
             if m.has_impedance {
                 let _ = write!(s, " impedance={}", m.impedance);
             }
@@ -64,33 +71,44 @@ impl Xiaomi {
     }
 
     fn decode_mibeacon(f: &[u8], base: usize) {
-        if f.len() < 5 { return; }
-        let fc        = u16::from_le_bytes([f[0], f[1]]);
-        let product   = u16::from_le_bytes([f[2], f[3]]);
-        let counter   = f[4];
+        if f.len() < 5 {
+            return;
+        }
+        let fc = u16::from_le_bytes([f[0], f[1]]);
+        let product = u16::from_le_bytes([f[2], f[3]]);
+        let counter = f[4];
         // Frame Control bitfield (LE): 3=encrypted, 4=MAC, 5=capability, 6=object,
         // 7=mesh, 8=registered, 9=solicited, 10-11=auth mode, 12-15=version.
         let encrypted = (fc >> 3) & 1 != 0;
-        let mac_inc   = (fc >> 4) & 1 != 0;
-        let cap_inc   = (fc >> 5) & 1 != 0;
-        let obj_inc   = (fc >> 6) & 1 != 0;
-        let mesh      = (fc >> 7) & 1 != 0;
+        let mac_inc = (fc >> 4) & 1 != 0;
+        let cap_inc = (fc >> 5) & 1 != 0;
+        let obj_inc = (fc >> 6) & 1 != 0;
+        let mesh = (fc >> 7) & 1 != 0;
         let registered = (fc >> 8) & 1 != 0;
         let solicited = (fc >> 9) & 1 != 0;
         let auth_mode = (fc >> 10) & 0x03;
-        let version   = (fc >> 12) & 0x0F;
+        let version = (fc >> 12) & 0x0F;
 
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    MiBeacon: product=0x{:04X} cnt={} v{} enc={} auth={}",
-            product, counter, version, encrypted, auth_mode);
+        let _ = write!(
+            s,
+            "    MiBeacon: product=0x{:04X} cnt={} v{} enc={} auth={}",
+            product, counter, version, encrypted, auth_mode
+        );
         if let Some(model) = Self::product_name(product) {
             let _ = write!(s, " model={}", model);
         } else if Self::OBSERVED_UNIDENTIFIED.binary_search(&product).is_ok() {
             let _ = write!(s, " (observed, model unidentified)");
         }
-        if mesh       { let _ = write!(s, " mesh"); }
-        if registered { let _ = write!(s, " registered"); }
-        if solicited  { let _ = write!(s, " solicited"); }
+        if mesh {
+            let _ = write!(s, " mesh");
+        }
+        if registered {
+            let _ = write!(s, " registered");
+        }
+        if solicited {
+            let _ = write!(s, " solicited");
+        }
         // The optional MAC is the device's real, static hardware address, carried
         // in the clear inside the service data. It does not rotate with the
         // advertising RPA, so it defeats address privacy on its own — the same
@@ -98,28 +116,41 @@ impl Xiaomi {
         // Print it rather than skipping past it to reach the sensor objects.
         if mac_inc && f.len() >= 11 {
             let a = &f[5..11];
-            let _ = write!(s, " mac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                a[5], a[4], a[3], a[2], a[1], a[0]);
+            let _ = write!(
+                s,
+                " mac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                a[5], a[4], a[3], a[2], a[1], a[0]
+            );
         }
         let _ = write!(s, "\r\n");
         emit(s);
 
         // Step past the MAC and capability fields to reach the object section.
         let mut idx = 5;
-        if mac_inc { idx += 6; }
+        if mac_inc {
+            idx += 6;
+        }
         if cap_inc {
-            if idx >= f.len() { return; }
+            if idx >= f.len() {
+                return;
+            }
             let cap = f[idx];
             idx += 1;
-            if cap & 0x20 != 0 { idx += 2; } // extended I/O capability
+            if cap & 0x20 != 0 {
+                idx += 2;
+            } // extended I/O capability
         }
-        if encrypted || !obj_inc { return; }
+        if encrypted || !obj_inc {
+            return;
+        }
 
         // TLV objects: [type u16 LE][len u8][data].
         while idx + 3 <= f.len() {
             let otype = u16::from_le_bytes([f[idx], f[idx + 1]]);
-            let olen  = f[idx + 2] as usize;
-            if idx + 3 + olen > f.len() { break; }
+            let olen = f[idx + 2] as usize;
+            if idx + 3 + olen > f.len() {
+                break;
+            }
             Self::decode_object(otype, &f[idx + 3..idx + 3 + olen], base + idx + 3);
             idx += 3 + olen;
         }
@@ -130,31 +161,81 @@ impl Xiaomi {
     /// sensor devices ble_monitor tracks; non-sensor products stay unnamed. Sorted
     /// by ID for binary search.
     const PRODUCTS: &'static [(u16, &'static str)] = &[
-        (0x0083, "YM-K1501"), (0x0098, "HHCCJCY01"), (0x00DB, "MMC-T201-1"),
-        (0x0113, "YM-K1501EU"), (0x0153, "YLYK01YL"), (0x015D, "HHCCPOT002"),
-        (0x01AA, "LYWSDCGQ"), (0x02DF, "JQJCY01YM"), (0x0347, "CGG1"),
-        (0x0380, "DSL-C08"), (0x0387, "MHO-C401"), (0x0391, "MMC-W505"),
-        (0x03B6, "YLKG07YL/YLKG08YL"), (0x03BC, "GCLS002"), (0x03BF, "YLYB01YL-BHFRC"),
-        (0x03D6, "CGH1"), (0x03DD, "MUE4094RT"), (0x040A, "WX08ZM"),
-        (0x045B, "LYWSD02"), (0x045C, "V-SK152"), (0x0489, "M1S-T500"),
-        (0x04E1, "XMMF01JQD"), (0x04E6, "YLYK01YL-VENFAN"), (0x04E9, "MJZNMSQ01YD"),
-        (0x055B, "LYWSD03MMC"), (0x0576, "CGD1"), (0x066F, "CGDK2"),
-        (0x068E, "YLYK01YL-FANCL"), (0x069E, "ZNMS16LM"), (0x069F, "ZNMS17LM"),
-        (0x06D3, "MHO-C303"), (0x0784, "XMZNMS04LM"), (0x07BF, "YLAI003"),
-        (0x07F6, "MJYD02YL"), (0x0806, "T700"), (0x0863, "SJWS01LM"),
-        (0x098B, "MCCGQ02HL"), (0x098C, "XMZNMST02YD"), (0x0997, "JTYJGD03MI"),
-        (0x0A83, "CGPR1"), (0x0A8D, "RTCGQ02LM"), (0x0B48, "CGG1-ENCRYPTED"),
-        (0x0C3C, "CGC1"), (0x0DE7, "SU001-T"), (0x0DFD, "K9B-3BTN"),
-        (0x0E39, "XMZNMS08LM"), (0x11C2, "SV40"), (0x1203, "XMWSDJ04MMC"),
-        (0x1568, "K9B-1BTN"), (0x1569, "K9B-2BTN"), (0x16E4, "LYWSD02MMC"),
-        (0x1790, "T700i"), (0x1889, "MS1BB(MI)"), (0x18E3, "ZX1"),
-        (0x1949, "XMWXKG01YL"), (0x1C10, "K9BB-1BTN"), (0x20DB, "MJZNZ018H"),
-        (0x2387, "XMWXKG01LM"), (0x2542, "LYWSD02MMC"), (0x2832, "MJWSD05MMC"),
-        (0x2AEB, "HS1BB(MI)"), (0x3531, "XMPIRO2SXS"), (0x38BB, "PTX"),
-        (0x3A61, "KS1"), (0x3BD5, "MJTZC01YM"), (0x3E17, "KS1BP"),
-        (0x3F0F, "RS1BB"), (0x3F4C, "PS1BB"), (0x4683, "XMOSB01XS"),
-        (0x4F59, "CGDK3"), (0x50FB, "ES3"), (0x55B5, "MJWSD06MMC"),
-        (0x5808, "CGG3"), (0x5DB1, "MBS17"), (0x64C5, "PTX-F1-Display"),
+        (0x0083, "YM-K1501"),
+        (0x0098, "HHCCJCY01"),
+        (0x00DB, "MMC-T201-1"),
+        (0x0113, "YM-K1501EU"),
+        (0x0153, "YLYK01YL"),
+        (0x015D, "HHCCPOT002"),
+        (0x01AA, "LYWSDCGQ"),
+        (0x02DF, "JQJCY01YM"),
+        (0x0347, "CGG1"),
+        (0x0380, "DSL-C08"),
+        (0x0387, "MHO-C401"),
+        (0x0391, "MMC-W505"),
+        (0x03B6, "YLKG07YL/YLKG08YL"),
+        (0x03BC, "GCLS002"),
+        (0x03BF, "YLYB01YL-BHFRC"),
+        (0x03D6, "CGH1"),
+        (0x03DD, "MUE4094RT"),
+        (0x040A, "WX08ZM"),
+        (0x045B, "LYWSD02"),
+        (0x045C, "V-SK152"),
+        (0x0489, "M1S-T500"),
+        (0x04E1, "XMMF01JQD"),
+        (0x04E6, "YLYK01YL-VENFAN"),
+        (0x04E9, "MJZNMSQ01YD"),
+        (0x055B, "LYWSD03MMC"),
+        (0x0576, "CGD1"),
+        (0x066F, "CGDK2"),
+        (0x068E, "YLYK01YL-FANCL"),
+        (0x069E, "ZNMS16LM"),
+        (0x069F, "ZNMS17LM"),
+        (0x06D3, "MHO-C303"),
+        (0x0784, "XMZNMS04LM"),
+        (0x07BF, "YLAI003"),
+        (0x07F6, "MJYD02YL"),
+        (0x0806, "T700"),
+        (0x0863, "SJWS01LM"),
+        (0x098B, "MCCGQ02HL"),
+        (0x098C, "XMZNMST02YD"),
+        (0x0997, "JTYJGD03MI"),
+        (0x0A83, "CGPR1"),
+        (0x0A8D, "RTCGQ02LM"),
+        (0x0B48, "CGG1-ENCRYPTED"),
+        (0x0C3C, "CGC1"),
+        (0x0DE7, "SU001-T"),
+        (0x0DFD, "K9B-3BTN"),
+        (0x0E39, "XMZNMS08LM"),
+        (0x11C2, "SV40"),
+        (0x1203, "XMWSDJ04MMC"),
+        (0x1568, "K9B-1BTN"),
+        (0x1569, "K9B-2BTN"),
+        (0x16E4, "LYWSD02MMC"),
+        (0x1790, "T700i"),
+        (0x1889, "MS1BB(MI)"),
+        (0x18E3, "ZX1"),
+        (0x1949, "XMWXKG01YL"),
+        (0x1C10, "K9BB-1BTN"),
+        (0x20DB, "MJZNZ018H"),
+        (0x2387, "XMWXKG01LM"),
+        (0x2542, "LYWSD02MMC"),
+        (0x2832, "MJWSD05MMC"),
+        (0x2AEB, "HS1BB(MI)"),
+        (0x3531, "XMPIRO2SXS"),
+        (0x38BB, "PTX"),
+        (0x3A61, "KS1"),
+        (0x3BD5, "MJTZC01YM"),
+        (0x3E17, "KS1BP"),
+        (0x3F0F, "RS1BB"),
+        (0x3F4C, "PS1BB"),
+        (0x4683, "XMOSB01XS"),
+        (0x4F59, "CGDK3"),
+        (0x50FB, "ES3"),
+        (0x55B5, "MJWSD06MMC"),
+        (0x5808, "CGG3"),
+        (0x5DB1, "MBS17"),
+        (0x64C5, "PTX-F1-Display"),
     ];
 
     fn product_name(id: u16) -> Option<&'static str> {
@@ -196,18 +277,28 @@ impl Xiaomi {
                 let v = u16::from_le_bytes([d[0], d[1]]);
                 let _ = write!(s, "humidity {}.{}%", v / 10, v % 10);
             }
-            0x100A if !d.is_empty() => { let _ = write!(s, "battery {}%", d[0]); }
+            0x100A if !d.is_empty() => {
+                let _ = write!(s, "battery {}%", d[0]);
+            }
             0x100D if d.len() >= 4 => {
                 let tv = i16::from_le_bytes([d[0], d[1]]);
                 let hv = u16::from_le_bytes([d[2], d[3]]);
-                let _ = write!(s, "temp {}.{} C humidity {}.{}%",
-                    tv / 10, (tv % 10).abs(), hv / 10, hv % 10);
+                let _ = write!(
+                    s,
+                    "temp {}.{} C humidity {}.{}%",
+                    tv / 10,
+                    (tv % 10).abs(),
+                    hv / 10,
+                    hv % 10
+                );
             }
             0x1007 if d.len() >= 3 => {
                 let lux = u32::from_le_bytes([d[0], d[1], d[2], 0]);
                 let _ = write!(s, "illuminance {} lux", lux);
             }
-            0x1008 if !d.is_empty() => { let _ = write!(s, "moisture {}%", d[0]); }
+            0x1008 if !d.is_empty() => {
+                let _ = write!(s, "moisture {}%", d[0]);
+            }
             0x1009 if d.len() >= 2 => {
                 let _ = write!(s, "conductivity {} uS/cm", u16::from_le_bytes([d[0], d[1]]));
             }
@@ -217,27 +308,41 @@ impl Xiaomi {
             }
             // Object layouts below are from the Bluetooth-Devices/xiaomi-ble parser
             // (github.com/Bluetooth-Devices/xiaomi-ble, xiaomi_ble/parser.py).
-            0x0003 => { let _ = write!(s, "motion detected"); }
+            0x0003 => {
+                let _ = write!(s, "motion detected");
+            }
             0x0006 if d.len() >= 5 => {
                 let key = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
                 let _ = write!(s, "fingerprint key=0x{:08X} match=0x{:02X}", key, d[4]);
             }
             0x0007 if !d.is_empty() => {
-                let _ = write!(s, "door {}", if d[0] == 0 { "open" } else { "closed/other" });
+                let _ = write!(
+                    s,
+                    "door {}",
+                    if d[0] == 0 { "open" } else { "closed/other" }
+                );
             }
             0x000F if d.len() >= 3 => {
                 let illum = u32::from_le_bytes([d[0], d[1], d[2], 0]);
                 let _ = write!(s, "motion, illuminance {} lux", illum);
             }
             0x1005 if d.len() >= 2 => {
-                let _ = write!(s, "power {} temp {} C",
-                    if d[0] != 0 { "on" } else { "off" }, d[1] as i8);
+                let _ = write!(
+                    s,
+                    "power {} temp {} C",
+                    if d[0] != 0 { "on" } else { "off" },
+                    d[1] as i8
+                );
             }
-            0x100E if !d.is_empty() => { let _ = write!(s, "lock attr=0x{:02X}", d[0]); }
+            0x100E if !d.is_empty() => {
+                let _ = write!(s, "lock attr=0x{:02X}", d[0]);
+            }
             0x1012 if !d.is_empty() => {
                 let _ = write!(s, "power {}", if d[0] != 0 { "on" } else { "off" });
             }
-            0x1013 if !d.is_empty() => { let _ = write!(s, "consumable {}%", d[0]); }
+            0x1013 if !d.is_empty() => {
+                let _ = write!(s, "consumable {}%", d[0]);
+            }
             0x1014 if !d.is_empty() => {
                 let _ = write!(s, "moisture/leak {}", if d[0] > 0 { "yes" } else { "no" });
             }
@@ -251,7 +356,9 @@ impl Xiaomi {
             0x1018 if !d.is_empty() => {
                 let _ = write!(s, "light {}", if d[0] > 0 { "yes" } else { "no" });
             }
-            0x1019 if !d.is_empty() => { let _ = write!(s, "opening state=0x{:02X}", d[0]); }
+            0x1019 if !d.is_empty() => {
+                let _ = write!(s, "opening state=0x{:02X}", d[0]);
+            }
             _ => tail = Some(d),
         }
         if let Some(t) = tail
@@ -279,7 +386,9 @@ impl Xiaomi {
     /// The frame carries no per-device anchor — every unit of the same model
     /// sends the same payload — so the useful field is the plaintext model.
     fn decode_fdaa(f: &[u8], base: usize) {
-        if f.is_empty() { return; }
+        if f.is_empty() {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
         let _ = write!(s, "    Xiaomi FDAA (Mi Connect): tag=0x{:02X}", f[0]);
         if f.len() >= 3 {
@@ -312,19 +421,27 @@ impl Xiaomi {
     // xiaomi-ble, ESPHome xiaomi_ble, reelyactive advlib — all target FE95,
     // not 038F). The field-shape guesses below come from captured traffic:
     //
-    //   * The first two bytes are a frame opcode from a small fixed set
-    //     (0x0A10, 0x1601, 0x2C11 observed).
+    //   * The first byte is the frame *family*, the second a sub-type — observed
+    //     families: 0x0A presence, 0x2C/0x2D ASCII-id + seq, 0x16 id-pair,
+    //     0x08/0x0B/0x09 sensor. The census of a dense mesh run shows ~140
+    //     distinct (family, sub) pairs, not ~140 unrelated opcodes.
     //   * Payloads are static per device (presence/keepalive, not sensor telemetry).
-    //   * Each frame embeds one or two 6-byte MAC-like identifiers; 0x1601 carries
-    //     the same MAC twice, 0x0A10 carries one at a fixed offset. This matches
-    //     Xiaomi BLE Mesh presence advertising (a stable id under a rotating MAC).
+    //   * Each frame embeds a stable identifier under a rotating MAC — a 6-byte
+    //     MAC-like id (0x1601 carries the same MAC twice, 0x0A10 once) or a
+    //     4-byte ASCII device id (0x2C11/0x2D11, e.g. "4dny"). This matches
+    //     Xiaomi BLE Mesh presence advertising.
     //
     // Recognised structure is surfaced; unknown bytes stay as hex.
     fn decode_mfg(data: &[u8], base: usize) {
-        if data.len() < 2 { return; }
+        if data.len() < 2 {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    Xiaomi mfg (proprietary, mesh?) type=0x{:02X}{:02X}",
-            data[0], data[1]);
+        let _ = write!(
+            s,
+            "    Xiaomi mfg (proprietary, mesh?) type=0x{:02X}{:02X}",
+            data[0], data[1]
+        );
         // Variable-length trailing bytes are hexdumped after the header line; the
         // short fixed fields (state, header, MAC) stay inline.
         let mut tail: Option<(&[u8], usize)> = None;
@@ -355,8 +472,38 @@ impl Xiaomi {
                     Self::write_mac_rev(&mut s, mac2);
                 }
             }
+            (0x2C, 0x11) | (0x2D, 0x11) if data.len() >= 10 => {
+                // 2C11/2D11 [4B ASCII device id] [0x10 0x30] [2B rolling seq] [trailer].
+                // A stable ASCII id under the rotating address — observed on the
+                // Xiaomi-mesh fleet (e.g. id "4dny" / "41MY").
+                let id: heapless::String<4> = data[2..6]
+                    .iter()
+                    .map(|&b| {
+                        if (0x20..=0x7E).contains(&b) {
+                            b as char
+                        } else {
+                            '?'
+                        }
+                    })
+                    .collect();
+                let _ = write!(s, " id=\"{}\" seq=", id);
+                write_hex(&mut s, &data[8..10]);
+                tail = Some((&data[10..], base + 10));
+            }
             _ => {
-                // Unknown opcode — keep the body as hex.
+                // Unknown sub-type — keep the body as hex, but name the family:
+                // the first byte is the mesh frame family, the second a sub-type
+                // (0x0A presence, 0x2C/0x2D id+seq, 0x16 id-pair, …).
+                let fam = match data[0] {
+                    0x0A => "0x0A presence",
+                    0x16 => "0x16 id-pair",
+                    0x2C | 0x2D => "0x2C/0x2D id+seq",
+                    0x08 | 0x0B | 0x09 => "0x0X sensor",
+                    _ => "",
+                };
+                if !fam.is_empty() {
+                    let _ = write!(s, " [{}]", fam);
+                }
                 tail = Some((&data[2..], base + 2));
             }
         }
@@ -375,7 +522,9 @@ impl Xiaomi {
     /// address), matching the packet header's address format.
     fn write_mac_rev(s: &mut LogStr, m: &[u8]) {
         for (i, b) in m.iter().rev().enumerate() {
-            if i > 0 { let _ = write!(s, ":"); }
+            if i > 0 {
+                let _ = write!(s, ":");
+            }
             let _ = write!(s, "{:02X}", b);
         }
     }

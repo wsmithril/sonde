@@ -18,19 +18,25 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Garmin International, Inc. — manufacturer data (Company ID 0x0087).
 pub(super) struct Garmin;
 impl super::VendorDecoder for Garmin {
-    fn company_ids(&self) -> &'static [u16] { &[0x0087] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0087]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 2 {
             hexdump(body, ctx.base, 6);
             return;
         }
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    Garmin (unofficial): state=0x{:02X} tag=0x{:02X}", body[0], body[1]);
+        let _ = write!(
+            s,
+            "    Garmin (unofficial): state=0x{:02X} tag=0x{:02X}",
+            body[0], body[1]
+        );
         // 0xA1 is the tag on essentially every observed frame; flag anything else
         // so a genuinely different Garmin product stands out in a capture.
         if body[1] != 0xA1 {

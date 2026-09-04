@@ -19,13 +19,20 @@ async fn conn_to_ring() -> ! {
         let p = capmode::conn_follow::RX_QUEUE.receive().await;
         // TODO(bench): plumb the connection AA/channel/RSSI from conn_follow's
         // follow state (RxPdu carries none); 0/0/0 are placeholders.
-        let n = pcap::record(&mut rec, p.t_air.as_micros(), 0, 0, p.crc_ok, 0, &p.data[..p.len as usize]);
+        let n = pcap::record(
+            &mut rec,
+            p.t_air.as_micros(),
+            0,
+            0,
+            p.crc_ok,
+            0,
+            &p.data[..p.len as usize],
+        );
         SD_RING.push(&rec[..n]);
     }
 }
 
-#[embassy_executor::task]
-pub async fn run(spawner: Spawner, l: LedParts) {
+pub async fn run(spawner: Spawner, l: LedParts) -> ! {
     let leds = led::Gpio::new(l.r, l.g, l.b);
     let mut m = capmode::ConnFollow::<PcapSink>::new(leds);
     m.init(&CTX, async move {

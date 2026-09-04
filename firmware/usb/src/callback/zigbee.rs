@@ -11,13 +11,12 @@ use sonde_common::{led, ulog};
 
 use crate::{CTX, ConsoleSink, LedParts};
 
-#[embassy_executor::task]
-pub async fn run(spawner: Spawner, l: LedParts) {
+pub async fn run(spawner: Spawner, l: LedParts) -> ! {
     ulog!("mode=zb_sniff\r\n");
     let leds = led::Gpio::new(l.r, l.g, l.b);
     let mut m = mode::ZigbeeSniff::<ConsoleSink>::new(leds);
     m.init(&CTX, async move {
-        spawner.spawn(mode::zigbee::log_task().unwrap());
+        spawner.spawn(mode::decode_task(mode::DecodeTask::Zigbee).unwrap());
     })
     .await;
     m.run(&CTX).await

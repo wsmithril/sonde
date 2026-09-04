@@ -12,7 +12,7 @@
 
 // Formatting helpers shared with the rest of the decoder. Imported once here so
 // each vendor module keeps reaching them as `super::…`.
-use super::{emit, emit_oui_vendor, hexdump, write_hex, write_mac_be, LogStr};
+use super::{LogStr, emit, emit_oui_vendor, hexdump, write_hex, write_mac_be};
 
 mod alibaba;
 mod amap;
@@ -36,6 +36,7 @@ mod gopro;
 mod gree;
 mod haier;
 mod harman;
+mod hisense;
 mod honor;
 mod hp;
 mod huawei;
@@ -50,8 +51,8 @@ mod miconnect;
 mod microsoft;
 mod midea;
 mod mobike;
-mod ninebot;
 mod motive;
+mod ninebot;
 mod nintendo;
 mod olafriends;
 mod oplus;
@@ -102,9 +103,13 @@ pub(super) struct DecodeCtx {
 /// body that follows the 2-byte Company ID / service UUID.
 pub(super) trait VendorDecoder: Sync {
     /// Manufacturer Company IDs handled (AD 0xFF). Empty if none.
-    fn company_ids(&self) -> &'static [u16] { &[] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[]
+    }
     /// Service UUID16s handled (AD 0x16). Empty if none.
-    fn service_uuids(&self) -> &'static [u16] { &[] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[]
+    }
     /// Decode `body` (the bytes after the matched 2-byte key).
     fn decode(&self, ctx: &DecodeCtx, body: &[u8]);
 }
@@ -153,6 +158,7 @@ static DECODERS: &[&dyn VendorDecoder] = &[
     &ti::TexasInstruments,
     &tomtom::TomTom,
     &haier::Haier,
+    &hisense::Hisense,
     &artiming::ArTiming,
     &bandxi::BandXi,
     &soundaudio::SoundAudio,
@@ -193,10 +199,16 @@ fn dispatch(ctx: &DecodeCtx, body: &[u8]) -> bool {
 }
 
 pub(super) fn decode_mfg(data: &[u8]) {
-    if data.len() < 2 { return; }
+    if data.len() < 2 {
+        return;
+    }
     let cid = u16::from_le_bytes([data[0], data[1]]);
     let body = &data[2..];
-    let ctx = DecodeCtx { base: 2, key: cid, kind: FrameKind::Mfg };
+    let ctx = DecodeCtx {
+        base: 2,
+        key: cid,
+        kind: FrameKind::Mfg,
+    };
     // An unknown vendor gets a raw body dump: the dump's ASCII gutter is where an
     // embedded model or firmware string shows up. It sits one level under the
     // MfgData container the caller already opened.
@@ -208,9 +220,19 @@ pub(super) fn decode_mfg(data: &[u8]) {
 /// Dispatch service data (AD type 0x16) by the leading 16-bit service UUID.
 /// `adva` (the advertiser's on-air address) lets us flag beacons that place
 /// their own BD_ADDR in the service payload instead of a real vendor structure.
-pub(super) fn decode_service_data(data: &[u8], adva: Option<[u8; 6]>) {
+/// Haier's registered OUI prefixes (U-home appliances). A 0xFF01 frame from one
+/// of these is a Haier U+ appliance even when its mfg 0x0929 frame isn't in the
+/// same packet — the packet-level flag can't fire, but the address can.
+fn is_haier_oui(adva: Option<[u8; 6]>) -> bool {
+    matches!(adva, Some(a)
+        if matches!(&a[..3], [0x24, 0xE8, 0xCE] | [0x68, 0xE4, 0x78] | [0x18, 0xA7, 0xF1]))
+}
+
+pub(super) fn decode_service_data(data: &[u8], adva: Option<[u8; 6]>, haier: bool) {
     use core::fmt::Write;
-    if data.len() < 2 { return; }
+    if data.len() < 2 {
+        return;
+    }
     let uuid = u16::from_le_bytes([data[0], data[1]]);
     let body = &data[2..]; // frame bytes follow the 16-bit service UUID
 
@@ -222,13 +244,37 @@ pub(super) fn decode_service_data(data: &[u8], adva: Option<[u8; 6]>) {
         rev.reverse();
         if body.len() >= 6 && (body[..6] == a || body[..6] == rev) {
             let mut s: LogStr = LogStr::new();
-            let _ = write!(s, "    own-address in service data (uuid=0x{:04X})\r\n", uuid);
+            let _ = write!(
+                s,
+                "    own-address in service data (uuid=0x{:04X})\r\n",
+                uuid
+            );
             emit(s);
             return;
         }
     }
 
-    let ctx = DecodeCtx { base: 2, key: uuid, kind: FrameKind::Service };
+    // 0xFF01 is shared by U-tec locks AND Haier U+ appliances (e.g. the
+    // `U-GWH…` water heater). The packet's manufacturer company disambiguates:
+    // when a Haier mfg (0x0929) was seen, this frame is Haier's, not a lock.
+    if uuid == 0xFF01 && (haier || is_haier_oui(adva)) {
+        let mut s: LogStr = LogStr::new();
+        let _ = write!(
+            s,
+            "    Haier U-home 0xFF01 (ServiceData): type=0x{:02X} len={}",
+            body.first().copied().unwrap_or(0),
+            body.len().saturating_sub(1)
+        );
+        emit(s);
+        super::hexdump(&body[1..], 3, 6);
+        return;
+    }
+
+    let ctx = DecodeCtx {
+        base: 2,
+        key: uuid,
+        kind: FrameKind::Service,
+    };
     // Unknown service UUID: dump the raw body one level under the ServiceData
     // container the caller already opened.
     if !dispatch(&ctx, body) {

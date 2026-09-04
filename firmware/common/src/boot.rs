@@ -85,12 +85,12 @@ pub fn next_boot_mode(nvmc: Peri<'static, peripherals::NVMC>) -> BootMode {
         Some(p) => (p + 1) % BOOT_MODES,
         None => 0,
     };
-    // Temporarily skip RssiMonitor (1) and ZigbeeSniff (4): advance past a
-    // blacklisted mode so the cycle visits only BleSniff/GattEnum/ConnFollow. The
-    // resolved (non-blacklisted) mode is what gets persisted, so the next boot's
-    // `(prev + 1)` continues from here. BleSniff (0) is never blacklisted, so the
-    // loop always terminates.
-    while matches!(mode, 1 | 4) {
+    // Skip ZigbeeSniff (4) only — the XIAO nRF52840 has no 802.15.4 radio, so
+    // that mode is blacklisted and the cycle visits BleSniff/RssiMonitor/
+    // GattEnum/ConnFollow. The resolved (non-blacklisted) mode is what gets
+    // persisted, so the next boot's `(prev + 1)` continues from here. BleSniff
+    // (0) is never blacklisted, so the loop always terminates.
+    while matches!(mode, 4) {
         mode = (mode + 1) % BOOT_MODES;
     }
     let slot = match free {
@@ -125,16 +125,17 @@ pub fn next_boot_mode(nvmc: Peri<'static, peripherals::NVMC>) -> BootMode {
 /// floor on every channel. `embassy_nrf::init` then issues `TASKS_HFCLKSTART` and
 /// blocks until `EVENTS_HFCLKSTARTED` before returning.
 ///
-/// LFCLK is embassy-time's entire tick base, so it sets every connection anchor,
-/// T_IFS deadline and hop instant in `gatt`/`conn_follow`. The default is
-/// `InternalRC` — an uncalibrated RC oscillator, measurably ~3100 ppm slow here: a
-/// locked follower re-anchoring every event saw a persistent -122 µs against a
-/// 30 ms interval (~32666 Hz, not 32768). BLE allows 500 ppm total; radio bit
-/// timing comes off HFCLK and was always fine, so the symptom was correct packets
-/// on a wrong schedule. `Synthesized` divides the HFCLK we already source from the
-/// crystal, inheriting HFXO accuracy, and always starts — `ExternalXtal` would spin
-/// forever on `EVENTS_LFCLKSTARTED` on a board with no 32.768 kHz crystal. The cost
-/// is HFCLK must keep running, irrelevant while the radio is on and USB-powered.
+/// LFCLK is embassy-time's entire tick base, so it schedules every connection
+/// anchor, T_IFS deadline and hop instant in `gatt`/`conn_follow`. The default is
+/// `InternalRC`, an uncalibrated oscillator that is unsuitable for a passive BLE
+/// follower: BLE permits only 500 ppm total clock inaccuracy. Radio bit timing
+/// still comes from HFCLK, so the symptom is correct packets on a wrong schedule.
+/// `Synthesized` divides the HFXO we already source from the crystal, inheriting
+/// its accuracy, and always starts — `ExternalXtal` would spin forever on
+/// `EVENTS_LFCLKSTARTED` on a board with no 32.768 kHz crystal. The follower also
+/// latches RADIO.END in a 1 MHz TIMER over PPI; it must not infer radio timing
+/// from RTC1/poll-loop timestamps, which are quantized at 30.5 µs. The cost is
+/// HFCLK must keep running, irrelevant while the radio is on and USB-powered.
 pub fn clock_config() -> embassy_nrf::config::Config {
     let mut config = embassy_nrf::config::Config::default();
     config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;

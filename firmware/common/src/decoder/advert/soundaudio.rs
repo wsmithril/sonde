@@ -6,12 +6,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// Sounding Audio Industrial Ltd. — manufacturer data (Company ID 0x0E0B).
 pub(super) struct SoundAudio;
 impl super::VendorDecoder for SoundAudio {
-    fn company_ids(&self) -> &'static [u16] { &[0x0E0B] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0E0B]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 15 {
             hexdump(body, ctx.base, 6);

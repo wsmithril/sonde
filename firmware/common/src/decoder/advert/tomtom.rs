@@ -7,12 +7,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// TomTom International BV — manufacturer data (Company ID 0x0100).
 pub(super) struct TomTom;
 impl super::VendorDecoder for TomTom {
-    fn company_ids(&self) -> &'static [u16] { &[0x0100] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0100]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 15 || body[0] != 0xB5 {
             hexdump(body, ctx.base, 6);

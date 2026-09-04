@@ -8,9 +8,9 @@
 //! dispatchers. Only plaintext, structured fields are decoded; identity fields
 //! that vendors encrypt/hash/rotate for privacy are labelled but left as hex.
 
-pub mod asset;
 /// Advertising-payload deep decoders, dispatched by Company ID / service UUID.
 mod advert;
+pub mod asset;
 /// GATT attribute decoding (UUID names, characteristic values, vendor transports),
 /// used by the connection role in [`crate::central`].
 pub mod gatt;
@@ -88,7 +88,10 @@ include!(concat!(env!("OUT_DIR"), "/uri_schemes.rs")); // URI_SCHEMES
 
 /// Binary-search a sorted `(u16, &str)` SIG table.
 fn lookup(table: &'static [(u16, &'static str)], id: u16) -> Option<&'static str> {
-    table.binary_search_by_key(&id, |&(k, _)| k).ok().map(|i| table[i].1)
+    table
+        .binary_search_by_key(&id, |&(k, _)| k)
+        .ok()
+        .map(|i| table[i].1)
 }
 
 /// Look up a Bluetooth SIG Company Identifier (the manufacturer-data prefix)
@@ -133,7 +136,9 @@ pub fn oui_vendor(prefix: u32, ext12: Option<u16>) -> Option<heapless::String<96
 pub fn write_mac_be(s: &mut LogStr, m: &[u8]) {
     use core::fmt::Write;
     for (i, b) in m.iter().enumerate() {
-        if i > 0 { let _ = write!(s, ":"); }
+        if i > 0 {
+            let _ = write!(s, ":");
+        }
         let _ = write!(s, "{:02X}", b);
     }
 }
@@ -148,7 +153,9 @@ pub fn write_mac_be(s: &mut LogStr, m: &[u8]) {
 /// where the 24-bit OUI alone names only the registrar.
 pub fn emit_oui_vendor(m: &[u8]) {
     use core::fmt::Write;
-    if m.len() < 3 || m[0] & 0x02 != 0 { return; }
+    if m.len() < 3 || m[0] & 0x02 != 0 {
+        return;
+    }
     let prefix = (m[0] as u32) << 16 | (m[1] as u32) << 8 | m[2] as u32;
     let ext12 = (m.len() >= 5).then(|| (m[3] as u16) << 4 | (m[4] >> 4) as u16);
     if let Some(v) = oui_vendor(prefix, ext12) {
@@ -232,7 +239,7 @@ fn ad_type_name(t: u8) -> &'static str {
         0x34 => "ElectronicShelfLabel",
         0x3D => "3DInformation",
         0xFF => "MfgData",
-        _    => "",
+        _ => "",
     };
     if !short.is_empty() {
         return short;
@@ -258,7 +265,7 @@ fn le_role_name(r: u8) -> &'static str {
         0x01 => "central only",
         0x02 => "peripheral+central, peripheral preferred",
         0x03 => "peripheral+central, central preferred",
-        _    => "rfu",
+        _ => "rfu",
     }
 }
 
@@ -284,7 +291,7 @@ fn cod_major(major: u8) -> &'static str {
         0x08 => "Toy",
         0x09 => "Health",
         0x1F => "Uncategorized",
-        _    => "?",
+        _ => "?",
     }
 }
 
@@ -311,7 +318,9 @@ fn write_cod_services(s: &mut LogStr, cod: u32) {
             first = false;
         }
     }
-    if !first { let _ = write!(s, "]"); }
+    if !first {
+        let _ = write!(s, "]");
+    }
 }
 
 /// Append an advertising interval given in 0.625 ms units as milliseconds with
@@ -463,7 +472,8 @@ fn utf8_len(b: u8) -> usize {
 fn contains_addr(data: &[u8], adva: &[u8; 6]) -> bool {
     let mut rev = *adva;
     rev.reverse();
-    data.windows(6).any(|w| w == adva.as_slice() || w == rev.as_slice())
+    data.windows(6)
+        .any(|w| w == adva.as_slice() || w == rev.as_slice())
 }
 
 /// The GATT role a SIG-assigned 16-bit service UUID implies, for frames whose
@@ -530,11 +540,38 @@ fn emit_ad_header(ad_type: u8) {
 /// the field *contents* are unproven, so the deeper vendor sub-decoders (Apple
 /// Continuity, mesh bearers, service-data decoders) are skipped and their bodies
 /// dumped raw. Running them on corrupt bytes invents phantom sub-messages.
+///
+/// Whether any AD field carries the Haier company ID (0x0929) as its
+/// manufacturer company ID. Order-independent: the Haier/U-tec 0xFF01 routing
+/// decision must not depend on where the mfg frame sits in the packet.
+fn adv_has_haier_mfg(ad: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < ad.len() {
+        let flen = ad[i] as usize;
+        if flen == 0 || i + 1 + flen > ad.len() {
+            break;
+        }
+        let data = &ad[i + 2..i + 1 + flen];
+        if ad[i + 1] == 0xFF && data.len() >= 2 && data[0] == 0x29 && data[1] == 0x09 {
+            return true;
+        }
+        i += 1 + flen;
+    }
+    false
+}
+
 pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool) -> usize {
     use core::fmt::Write;
 
     // Bytes consumed by complete structures; the walk's stopping point.
     let mut consumed = 0usize;
+
+    // Whether this packet carries a Haier manufacturer frame (0x0929) — routes a
+    // 0xFF01 ServiceData to the Haier decoder instead of the U-tec lock label
+    // (the two share the UUID; see device/midea … the U-tec/Haier confusion).
+    // Pre-scanned so a 0xFF01 that *precedes* the mfg frame in the AD walk still
+    // routes to Haier (single-pass order would mislabel it as a U-tec lock).
+    let haier_seen = verified && adv_has_haier_mfg(adv_data);
 
     // Synthesised into one `profile:` line after the walk. A frame whose whole
     // payload is a service-UUID list gets no vendor decode, so this is the only
@@ -554,15 +591,16 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
             break;
         }
         let data_end = i + 1 + field_len; // length byte covers type + data
-        if data_end > adv_data.len() { break; } // truncated structure
+        if data_end > adv_data.len() {
+            break;
+        } // truncated structure
         let ad_type = adv_data[i + 1];
         let data = &adv_data[i + 2..data_end];
 
         // Some cheap beacons stuff their own 6-byte BD_ADDR into the manufacturer
         // field, so the "Company ID" is just the low two bytes of the MAC. Detect
         // this so we flag it instead of reporting a bogus vendor.
-        let mfg_is_own_addr =
-            ad_type == 0xFF && matches!(adva, Some(a) if data == a.as_slice());
+        let mfg_is_own_addr = ad_type == 0xFF && matches!(adva, Some(a) if data == a.as_slice());
 
         // A whole family of cheap IoT beacons (e-bikes/scooters, GPS trackers)
         // put two octets of their *own* address into the 2-byte Company-ID slot
@@ -602,21 +640,33 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 // Flags bitfield.
                 let f = data.first().copied().unwrap_or(0);
                 let _ = write!(s, "0x{:02X}", f);
-                if f & 0x01 != 0 { let _ = write!(s, " LE-Limited"); }
-                if f & 0x02 != 0 { let _ = write!(s, " LE-General"); }
-                if f & 0x04 != 0 { let _ = write!(s, " NoBREDR"); }
-                if f & 0x08 != 0 { let _ = write!(s, " LE+BREDR-Ctrl"); }
+                if f & 0x01 != 0 {
+                    let _ = write!(s, " LE-Limited");
+                }
+                if f & 0x02 != 0 {
+                    let _ = write!(s, " LE-General");
+                }
+                if f & 0x04 != 0 {
+                    let _ = write!(s, " NoBREDR");
+                }
+                if f & 0x08 != 0 {
+                    let _ = write!(s, " LE+BREDR-Ctrl");
+                }
                 // Bit 4 named the host half of the same simultaneous-LE/BR-EDR
                 // capability until the SIG withdrew it; CSS Part A Table 1.4
                 // now reads "Previously Used". Stacks predating the withdrawal
                 // still set it, so it is worth showing under a name that does
                 // not claim a capability the spec no longer defines.
-                if f & 0x10 != 0 { let _ = write!(s, " PreviouslyUsed"); }
+                if f & 0x10 != 0 {
+                    let _ = write!(s, " PreviouslyUsed");
+                }
             }
             0x08 | 0x09 => {
                 // Local name (UTF-8, else hex).
                 match core::str::from_utf8(data) {
-                    Ok(n)  => { let _ = write!(s, "{}", n); }
+                    Ok(n) => {
+                        let _ = write!(s, "{}", n);
+                    }
                     Err(_) => tail = Some((data, 0)),
                 }
             }
@@ -670,8 +720,11 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                     for q in data.chunks(4) {
                         if q.len() == 4 {
                             let mut c: LogStr = LogStr::new();
-                            let _ = write!(c, "    - {:08X}",
-                                u32::from_le_bytes([q[0], q[1], q[2], q[3]]));
+                            let _ = write!(
+                                c,
+                                "    - {:08X}",
+                                u32::from_le_bytes([q[0], q[1], q[2], q[3]])
+                            );
                             emit(c);
                         }
                     }
@@ -679,7 +732,8 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 } else {
                     for q in data.chunks(4) {
                         if q.len() == 4 {
-                            let _ = write!(s, "{:08X} ", u32::from_le_bytes([q[0], q[1], q[2], q[3]]));
+                            let _ =
+                                write!(s, "{:08X} ", u32::from_le_bytes([q[0], q[1], q[2], q[3]]));
                         }
                     }
                 }
@@ -721,7 +775,7 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 let _ = write!(c, "len={}", data.len() - 2);
                 emit(c);
                 if verified {
-                    advert::decode_service_data(data, adva);
+                    advert::decode_service_data(data, adva, haier_seen);
                 } else {
                     hexdump(&data[2..], 2, 6);
                 }
@@ -743,8 +797,12 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 // spelled out, so it is expanded here and the remainder of the
                 // field is the rest of the URI as UTF-8.
                 match (uri_scheme(data), core::str::from_utf8(data)) {
-                    (Some((scheme, n)), Ok(u)) => { let _ = write!(s, "{}{}", scheme, &u[n..]); }
-                    (None, Ok(u)) => { let _ = write!(s, "{}", u); }
+                    (Some((scheme, n)), Ok(u)) => {
+                        let _ = write!(s, "{}{}", scheme, &u[n..]);
+                    }
+                    (None, Ok(u)) => {
+                        let _ = write!(s, "{}", u);
+                    }
                     _ => tail = Some((data, 0)),
                 }
             }
@@ -753,9 +811,12 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 // child line, then the raw body dump.
                 emit_ad_header(ad_type);
                 let mut c: LogStr = LogStr::new();
-                let _ = write!(c, "    uuid={:08X} len={}",
+                let _ = write!(
+                    c,
+                    "    uuid={:08X} len={}",
                     u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-                    data.len() - 4);
+                    data.len() - 4
+                );
                 emit(c);
                 hexdump(&data[4..], 4, 6);
                 handled = true;
@@ -781,9 +842,17 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 // the rotation, so it is worth naming explicitly.
                 if data.len() >= 7 {
                     let a = &data[..6];
-                    let _ = write!(s, "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} {}",
-                        a[5], a[4], a[3], a[2], a[1], a[0],
-                        if data[6] & 1 == 0 { "public" } else { "random" });
+                    let _ = write!(
+                        s,
+                        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} {}",
+                        a[5],
+                        a[4],
+                        a[3],
+                        a[2],
+                        a[1],
+                        a[0],
+                        if data[6] & 1 == 0 { "public" } else { "random" }
+                    );
                 } else {
                     tail = Some((data, 0));
                 }
@@ -797,8 +866,11 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                     for a in data.chunks(6) {
                         if a.len() == 6 {
                             let mut c: LogStr = LogStr::new();
-                            let _ = write!(c, "    - {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                                a[5], a[4], a[3], a[2], a[1], a[0]);
+                            let _ = write!(
+                                c,
+                                "    - {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                                a[5], a[4], a[3], a[2], a[1], a[0]
+                            );
                             emit(c);
                         }
                     }
@@ -806,8 +878,11 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 } else {
                     for a in data.chunks(6) {
                         if a.len() == 6 {
-                            let _ = write!(s, "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} ",
-                                a[5], a[4], a[3], a[2], a[1], a[0]);
+                            let _ = write!(
+                                s,
+                                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} ",
+                                a[5], a[4], a[3], a[2], a[1], a[0]
+                            );
                         }
                     }
                 }
@@ -832,7 +907,10 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 // Advertising Interval - long: 3 or 4 octets LE, 0.625 ms units.
                 match data.len() {
                     3 => write_interval(&mut s, u32::from_le_bytes([data[0], data[1], data[2], 0])),
-                    4 => write_interval(&mut s, u32::from_le_bytes([data[0], data[1], data[2], data[3]])),
+                    4 => write_interval(
+                        &mut s,
+                        u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+                    ),
                     _ => tail = Some((data, 0)),
                 }
             }
@@ -842,8 +920,11 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 // member holding the SIRK can resolve it, but the pair is stable
                 // for as long as `prand` is reused.
                 if data.len() >= 6 {
-                    let _ = write!(s, "hash={:02X}{:02X}{:02X} prand={:02X}{:02X}{:02X}",
-                        data[2], data[1], data[0], data[5], data[4], data[3]);
+                    let _ = write!(
+                        s,
+                        "hash={:02X}{:02X}{:02X} prand={:02X}{:02X}{:02X}",
+                        data[2], data[1], data[0], data[5], data[4], data[3]
+                    );
                     // Set correlation (#9): with a matching SIRK compiled in, tag
                     // the coordinated-set this member belongs to. Off unless built
                     // with `resolve-identities`.
@@ -863,9 +944,23 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 }
             }
             0x30 => {
-                // Broadcast_Name (LE Audio), UTF-8.
+                // Broadcast_Name (LE Audio), UTF-8 — normally a short readable
+                // name. A payload beyond ~32 bytes is a vendor repurposing the
+                // type as a data container (observed: 100+ bytes of high-entropy
+                // bytes under a "BroadcastName" AD), so flag it rather than
+                // presenting a fake name.
                 match core::str::from_utf8(data) {
-                    Ok(n)  => { let _ = write!(s, "{}", n); }
+                    Ok(n) if data.len() <= 32 => {
+                        let _ = write!(s, "{}", n);
+                    }
+                    Ok(_) => {
+                        let _ = write!(
+                            s,
+                            "len={} (long — proprietary data, not a name)",
+                            data.len()
+                        );
+                        tail = Some((data, 0));
+                    }
                     Err(_) => tail = Some((data, 0)),
                 }
             }
@@ -874,9 +969,17 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 // connection event instant it takes effect at (u16 LE).
                 if data.len() >= 7 {
                     let used: u32 = data[..5].iter().map(|b| b.count_ones()).sum();
-                    let _ = write!(s, "chmap={:02X}{:02X}{:02X}{:02X}{:02X} ({} ch) instant={}",
-                        data[0], data[1], data[2], data[3], data[4], used,
-                        u16::from_le_bytes([data[5], data[6]]));
+                    let _ = write!(
+                        s,
+                        "chmap={:02X}{:02X}{:02X}{:02X}{:02X} ({} ch) instant={}",
+                        data[0],
+                        data[1],
+                        data[2],
+                        data[3],
+                        data[4],
+                        used,
+                        u16::from_le_bytes([data[5], data[6]])
+                    );
                 } else {
                     tail = Some((data, 0));
                 }
@@ -901,10 +1004,20 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                 // without the session key, but the layout is worth surfacing.
                 if data.len() >= 9 {
                     let mic = &data[data.len() - 4..];
-                    let _ = write!(s,
+                    let _ = write!(
+                        s,
                         "randomizer={:02X}{:02X}{:02X}{:02X}{:02X} payload={}B mic={:02X}{:02X}{:02X}{:02X}",
-                        data[0], data[1], data[2], data[3], data[4], data.len() - 9,
-                        mic[0], mic[1], mic[2], mic[3]);
+                        data[0],
+                        data[1],
+                        data[2],
+                        data[3],
+                        data[4],
+                        data.len() - 9,
+                        mic[0],
+                        mic[1],
+                        mic[2],
+                        mic[3]
+                    );
                 } else {
                     tail = Some((data, 0));
                 }
@@ -937,7 +1050,9 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                         let _ = write!(c, "0x{:04X} (own-MAC-prefix, unregistered) ", cid);
                     } else {
                         match company_name(cid) {
-                            Some(n) => { let _ = write!(c, "{} (0x{:04X}) ", n, cid); }
+                            Some(n) => {
+                                let _ = write!(c, "{} (0x{:04X}) ", n, cid);
+                            }
                             // 0xFFFF is the SIG "no company / internal use" value.
                             None if cid == 0xFFFF => {
                                 let _ = write!(c, "0xFFFF (reserved/test — not a real company) ");
@@ -950,8 +1065,11 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                                 // bytes go out little-endian, so data[0] is the
                                 // first character.
                                 if data[0].is_ascii_graphic() && data[1].is_ascii_graphic() {
-                                    let _ = write!(c, ", ascii \"{}{}\"",
-                                        data[0] as char, data[1] as char);
+                                    let _ = write!(
+                                        c,
+                                        ", ascii \"{}{}\"",
+                                        data[0] as char, data[1] as char
+                                    );
                                 }
                                 let _ = write!(c, ") ");
                             }
@@ -961,7 +1079,10 @@ pub fn log_ad_structures(adv_data: &[u8], adva: Option<[u8; 6]>, verified: bool)
                     emit(c);
                     if mfg_body_has_own_addr {
                         let mut n: LogStr = LogStr::new();
-                        let _ = write!(n, "    own address embedded in manufacturer data (identity leak)");
+                        let _ = write!(
+                            n,
+                            "    own address embedded in manufacturer data (identity leak)"
+                        );
                         emit(n);
                     }
                     if mfg_cid_is_own_prefix {
@@ -1173,7 +1294,9 @@ fn access_address_valid(aa: u32) -> bool {
 /// [`ConnSpec`]. `payload` starts at InitA (i.e. `buf[2..]`); needs ≥34 bytes.
 /// `hdr` is the PDU header byte (`buf[0]`), which carries ChSel in bit 5.
 pub fn parse_connect_ind(hdr: u8, payload: &[u8]) -> Option<ConnSpec> {
-    if payload.len() < 34 { return None; }
+    if payload.len() < 34 {
+        return None;
+    }
     let ll = &payload[12..34]; // LLData
     Some(ConnSpec {
         aa: u32::from_le_bytes([ll[0], ll[1], ll[2], ll[3]]),
@@ -1202,8 +1325,8 @@ pub fn decode_connect_ind(hdr: u8, payload: &[u8]) -> bool {
         Some(s) => s,
         None => return false,
     };
-    let init = &payload[0..6];   // Initiator (the central) — on-air LE
-    let adva = &payload[6..12];  // Advertiser (the peripheral) — on-air LE
+    let init = &payload[0..6]; // Initiator (the central) — on-air LE
+    let adva = &payload[6..12]; // Advertiser (the peripheral) — on-air LE
     let ch_count: u32 = spec.chm.iter().map(|b| b.count_ones()).sum();
 
     // 1.25 ms units → hundredths of a ms (×125) for a "NN.MMms" render.
@@ -1212,19 +1335,45 @@ pub fn decode_connect_ind(hdr: u8, payload: &[u8]) -> bool {
     let wo = spec.win_offset as u32 * 125;
 
     let mut s: LogStr = LogStr::new();
-    let _ = write!(s, "    InitA={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} -> AdvA={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        init[5], init[4], init[3], init[2], init[1], init[0],
-        adva[5], adva[4], adva[3], adva[2], adva[1], adva[0]);
+    let _ = write!(
+        s,
+        "    InitA={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} -> AdvA={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        init[5],
+        init[4],
+        init[3],
+        init[2],
+        init[1],
+        init[0],
+        adva[5],
+        adva[4],
+        adva[3],
+        adva[2],
+        adva[1],
+        adva[0]
+    );
     emit(s);
     let mut s: LogStr = LogStr::new();
     // `csa` is the hop algorithm the pair will use — the field that says whether
     // the channel sequence follows `hop` at all.
-    let _ = write!(s, "    AA=0x{:08X} CRCInit=0x{:06X} hop={} sca={} csa={}",
-        spec.aa, spec.crc_init, spec.hop, spec.sca, if spec.csa2 { 2 } else { 1 });
+    let _ = write!(
+        s,
+        "    AA=0x{:08X} CRCInit=0x{:06X} hop={} sca={} csa={}",
+        spec.aa,
+        spec.crc_init,
+        spec.hop,
+        spec.sca,
+        if spec.csa2 { 2 } else { 1 }
+    );
     emit(s);
     let mut s: LogStr = LogStr::new();
-    let _ = write!(s, "    interval={}.{:02}ms latency={} timeout={}ms",
-        iv / 100, iv % 100, spec.latency, spec.timeout as u32 * 10);
+    let _ = write!(
+        s,
+        "    interval={}.{:02}ms latency={} timeout={}ms",
+        iv / 100,
+        iv % 100,
+        spec.latency,
+        spec.timeout as u32 * 10
+    );
     emit(s);
     let mut s: LogStr = LogStr::new();
     // ChM in spec octet order: chm[0] bit 0 is channel 0, so the leftmost hex
@@ -1234,13 +1383,23 @@ pub fn decode_connect_ind(hdr: u8, payload: &[u8]) -> bool {
     // "0CF6C00000" was decoded by hand as channels {2,3,9,10,12,13,14,15,22,23}
     // when the follower was correctly hopping {22,23,25,26,28,29,30,31,34,35},
     // making a working channel map look like the bug.
-    let _ = write!(s, "    winsize={}.{:02}ms winoffset={}.{:02}ms chmap={:02X}{:02X}{:02X}{:02X}{:02X} ({} ch)",
-        ws / 100, ws % 100, wo / 100, wo % 100,
-        spec.chm[0], spec.chm[1], spec.chm[2], spec.chm[3], spec.chm[4], ch_count);
+    let _ = write!(
+        s,
+        "    winsize={}.{:02}ms winoffset={}.{:02}ms chmap={:02X}{:02X}{:02X}{:02X}{:02X} ({} ch)",
+        ws / 100,
+        ws % 100,
+        wo / 100,
+        wo % 100,
+        spec.chm[0],
+        spec.chm[1],
+        spec.chm[2],
+        spec.chm[3],
+        spec.chm[4],
+        ch_count
+    );
     emit(s);
     true
 }
-
 
 // ── Extended advertising (BLE 5) decoder ─────────────────────────────────────
 //
@@ -1267,7 +1426,7 @@ pub struct AuxPtr {
 /// `offset_us == 0` means the offset was too far to represent → unschedulable.
 #[derive(Clone, Copy)]
 pub struct SyncInfo {
-    pub offset_us: u32,     // to the AUX_SYNC_IND, from this packet's air-start
+    pub offset_us: u32,      // to the AUX_SYNC_IND, from this packet's air-start
     pub interval_125us: u16, // periodic advertising interval, 1.25 ms units
     pub chm: [u8; 5],        // 37-bit periodic channel map
     pub aa: u32,             // periodic Access Address
@@ -1308,7 +1467,9 @@ pub fn decode_ext_adv(p: &[u8]) -> ExtInfo {
 fn walk_ext_hdr(p: &[u8], log: bool) -> ExtInfo {
     use core::fmt::Write;
     let mut info = ExtInfo::default();
-    if p.is_empty() { return info; }
+    if p.is_empty() {
+        return info;
+    }
 
     let ext_hdr_len = (p[0] & 0x3F) as usize;
     if log {
@@ -1338,8 +1499,11 @@ fn walk_ext_hdr(p: &[u8], log: bool) -> ExtInfo {
             if log {
                 let a = &p[off..off + 6];
                 let mut s: LogStr = LogStr::new();
-                let _ = write!(s, "  ExtHdr AdvA: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}\r\n",
-                    a[5], a[4], a[3], a[2], a[1], a[0]);
+                let _ = write!(
+                    s,
+                    "  ExtHdr AdvA: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}\r\n",
+                    a[5], a[4], a[3], a[2], a[1], a[0]
+                );
                 emit(s);
             }
             off += 6;
@@ -1349,8 +1513,11 @@ fn walk_ext_hdr(p: &[u8], log: bool) -> ExtInfo {
             if log {
                 let a = &p[off..off + 6];
                 let mut s: LogStr = LogStr::new();
-                let _ = write!(s, "  ExtHdr TargetA: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}\r\n",
-                    a[5], a[4], a[3], a[2], a[1], a[0]);
+                let _ = write!(
+                    s,
+                    "  ExtHdr TargetA: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}\r\n",
+                    a[5], a[4], a[3], a[2], a[1], a[0]
+                );
                 emit(s);
             }
             off += 6;
@@ -1378,27 +1545,41 @@ fn walk_ext_hdr(p: &[u8], log: bool) -> ExtInfo {
             info.adi = Some(adi);
             if log {
                 let mut s: LogStr = LogStr::new();
-                let _ = write!(s, "  ExtHdr ADI: did=0x{:03X} sid=0x{:X}\r\n",
-                    adi & 0x0FFF, adi >> 12);
+                let _ = write!(
+                    s,
+                    "  ExtHdr ADI: did=0x{:03X} sid=0x{:X}\r\n",
+                    adi & 0x0FFF,
+                    adi >> 12
+                );
                 emit(s);
             }
             off += 2;
         }
         // AuxPtr (3 bytes): channel, offset units/value, and PHY of the aux packet.
         if flags & 0x10 != 0 && off + 3 <= p.len() {
-            let chan    = p[off] & 0x3F;
-            let units   = if p[off] & 0x80 != 0 { 300u32 } else { 30 }; // µs
-            let raw     = u16::from_le_bytes([p[off + 1], p[off + 2]]);
+            let chan = p[off] & 0x3F;
+            let units = if p[off] & 0x80 != 0 { 300u32 } else { 30 }; // µs
+            let raw = u16::from_le_bytes([p[off + 1], p[off + 2]]);
             let aux_off = (raw & 0x1FFF) as u32 * units;
             let phy_num = (p[off + 2] >> 5) & 0x07;
-            info.aux = Some(AuxPtr { chan, phy: phy_num, offset_us: aux_off });
+            info.aux = Some(AuxPtr {
+                chan,
+                phy: phy_num,
+                offset_us: aux_off,
+            });
             if log {
                 let phy = match phy_num {
-                    0 => "1M", 1 => "2M", 2 => "Coded", _ => "?",
+                    0 => "1M",
+                    1 => "2M",
+                    2 => "Coded",
+                    _ => "?",
                 };
                 let mut s: LogStr = LogStr::new();
-                let _ = write!(s, "  ExtHdr AuxPtr: ch={} phy={} offset={}us\r\n",
-                    chan, phy, aux_off);
+                let _ = write!(
+                    s,
+                    "  ExtHdr AuxPtr: ch={} phy={} offset={}us\r\n",
+                    chan, phy, aux_off
+                );
                 emit(s);
             }
             off += 3;
@@ -1411,7 +1592,11 @@ fn walk_ext_hdr(p: &[u8], log: bool) -> ExtInfo {
             let sync_off = (w0 & 0x1FFF) as u32; // SyncPacketOffset (0 = too far)
             let units = if w0 & 0x2000 != 0 { 300u32 } else { 30 }; // OffsetUnits
             let adjust = if w0 & 0x4000 != 0 { 2_457_600u32 } else { 0 }; // OffsetAdjust
-            let offset_us = if sync_off == 0 { 0 } else { sync_off * units + adjust };
+            let offset_us = if sync_off == 0 {
+                0
+            } else {
+                sync_off * units + adjust
+            };
             let interval_125us = u16::from_le_bytes([si[2], si[3]]);
             let chm = [si[4], si[5], si[6], si[7], si[8] & 0x1F];
             let sca = (si[8] >> 5) & 0x07;
@@ -1419,15 +1604,32 @@ fn walk_ext_hdr(p: &[u8], log: bool) -> ExtInfo {
             let crc_init = u32::from_le_bytes([si[13], si[14], si[15], 0]);
             let event_counter = u16::from_le_bytes([si[16], si[17]]);
             info.sync = Some(SyncInfo {
-                offset_us, interval_125us, chm, aa, crc_init, event_counter,
+                offset_us,
+                interval_125us,
+                chm,
+                aa,
+                crc_init,
+                event_counter,
             });
             if log {
                 let ms_x100 = interval_125us as u32 * 125;
                 let mut s: LogStr = LogStr::new();
-                let _ = write!(s,
+                let _ = write!(
+                    s,
                     "  ExtHdr SyncInfo: aa=0x{:08X} crcinit=0x{:06X} interval={}.{:02}ms offset={}us evt={} sca={} chm={:02X}{:02X}{:02X}{:02X}{:02X}\r\n",
-                    aa, crc_init, ms_x100 / 100, ms_x100 % 100, offset_us, event_counter,
-                    sca, chm[0], chm[1], chm[2], chm[3], chm[4]);
+                    aa,
+                    crc_init,
+                    ms_x100 / 100,
+                    ms_x100 % 100,
+                    offset_us,
+                    event_counter,
+                    sca,
+                    chm[0],
+                    chm[1],
+                    chm[2],
+                    chm[3],
+                    chm[4]
+                );
                 emit(s);
             }
             off += 18;

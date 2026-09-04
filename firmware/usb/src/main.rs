@@ -7,13 +7,16 @@
 //! to its setup in [`callback`]. Each mode owns its peripheral wiring and tasks there;
 //! nothing mode-specific lives in `main`.
 
+use core::cell::UnsafeCell;
+use core::mem::{ManuallyDrop, MaybeUninit};
+
 use embassy_executor::Spawner;
 use embassy_nrf::qspi::{self, Qspi};
 use embassy_nrf::spim::{self, Spim};
 use embassy_nrf::uarte;
 use embassy_nrf::usb::{self, Driver, vbus_detect::HardwareVbusDetect};
 use embassy_nrf::{Peri, bind_interrupts, peripherals};
-use embassy_usb::class::cdc_acm::{CdcAcmClass, Sender, State};
+use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
 use static_cell::StaticCell;
 // The panic handler lives in `sonde_common::panic`, which records the crash site to
@@ -24,7 +27,9 @@ use defmt_rtt as _;
 
 use sonde_common::boot::{self, BootMode, next_boot_mode};
 use sonde_common::led::OnBoardLed as _;
-use sonde_common::{LOG, LOG_DROPPED, Rng, decoder, gnss, hal, led, mode, panic, ulog, ulogf, wallclock};
+use sonde_common::{
+    LOG, LOG_DROPPED, Rng, decoder, gnss, hal, led, mode, panic, ulog, ulogf, wallclock,
+};
 
 mod callback;
 
@@ -60,6 +65,92 @@ impl mode::CaptureSink for ConsoleSink {
 /// be a spawned task rather than borrowing `main`'s locals.
 pub(crate) static CTX: mode::Ctx<ConsoleSink> = mode::Ctx::new(Rng(0x1234_5678), ConsoleSink);
 
+// ── Runtime-mode RAM overlay ────────────────────────────────────────────────
+//
+// USB chooses its boot mode from flash at runtime, so normal linker reachability
+// retains every mode's globals and Embassy task entrypoints. The mode-specific
+// *data* does not need to coexist, though: reset selects exactly one arm before
+// any mode task is spawned. Keep shared USB/radio/log state outside this arena;
+// only the mutually exclusive module buffers/tables live here.
+#[repr(C)]
+union UsbModeStorage {
+    ble_sniff: ManuallyDrop<mode::ble_sniff::Storage>,
+    rssi: ManuallyDrop<mode::rssi::Storage>,
+    gatt: ManuallyDrop<()>,
+    conn_follow: ManuallyDrop<mode::conn_follow::Storage>,
+    zigbee: ManuallyDrop<mode::zigbee::Storage>,
+    recon: ManuallyDrop<mode::recon::Storage>,
+}
+
+struct ModeArena(UnsafeCell<MaybeUninit<UsbModeStorage>>);
+unsafe impl Sync for ModeArena {}
+static MODE_ARENA: ModeArena = ModeArena(UnsafeCell::new(MaybeUninit::uninit()));
+
+/// Bind this launch's matching field of [`MODE_ARENA`].
+///
+/// # Safety
+/// Called once, before the boot-mode dispatcher spawns any mode task. A reset
+/// precedes every later boot-mode choice, so no task can retain an old field.
+impl ModeArgs {
+    unsafe fn init_storage(&self) {
+        let arena = MODE_ARENA.0.get();
+        unsafe {
+            match self {
+                ModeArgs::BleSniff { .. } => {
+                    (*arena).as_mut_ptr().write(UsbModeStorage {
+                        ble_sniff: ManuallyDrop::new(mode::ble_sniff::Storage::new()),
+                    });
+                    let storage = &*((&(*(*arena).as_ptr()).ble_sniff
+                        as *const ManuallyDrop<mode::ble_sniff::Storage>)
+                        .cast::<mode::ble_sniff::Storage>());
+                    mode::ble_sniff::bind_storage(storage);
+                }
+                ModeArgs::Rssi { .. } => {
+                    (*arena).as_mut_ptr().write(UsbModeStorage {
+                        rssi: ManuallyDrop::new(mode::rssi::Storage::new()),
+                    });
+                    let storage = &*((&(*(*arena).as_ptr()).rssi
+                        as *const ManuallyDrop<mode::rssi::Storage>)
+                        .cast::<mode::rssi::Storage>());
+                    mode::rssi::bind_storage(storage);
+                }
+                ModeArgs::Gatt { .. } => {
+                    (*arena).as_mut_ptr().write(UsbModeStorage {
+                        gatt: ManuallyDrop::new(()),
+                    });
+                }
+                ModeArgs::ConnFollow { .. } => {
+                    (*arena).as_mut_ptr().write(UsbModeStorage {
+                        conn_follow: ManuallyDrop::new(mode::conn_follow::Storage::new()),
+                    });
+                    let storage = &*((&(*(*arena).as_ptr()).conn_follow
+                        as *const ManuallyDrop<mode::conn_follow::Storage>)
+                        .cast::<mode::conn_follow::Storage>());
+                    mode::conn_follow::bind_storage(storage);
+                }
+                ModeArgs::Zigbee { .. } => {
+                    (*arena).as_mut_ptr().write(UsbModeStorage {
+                        zigbee: ManuallyDrop::new(mode::zigbee::Storage::new()),
+                    });
+                    let storage = &*((&(*(*arena).as_ptr()).zigbee
+                        as *const ManuallyDrop<mode::zigbee::Storage>)
+                        .cast::<mode::zigbee::Storage>());
+                    mode::zigbee::bind_storage(storage);
+                }
+                ModeArgs::Recon { .. } => {
+                    (*arena).as_mut_ptr().write(UsbModeStorage {
+                        recon: ManuallyDrop::new(mode::recon::Storage::new()),
+                    });
+                    let storage = &*((&(*(*arena).as_ptr()).recon
+                        as *const ManuallyDrop<mode::recon::Storage>)
+                        .cast::<mode::recon::Storage>());
+                    mode::recon::bind_storage(storage);
+                }
+            }
+        }
+    }
+}
+
 // ── Peripheral bundles ────────────────────────────────────────────────────────
 //
 // `run` has already consumed USBD + NVMC from `Peripherals`, so it can't pass the
@@ -86,6 +177,56 @@ pub(crate) struct LedParts {
     pub b: Peri<'static, peripherals::P0_06>,
 }
 
+/// Arguments for the one runtime-selected mode task. An enum makes the task
+/// future the size of its largest mode branch rather than reserving one Embassy
+/// pool for each mutually exclusive callback.
+enum ModeArgs {
+    BleSniff {
+        rx: Receiver<'static, UsbDriver>,
+        qspi: QspiParts,
+        leds: LedParts,
+    },
+    Rssi {
+        spi: Peri<'static, peripherals::SPI3>,
+        din: Peri<'static, peripherals::P0_02>,
+        leds: LedParts,
+    },
+    Gatt {
+        qspi: QspiParts,
+        leds: LedParts,
+    },
+    ConnFollow {
+        qspi: QspiParts,
+        leds: LedParts,
+    },
+    Zigbee {
+        leds: LedParts,
+    },
+    Recon {
+        qspi: QspiParts,
+        leds: LedParts,
+    },
+}
+
+/// The sole top-level mode task. The selected enum variant owns the relevant
+/// peripherals; only its future state is live after the match, so all boot-mode
+/// main-loop storage is overlaid in this one Embassy pool.
+#[embassy_executor::task]
+async fn mode_task(spawner: Spawner, args: ModeArgs) -> ! {
+    match args {
+        ModeArgs::BleSniff { rx, qspi, leds } => {
+            callback::ble_sniff::run(spawner, rx, qspi, leds).await
+        }
+        ModeArgs::Rssi { spi, din, leds } => callback::rssi::run(spi, din, leds).await,
+        ModeArgs::Gatt { qspi, leds } => callback::gatt::run(spawner, qspi, leds).await,
+        ModeArgs::ConnFollow { qspi, leds } => {
+            callback::conn_follow::run(spawner, qspi, leds).await
+        }
+        ModeArgs::Zigbee { leds } => callback::zigbee::run(spawner, leds).await,
+        ModeArgs::Recon { qspi, leds } => callback::recon::run(spawner, qspi, leds).await,
+    }
+}
+
 // ── USB CDC serial ──────────────────────────────────────────────────────────
 //
 // The CDC-ACM class exposes a serial port (appears as /dev/tty.usbmodem*)
@@ -105,7 +246,12 @@ static USB_CTRL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 
 /// Build the USB device + CDC-ACM class. The shared StaticCells are initialised
 /// here, so this runs once per boot (from the single spawned USB task).
-fn build_usb(driver: UsbDriver) -> (UsbDevice<'static, UsbDriver>, CdcAcmClass<'static, UsbDriver>) {
+fn build_usb(
+    driver: UsbDriver,
+) -> (
+    UsbDevice<'static, UsbDriver>,
+    CdcAcmClass<'static, UsbDriver>,
+) {
     let mut config = UsbConfig::new(0xc0de, 0xcafe);
     config.manufacturer = Some("Sonde");
     config.product = Some("Sonde BLE Probe");
@@ -149,7 +295,11 @@ async fn cdc_push(
 }
 
 /// Ship whatever is staged, as a short packet.
-async fn cdc_flush(tx: &mut Sender<'static, UsbDriver>, pkt: &[u8; CDC_PKT], n: &mut usize) -> Result<(), ()> {
+async fn cdc_flush(
+    tx: &mut Sender<'static, UsbDriver>,
+    pkt: &[u8; CDC_PKT],
+    n: &mut usize,
+) -> Result<(), ()> {
     if *n > 0 {
         tx.write_packet(&pkt[..*n]).await.map_err(|_| ())?;
         *n = 0;
@@ -167,13 +317,26 @@ fn log_chip() {
     let ram = FICR.info().ram().read().0;
     let flash = FICR.info().flash().read().0;
     let vb = FICR.info().variant().read().to_be_bytes();
-    let vc = |b: u8| if (0x20..0x7f).contains(&b) { b as char } else { '.' };
+    let vc = |b: u8| {
+        if (0x20..0x7f).contains(&b) {
+            b as char
+        } else {
+            '.'
+        }
+    };
     ulogf!(
         "chip: PART=0x{:05X} VARIANT={}{}{}{} PACKAGE=0x{:X} RAM={}KB FLASH={}KB \
          DEVICEID={:08X}{:08X} genuine_nRF52840={}",
-        part, vc(vb[0]), vc(vb[1]), vc(vb[2]), vc(vb[3]),
-        FICR.info().package().read().0, ram, flash,
-        FICR.deviceid(1).read(), FICR.deviceid(0).read(),
+        part,
+        vc(vb[0]),
+        vc(vb[1]),
+        vc(vb[2]),
+        vc(vb[3]),
+        FICR.info().package().read().0,
+        ram,
+        flash,
+        FICR.deviceid(1).read(),
+        FICR.deviceid(0).read(),
         part == 0x52840 && ram == 256 && flash == 1024
     );
 }
@@ -222,12 +385,18 @@ async fn drain_log(tx: &mut Sender<'static, UsbDriver>) {
                 // mode, then ISO-8601 UTC — see `wallclock`.
                 let mut prefix: heapless::String<32> = heapless::String::new();
                 wallclock::write_prefix(&mut prefix, queued_at);
-                if cdc_push(tx, &mut pkt, &mut n, prefix.as_bytes()).await.is_err() {
+                if cdc_push(tx, &mut pkt, &mut n, prefix.as_bytes())
+                    .await
+                    .is_err()
+                {
                     break 'connected;
                 }
             }
 
-            if cdc_push(tx, &mut pkt, &mut n, msg.as_bytes()).await.is_err() {
+            if cdc_push(tx, &mut pkt, &mut n, msg.as_bytes())
+                .await
+                .is_err()
+            {
                 break 'connected;
             }
         }
@@ -275,13 +444,15 @@ pub(crate) fn hold_assets(spawner: Spawner, qspi: Qspi<'static>) {
     spawner.spawn(qspi_hold(qspi).unwrap());
 }
 
-/// The WS2812 strip SPI for the RSSI monitor: 2 MHz, TX-only, no SCK, on P1.11.
+/// The WS2812 strip SPI for the RSSI monitor: 4 MHz, TX-only, no SCK, on D0
+/// (P0.02) — the Seeed 6×10 RGB matrix's data pin. 4 MHz (not 2 MHz) keeps the
+/// WS2812 '0' pulse (250 ns) inside spec — see `rssi::encode_color_byte`.
 pub(crate) fn ws2812_spi(
     spi: Peri<'static, peripherals::SPI3>,
-    din: Peri<'static, peripherals::P1_11>,
+    din: Peri<'static, peripherals::P0_02>,
 ) -> Spim<'static> {
     let mut cfg = spim::Config::default();
-    cfg.frequency = spim::Frequency::M2;
+    cfg.frequency = spim::Frequency::M4;
     Spim::new_txonly_nosck(spi, Irqs, din, cfg)
 }
 
@@ -362,8 +533,18 @@ async fn main(spawner: Spawner) {
     // GNSS (DX-GP21): wire the UART + 1PPS if the module is present. The boot
     // probe leaves the 1PPS pin unbound when the module does not answer — a
     // floating input must not drive the pulse handler.
-    let gnss = gnss::spawn(spawner, p.UARTE0, Irqs, p.P0_02, p.P0_03, p.P0_04, p.P0_05).await;
-    ulogf!("gnss: module {}\r\n", if gnss { "present — 1PPS armed" } else { "absent — 1PPS skipped" });
+    // GNSS pins moved off D0/D1/A2/A3: the LED matrix owns D0 (P0.02), so the
+    // module now sits on the four GPIOs next to the power group — D10 (TX),
+    // D9 (RX), D7 (1PPS), D5 (power).
+    let gnss = gnss::spawn(spawner, p.UARTE0, Irqs, p.P0_08, p.P0_07, p.P0_31, p.P0_05).await;
+    ulogf!(
+        "gnss: module {}\r\n",
+        if gnss {
+            "present — 1PPS armed"
+        } else {
+            "absent — 1PPS skipped"
+        }
+    );
 
     // Spawn the selected mode's task. Each `callback::*` task builds the mode, then
     // hands it a build-specific `setup` future (QSPI/LED/provisioning) that the mode
@@ -371,16 +552,47 @@ async fn main(spawner: Spawner) {
     // are already spent); only one arm runs, so moving the shared LED pins out of `p`
     // in several arms is fine.
     let qspi = || QspiParts {
-        qspi: p.QSPI, sck: p.P0_21, csn: p.P0_25,
-        io0: p.P0_20, io1: p.P0_24, io2: p.P0_22, io3: p.P0_23,
+        qspi: p.QSPI,
+        sck: p.P0_21,
+        csn: p.P0_25,
+        io0: p.P0_20,
+        io1: p.P0_24,
+        io2: p.P0_22,
+        io3: p.P0_23,
     };
-    let leds = || LedParts { pwm: p.PWM0, r: p.P0_26, g: p.P0_30, b: p.P0_06 };
-    match mode {
-        BootMode::BleSniff => spawner.spawn(callback::ble_sniff::run(spawner, rx, qspi(), leds()).unwrap()),
-        BootMode::RssiMonitor => spawner.spawn(callback::rssi::run(p.SPI3, p.P1_11, leds()).unwrap()),
-        BootMode::GattEnum => spawner.spawn(callback::gatt::run(spawner, qspi(), leds()).unwrap()),
-        BootMode::ConnFollow => spawner.spawn(callback::conn_follow::run(spawner, qspi(), leds()).unwrap()),
-        BootMode::ZigbeeSniff => spawner.spawn(callback::zigbee::run(spawner, leds()).unwrap()),
-        BootMode::Recon => spawner.spawn(callback::recon::run(spawner, qspi(), leds()).unwrap()),
-    }
+    let leds = || LedParts {
+        pwm: p.PWM0,
+        r: p.P0_26,
+        g: p.P0_30,
+        b: p.P0_06,
+    };
+    let args = match mode {
+        BootMode::BleSniff => ModeArgs::BleSniff {
+            rx,
+            qspi: qspi(),
+            leds: leds(),
+        },
+        BootMode::RssiMonitor => ModeArgs::Rssi {
+            spi: p.SPI3,
+            din: p.P0_02,
+            leds: leds(),
+        },
+        BootMode::GattEnum => ModeArgs::Gatt {
+            qspi: qspi(),
+            leds: leds(),
+        },
+        BootMode::ConnFollow => ModeArgs::ConnFollow {
+            qspi: qspi(),
+            leds: leds(),
+        },
+        BootMode::ZigbeeSniff => ModeArgs::Zigbee { leds: leds() },
+        BootMode::Recon => ModeArgs::Recon {
+            qspi: qspi(),
+            leds: leds(),
+        },
+    };
+    // The launch enum owns both the selected peripherals and the identity of
+    // its matching arena field, so the two cannot drift apart.
+    unsafe { args.init_storage() };
+    spawner.spawn(mode_task(spawner, args).unwrap());
 }

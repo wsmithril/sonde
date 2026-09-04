@@ -9,7 +9,7 @@
 
 use core::fmt::Write;
 
-use super::{line, send, u16le, write_interval, write_phys, Decoder};
+use super::{Decoder, line, send, u16le, write_interval, write_phys};
 
 pub(super) struct Timeline;
 
@@ -34,7 +34,12 @@ impl Decoder<u8> for Timeline {
                 let mut s = line();
                 let _ = s.push_str("interval=");
                 write_interval(&mut s, u16le(d, 3));
-                let _ = write!(s, " latency={} timeout={}ms", u16le(d, 5), u16le(d, 7) as u32 * 10);
+                let _ = write!(
+                    s,
+                    " latency={} timeout={}ms",
+                    u16le(d, 5),
+                    u16le(d, 7) as u32 * 10
+                );
                 let _ = s.push_str(" winsize=");
                 write_interval(&mut s, d[0] as u16);
                 let _ = s.push_str(" winoffset=");
@@ -51,7 +56,11 @@ impl Decoder<u8> for Timeline {
                 let _ = write!(
                     s,
                     "chmap={:02X}{:02X}{:02X}{:02X}{:02X} ({} ch) instant={}",
-                    d[0], d[1], d[2], d[3], d[4],
+                    d[0],
+                    d[1],
+                    d[2],
+                    d[3],
+                    d[4],
                     d[..5].iter().map(|b| b.count_ones()).sum::<u32>(),
                     u16le(d, 5)
                 );
@@ -74,7 +83,9 @@ impl Decoder<u8> for Timeline {
                 let _ = write!(
                     s,
                     "enable={} min_spacing={}ms max_delay={}ms",
-                    d[0], d[1] as u32 * 200, d[2] as u32 * 200
+                    d[0],
+                    d[1] as u32 * 200,
+                    d[2] as u32 * 200
                 );
                 send(s);
             }

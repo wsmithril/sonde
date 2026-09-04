@@ -20,18 +20,22 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Samsung Electronics — manufacturer data (Company ID 0x0075).
 pub(super) struct Samsung;
 impl super::VendorDecoder for Samsung {
-    fn company_ids(&self) -> &'static [u16] { &[0x0075] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0075]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         match body[0] {
             0x42 => Self::decode_buds(ctx, body),
             0x01 => Self::decode_watch(ctx, body),
-            _    => Self::decode_generic(ctx, body),
+            _ => Self::decode_generic(ctx, body),
         }
     }
 }
@@ -72,8 +76,12 @@ impl Samsung {
     /// Any other leading byte: labelled but not decoded.
     fn decode_generic(ctx: &super::DecodeCtx, body: &[u8]) {
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    Samsung (unrecognised): type=0x{:02X} len={}",
-            body[0], body.len());
+        let _ = write!(
+            s,
+            "    Samsung (unrecognised): type=0x{:02X} len={}",
+            body[0],
+            body.len()
+        );
         emit(s);
         hexdump(body, ctx.base, 6);
     }
@@ -104,7 +112,7 @@ fn buds_name(id: u32) -> Option<&'static str> {
         0x42C519 => "Red Buds Live",
         0xAE073A => "Black & White Buds2",
         0x011716 => "Sleek Black Buds2",
-        _        => return None,
+        _ => return None,
     })
 }
 
@@ -141,6 +149,6 @@ fn watch_name(id: u8) -> Option<&'static str> {
         0xE5 => "White Watch5 Gold Edition",
         0xEC => "Black Watch6 Golf Edition",
         0xEF => "Black Watch6 TB Edition",
-        _    => return None,
+        _ => return None,
     })
 }

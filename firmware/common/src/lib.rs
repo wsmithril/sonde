@@ -135,8 +135,7 @@ impl Sink for LogSink {
 /// A burst that outruns the host turns the log silent, which reads exactly like
 /// a wedged device: the producer never blocks, so the firmware runs on happily
 /// while nothing comes out. The count is what tells the two apart.
-pub static LOG_DROPPED: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static LOG_DROPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Everything that means the probe lost data: a dropped log line, a full decode
 /// queue, a torn DMA snapshot.
@@ -148,15 +147,13 @@ pub static LOG_DROPPED: core::sync::atomic::AtomicU32 =
 /// A radio found still running where DISABLED was expected is *not* counted here:
 /// [`hal::radio::ensure_disabled`] recovers it in place with no data lost, so
 /// it belongs in [`RADIO_RECOVERED`], not in the loss signal that flashes the LED.
-pub static ERR_TOTAL: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static ERR_TOTAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Times the radio was found still running where DISABLED was expected and
 /// [`hal::radio::ensure_disabled`] disabled it in place. Each one is a benign
 /// recovery, not lost data — separate from [`ERR_TOTAL`] so a self-healing quirk
 /// does not read as loss. Surfaced per-window as `recovered=` in the sniff stats.
-pub static RADIO_RECOVERED: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static RADIO_RECOVERED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Stamp every line `f` emits with `t`.
 ///
@@ -257,7 +254,11 @@ pub fn hexdump(payload: &[u8], base: usize, indent: usize) {
         }
         let _ = s.push_str("  ");
         for &b in row {
-            let _ = s.push(if (0x20..0x7F).contains(&b) { b as char } else { '.' });
+            let _ = s.push(if (0x20..0x7F).contains(&b) {
+                b as char
+            } else {
+                '.'
+            });
         }
         terminate_line(&mut s);
         log_send(s);
@@ -289,12 +290,12 @@ pub fn hexdump_dense(prefix: &str, payload: &[u8], indent: usize) {
     }
 }
 
-pub mod boot;
 pub(crate) mod blacklist;
+pub mod boot;
 pub mod central;
+pub mod device;
 pub mod gnss;
 pub mod hal;
-pub mod device;
 #[cfg(feature = "resolve-identities")]
 pub mod keys;
 pub mod led;
@@ -346,6 +347,8 @@ impl Rng {
     /// xorshift dies on an all-zero state, so keep it non-zero.
     pub fn stir(&mut self, entropy: u32) {
         self.0 ^= entropy.rotate_left(7);
-        if self.0 == 0 { self.0 = 0x9E37_79B9; }
+        if self.0 == 0 {
+            self.0 = 0x9E37_79B9;
+        }
     }
 }

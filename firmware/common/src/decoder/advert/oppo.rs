@@ -22,7 +22,7 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// Heytap 8-byte header shared across OPPO / OnePlus / Realme mfg-data.
 const HEYTAP_HEADER: &[u8; 8] = &[0xAF, 0x30, 0x2B, 0x14, 0x88, 0x00, 0x4C, 0x26];
@@ -30,7 +30,9 @@ const HEYTAP_HEADER: &[u8; 8] = &[0xAF, 0x30, 0x2B, 0x14, 0x88, 0x00, 0x4C, 0x26
 /// OPPO — manufacturer data (Company ID 0x079A).
 pub(super) struct Oppo;
 impl super::VendorDecoder for Oppo {
-    fn company_ids(&self) -> &'static [u16] { &[0x079A] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x079A]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         decode_heytap(ctx, body, "OPPO");
     }
@@ -40,7 +42,9 @@ impl super::VendorDecoder for Oppo {
 /// as OPPO / Realme; brand is disambiguated by CID.
 pub(super) struct OnePlus;
 impl super::VendorDecoder for OnePlus {
-    fn company_ids(&self) -> &'static [u16] { &[0x072F] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x072F]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         decode_heytap(ctx, body, "OnePlus");
     }
@@ -50,14 +54,18 @@ impl super::VendorDecoder for OnePlus {
 /// as OPPO / OnePlus; brand is disambiguated by CID.
 pub(super) struct Realme;
 impl super::VendorDecoder for Realme {
-    fn company_ids(&self) -> &'static [u16] { &[0x08A4] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x08A4]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         decode_heytap(ctx, body, "Realme");
     }
 }
 
 fn decode_heytap(ctx: &super::DecodeCtx, body: &[u8], brand: &str) {
-    if body.is_empty() { return; }
+    if body.is_empty() {
+        return;
+    }
     // The Heytap header is stable across all three brands; state and tail
     // bytes past it are undocumented, so surface the header match as the
     // recognised structure and dump the rest.
@@ -67,14 +75,23 @@ fn decode_heytap(ctx: &super::DecodeCtx, body: &[u8], brand: &str) {
         write_hex(&mut s, HEYTAP_HEADER);
         let _ = write!(s, " tail-len={}", body.len() - HEYTAP_HEADER.len());
         emit(s);
-        hexdump(&body[HEYTAP_HEADER.len()..], ctx.base + HEYTAP_HEADER.len(), 6);
+        hexdump(
+            &body[HEYTAP_HEADER.len()..],
+            ctx.base + HEYTAP_HEADER.len(),
+            6,
+        );
         return;
     }
     // Non-Heytap frames on these CIDs: the current firmware sees rare short
     // variants that don't start with the shared header. No public RE.
     let mut s: LogStr = LogStr::new();
-    let _ = write!(s, "    {} (fast-connect): frame=0x{:02X} len={}",
-        brand, body[0], body.len());
+    let _ = write!(
+        s,
+        "    {} (fast-connect): frame=0x{:02X} len={}",
+        brand,
+        body[0],
+        body.len()
+    );
     emit(s);
     hexdump(body, ctx.base, 6);
 }

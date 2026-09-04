@@ -18,24 +18,30 @@
 
 use core::fmt::Write;
 
-use super::{emit, LogStr};
+use super::{LogStr, emit};
 
 /// LEGO System A/S — manufacturer data (Company ID 0x0397): Powered Up / LWP3 hubs.
 pub(super) struct Lego;
 impl super::VendorDecoder for Lego {
-    fn company_ids(&self) -> &'static [u16] { &[0x0397] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0397]
+    }
     fn decode(&self, _ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.len() < 6 { return; }
+        if body.len() < 6 {
+            return;
+        }
 
-        let button   = body[0] != 0;
+        let button = body[0] != 0;
         let hub_kind = body[1];
-        let caps     = body[2];
-        let network  = body[3];
-        let status   = body[4];
+        let caps = body[2];
+        let network = body[3];
+        let status = body[4];
         // body[5] = reserved
 
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    LEGO {}: btn={} net=0x{:02X} status=0x{:02X}",
+        let _ = write!(
+            s,
+            "    LEGO {}: btn={} net=0x{:02X} status=0x{:02X}",
             Self::model_name(hub_kind),
             if button { "pressed" } else { "off" },
             network,
@@ -44,17 +50,31 @@ impl super::VendorDecoder for Lego {
 
         let _ = write!(s, " cap=[");
         let mut sep = "";
-        if caps & 0x01 != 0 { let _ = write!(s, "{}central",   sep); sep = " "; }
-        if caps & 0x02 != 0 { let _ = write!(s, "{}peripheral", sep); sep = " "; }
-        if caps & 0x04 != 0 { let _ = write!(s, "{}ports",      sep); sep = " "; }
-        if caps & 0x08 != 0 { let _ = write!(s, "{}remote",     sep); }
+        if caps & 0x01 != 0 {
+            let _ = write!(s, "{}central", sep);
+            sep = " ";
+        }
+        if caps & 0x02 != 0 {
+            let _ = write!(s, "{}peripheral", sep);
+            sep = " ";
+        }
+        if caps & 0x04 != 0 {
+            let _ = write!(s, "{}ports", sep);
+            sep = " ";
+        }
+        if caps & 0x08 != 0 {
+            let _ = write!(s, "{}remote", sep);
+        }
         let _ = write!(s, "]");
 
         // Remaining 6 bytes: the hub's classic BT address, for correlation with BR/EDR.
         if body.len() >= 12 {
             let a = &body[6..12];
-            let _ = write!(s, " bt_addr={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                a[5], a[4], a[3], a[2], a[1], a[0]);
+            let _ = write!(
+                s,
+                " bt_addr={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                a[5], a[4], a[3], a[2], a[1], a[0]
+            );
         }
         emit(s);
     }
@@ -75,7 +95,7 @@ impl Lego {
             0x81 => "SPIKE Prime / MINDSTORMS RI Hub",
             0x83 => "SPIKE Essential Hub",
             0x84 => "Technic Move Hub",
-            _    => "Hub (?)",
+            _ => "Hub (?)",
         }
     }
 }

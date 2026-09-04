@@ -13,13 +13,17 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// GoPro, Inc. — manufacturer data (0x02F2) and service data (0xFEA6).
 pub(super) struct GoPro;
 impl super::VendorDecoder for GoPro {
-    fn company_ids(&self) -> &'static [u16] { &[0x02F2] }
-    fn service_uuids(&self) -> &'static [u16] { &[0xFEA6] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x02F2]
+    }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFEA6]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         match ctx.kind {
             super::FrameKind::Service => Self::decode_service(ctx, body),

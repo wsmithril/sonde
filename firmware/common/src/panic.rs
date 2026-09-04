@@ -15,7 +15,7 @@
 //! deterministically is stepped past rather than retried in a tight loop, and the
 //! recorded site is printed on the next boot by [`report_and_clear`].
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use embassy_nrf::pac;
 use embassy_nrf::pac::nvmc::vals;
@@ -96,7 +96,8 @@ fn record(line: u32, file: &[u8], msg: &[u8]) {
     // First free slot, by the same append-log scheme the boot-mode page uses.
     let mut slot = None;
     for i in 0..RECS {
-        let w = unsafe { core::ptr::read_volatile((PANIC_PAGE as usize + i * REC_LEN) as *const u32) };
+        let w =
+            unsafe { core::ptr::read_volatile((PANIC_PAGE as usize + i * REC_LEN) as *const u32) };
         if w == 0xFFFF_FFFF {
             slot = Some(i);
             break;
@@ -160,7 +161,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     };
 
     let mut msg = [0u8; REC_MSG_LEN];
-    let mut w = Trunc { buf: &mut msg, n: 0 };
+    let mut w = Trunc {
+        buf: &mut msg,
+        n: 0,
+    };
     let _ = core::fmt::write(&mut w, format_args!("{}", info.message()));
     let n = w.n;
 

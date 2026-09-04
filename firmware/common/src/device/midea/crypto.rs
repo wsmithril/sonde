@@ -1,7 +1,7 @@
 //! Midea control-channel crypto, ported from midea-ble-go
 //! (`internal/proto/crypto.go`).
 //!
-//! * **rootKey** = `HKDF-SHA256(ikm = 0xAC‖SN8‖MAC_reversed, salt = ∅,
+//! * **rootKey** = `HKDF-SHA256(ikm = typeCode‖SN8‖MAC_reversed, salt = ∅,
 //!   info = "midea_bleapp")[..16]` — the SN and MAC are broadcast in the 0x06A8
 //!   advertisement, so a passive listener can derive this and decrypt the `t2`
 //!   handshake frames.
@@ -16,8 +16,8 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::hal::crypto::aes128_ecb;
 use super::frame::Frame;
+use crate::hal::crypto::aes128_ecb;
 
 // AES-CCM parameters used by Midea: 8-byte tag (M) and a 7-byte length field (L),
 // which fixes the nonce at 15 - L = 8 bytes.
@@ -26,18 +26,34 @@ const L: usize = 7;
 
 // ── key derivation ──────────────────────────────────────────────────────────
 
-/// Reconstruct the HKDF input the appliance uses: `0xAC ‖ SN[..8] ‖ MAC_reversed`
-/// (`internal/ble/scanner.go`). `sn` is the ASCII short serial; only its first 8
-/// bytes are used. `mac` is the appliance's real address, most-significant first.
-pub fn advertis_data(sn: &[u8], mac: &[u8; 6]) -> [u8; 15] {
+/// Reconstruct the HKDF input the appliance uses:
+/// `typeCode ‖ SN[..8] ‖ MAC_reversed` (`internal/ble/scanner.go`). The type code
+/// is the two ASCII hex characters at `sn[8..10]`: an AC serial supplies `0xAC`,
+/// an ED serial supplies `0xED`. Only the first 8 serial bytes are otherwise used.
+/// `mac` is the appliance's real address, most-significant first.
+pub fn advertis_data(sn: &[u8], mac: &[u8; 6]) -> Option<[u8; 15]> {
+    let type_code = ascii_hex_byte(sn.get(8).copied()?, sn.get(9).copied()?)?;
     let mut out = [0u8; 15];
-    out[0] = 0xAC;
+    out[0] = type_code;
     let n = sn.len().min(8);
     out[1..1 + n].copy_from_slice(&sn[..n]); // shorter SN leaves trailing zeros
     for i in 0..6 {
         out[9 + i] = mac[5 - i]; // reversed
     }
-    out
+    Some(out)
+}
+
+/// Decode the ASCII-hex appliance type embedded in the short serial.
+fn ascii_hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        }
+    }
+    Some(nibble(hi)? << 4 | nibble(lo)?)
 }
 
 /// HMAC-SHA256 over the concatenation of `chunks`.
@@ -208,7 +224,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::derive_root_key;
+    use super::{advertis_data, derive_root_key};
+
+    #[test]
+    fn advertis_data_uses_the_serial_type_code() {
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let ac = advertis_data(b"12345678AC0000", &mac).unwrap();
+        let ed = advertis_data(b"12345678ED0000", &mac).unwrap();
+
+        assert_eq!(
+            ac,
+            [
+                0xAC, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', 0xFF, 0xEE, 0xDD, 0xCC, 0xBB,
+                0xAA,
+            ]
+        );
+        assert_eq!(ed[0], 0xED);
+        assert_eq!(&ed[1..], &ac[1..]);
+        assert!(advertis_data(b"12345678ZZ0000", &mac).is_none());
+    }
 
     /// Golden conformance vector from the Go / midea-ble reference suite
     /// (`src/proto/crypto.rs::root_key_golden_vector`): advertisData
@@ -219,7 +253,8 @@ mod tests {
     #[test]
     fn root_key_golden_vector() {
         let ad = [
-            0xAC, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+            0xAC, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF,
         ];
         assert_eq!(
             derive_root_key(&ad),

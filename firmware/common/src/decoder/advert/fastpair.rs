@@ -8,7 +8,7 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Community-sourced subset of the 24-bit Fast Pair Model ID registry (Google
 /// keeps the full 4000+ list private). Extended from the gists at
@@ -77,7 +77,9 @@ fn model_name(id: u32) -> Option<&'static str> {
 /// Google Fast Pair — service data (UUID 0xFE2C).
 pub(super) struct FastPair;
 impl super::VendorDecoder for FastPair {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFE2C] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFE2C]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         let f = body;
         let base = ctx.base;
@@ -92,7 +94,9 @@ impl super::VendorDecoder for FastPair {
             emit(s);
             return;
         }
-        if f.is_empty() { return; }
+        if f.is_empty() {
+            return;
+        }
 
         // Non-discoverable: walk the [len<<4 | type] account-key-data fields.
         let _ = write!(s, "    FastPair non-discoverable:");
@@ -104,15 +108,26 @@ impl super::VendorDecoder for FastPair {
             let bstart = i + 1;
             let bend = (bstart + len).min(f.len());
             match typ {
-                0x0 => { let _ = write!(s, " akf(show,{}B)", len); }
-                0x2 => { let _ = write!(s, " akf(hidden,{}B)", len); }
-                0x1 => { let _ = write!(s, " salt({}B)", len); }
+                0x0 => {
+                    let _ = write!(s, " akf(show,{}B)", len);
+                }
+                0x2 => {
+                    let _ = write!(s, " akf(hidden,{}B)", len);
+                }
+                0x1 => {
+                    let _ = write!(s, " salt({}B)", len);
+                }
                 0x3 | 0x4 => {
-                    let _ = write!(s, " battery({})",
-                        if typ == 0x3 { "show" } else { "hidden" });
+                    let _ = write!(
+                        s,
+                        " battery({})",
+                        if typ == 0x3 { "show" } else { "hidden" }
+                    );
                     battery = Some((bstart, bend - bstart));
                 }
-                _ => { let _ = write!(s, " field(type=0x{:X},{}B)", typ, len); }
+                _ => {
+                    let _ = write!(s, " field(type=0x{:X},{}B)", typ, len);
+                }
             }
             i = bend; // bend >= i+1 always, so the walk terminates
         }
@@ -124,12 +139,20 @@ impl super::VendorDecoder for FastPair {
             for k in 0..blen {
                 let v = f[bs + k];
                 let lbl = LABELS.get(k).copied().unwrap_or("?");
-                if k > 0 { let _ = write!(s, " "); }
+                if k > 0 {
+                    let _ = write!(s, " ");
+                }
                 let lvl = v & 0x7F;
                 if lvl == 0x7F {
                     let _ = write!(s, "{}=?", lbl);
                 } else {
-                    let _ = write!(s, "{}={}%{}", lbl, lvl, if v & 0x80 != 0 { "+" } else { "" });
+                    let _ = write!(
+                        s,
+                        "{}={}%{}",
+                        lbl,
+                        lvl,
+                        if v & 0x80 != 0 { "+" } else { "" }
+                    );
                 }
             }
             let _ = write!(s, "]");

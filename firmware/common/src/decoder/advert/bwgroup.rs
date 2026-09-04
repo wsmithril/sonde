@@ -17,12 +17,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// B&W Group Ltd. — manufacturer data (Company ID 0x014F).
 pub(super) struct BwGroup;
 impl super::VendorDecoder for BwGroup {
-    fn company_ids(&self) -> &'static [u16] { &[0x014F] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x014F]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         // Expect the 13-byte layout opening `0B 00`; anything else is unknown.
         if body.len() < 13 || body[0] != 0x0B {

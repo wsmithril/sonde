@@ -9,7 +9,7 @@
 use core::fmt::Write;
 
 use super::super::features;
-use super::{line, send, u16le, Decoder};
+use super::{Decoder, line, send, u16le};
 
 pub(super) struct Identity;
 
@@ -33,8 +33,11 @@ impl Decoder<u8> for Identity {
                 let mut s = line();
                 let cid = u16le(d, 1);
                 let _ = write!(
-                    s, "version={} (0x{:02X}) company=0x{:04X}",
-                    Self::version_name(d[0]), d[0], cid
+                    s,
+                    "version={} (0x{:02X}) company=0x{:04X}",
+                    Self::version_name(d[0]),
+                    d[0],
+                    cid
                 );
                 if let Some(n) = crate::decoder::company_name(cid) {
                     let _ = write!(s, " ({})", n);

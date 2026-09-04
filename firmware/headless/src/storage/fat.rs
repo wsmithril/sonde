@@ -119,7 +119,11 @@ impl Fat {
         let fat_sectors = (data_clusters + 2) * 4;
         let fat_sectors = fat_sectors.div_ceil(BLOCK);
         let part_total = RESERVED + NFATS * fat_sectors + data_clusters;
-        Self { files, fat_sectors, part_total }
+        Self {
+            files,
+            fat_sectors,
+            part_total,
+        }
     }
 
     fn data_start_rel(&self) -> u32 {
@@ -245,7 +249,11 @@ impl Fat {
             } else if cl == 1 || cl == ROOT_CLUSTER {
                 0x0FFF_FFFF // reserved + single-cluster root dir
             } else if let Some((f, off)) = self.file_at(cl) {
-                if off + 1 == f.n_clusters { 0x0FFF_FFFF } else { cl + 1 }
+                if off + 1 == f.n_clusters {
+                    0x0FFF_FFFF
+                } else {
+                    cl + 1
+                }
             } else {
                 0 // free
             };

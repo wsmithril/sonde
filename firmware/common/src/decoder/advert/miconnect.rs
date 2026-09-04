@@ -29,7 +29,7 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// Longest device name reassembled from chunks. Names on air run to about 25
 /// bytes ("Xiaomi 12 Pro Dimensity"); CJK names cost 3 bytes a character.
@@ -39,7 +39,9 @@ const NAME_CAP: usize = 96;
 /// 0xFC66, 0xFDAA, 0xFD2D).
 pub(super) struct MiConnect;
 impl super::VendorDecoder for MiConnect {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFCC0, 0xFC66, 0xFDAA, 0xFD2D] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFCC0, 0xFC66, 0xFDAA, 0xFD2D]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         match ctx.key {
             0xFCC0 | 0xFC66 => decode_container(ctx, body),
@@ -56,7 +58,11 @@ fn decode_container(ctx: &super::DecodeCtx, body: &[u8]) {
         return;
     }
     let mut s: LogStr = LogStr::new();
-    let _ = write!(s, "    MiConnect 0x{:04X}: v{} flags=0x{:02X} id=", ctx.key, body[0], body[1]);
+    let _ = write!(
+        s,
+        "    MiConnect 0x{:04X}: v{} flags=0x{:02X} id=",
+        ctx.key, body[0], body[1]
+    );
     write_hex(&mut s, &body[3..9]);
     emit(s);
 
@@ -85,7 +91,9 @@ fn chunked_name(p: &[u8]) -> Option<heapless::Vec<u8, NAME_CAP>> {
         }
         i += 1;
     }
-    if out.is_empty() { return None; }
+    if out.is_empty() {
+        return None;
+    }
 
     // Continuation: `BC [len][0x01][strlen][text]`, where len covers the two
     // bytes after it plus the text.
@@ -110,7 +118,9 @@ fn decode_nibble_tlv(ctx: &super::DecodeCtx, body: &[u8]) {
     let mut i = 1;
     let mut has_name = false;
     while i < body.len() {
-        if body[i] & 0x0F == 0x03 && body[i] >> 4 != 0 { has_name = true; }
+        if body[i] & 0x0F == 0x03 && body[i] >> 4 != 0 {
+            has_name = true;
+        }
         i += 1 + (body[i] >> 4) as usize;
     }
     if body.is_empty() || i != body.len() || !has_name {
@@ -149,8 +159,13 @@ fn decode_fd2d(ctx: &super::DecodeCtx, body: &[u8]) {
         return;
     }
     let mut s: LogStr = LogStr::new();
-    let _ = write!(s, "    MiConnect 0xFD2D: v{} type=0x{:02X} encrypted len={}",
-        body[0], body[1], body.len() - 2);
+    let _ = write!(
+        s,
+        "    MiConnect 0xFD2D: v{} type=0x{:02X} encrypted len={}",
+        body[0],
+        body[1],
+        body.len() - 2
+    );
     emit(s);
     hexdump(&body[2..], ctx.base + 2, 6);
 }
@@ -161,7 +176,9 @@ fn emit_name(uuid: u16, name: &[u8]) {
     let mut s: LogStr = LogStr::new();
     let _ = write!(s, "    MiConnect 0x{:04X}: name=\"", uuid);
     match core::str::from_utf8(name) {
-        Ok(n) => { let _ = write!(s, "{}\"", n); }
+        Ok(n) => {
+            let _ = write!(s, "{}\"", n);
+        }
         Err(e) => {
             let vu = e.valid_up_to();
             if let Ok(n) = core::str::from_utf8(&name[..vu]) {

@@ -8,12 +8,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// OPPO / OnePlus cross-device discovery — service data (UUID 0x686B).
 pub(super) struct Oplus;
 impl super::VendorDecoder for Oplus {
-    fn service_uuids(&self) -> &'static [u16] { &[0x686B] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0x686B]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 7 || body[6] != 0x08 {
             hexdump(body, ctx.base, 6);
@@ -26,7 +28,9 @@ impl super::VendorDecoder for Oplus {
         let mut s: LogStr = LogStr::new();
         let _ = write!(s, "    OPPO/OnePlus cross-device: name=\"");
         match core::str::from_utf8(&body[7..]) {
-            Ok(n) => { let _ = write!(s, "{}\"", n); }
+            Ok(n) => {
+                let _ = write!(s, "{}\"", n);
+            }
             Err(e) => {
                 // The name is cut off at the AD-structure length limit, which can
                 // split a multi-byte character; print the part that decodes.

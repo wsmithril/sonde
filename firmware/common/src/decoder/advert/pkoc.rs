@@ -20,12 +20,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// PKOC access credential — service data (UUID 0xFFF0).
 pub(super) struct Pkoc;
 impl super::VendorDecoder for Pkoc {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFFF0] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFFF0]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         let mut s: LogStr = LogStr::new();
         let _ = write!(s, "    PKOC? (access credential, UUID 0xFFF0)");

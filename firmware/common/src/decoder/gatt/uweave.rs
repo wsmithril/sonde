@@ -51,7 +51,11 @@ pub(crate) fn describe(uuid_le: &[u8], v: &[u8], s: &mut LogStr) -> Option<usize
             1 => "CONNECTION_RESPONSE",
             2 => "CONNECTION_CLOSE",
             other => {
-                let _ = write!(s, "        uWeave CONTROL cmd=0x{:X} (counter {})", other, counter);
+                let _ = write!(
+                    s,
+                    "        uWeave CONTROL cmd=0x{:X} (counter {})",
+                    other, counter
+                );
                 return Some(1);
             }
         };
@@ -59,7 +63,11 @@ pub(crate) fn describe(uuid_le: &[u8], v: &[u8], s: &mut LogStr) -> Option<usize
     } else {
         let first = if b & 0x08 != 0 { " first" } else { "" };
         let last = if b & 0x04 != 0 { " last" } else { "" };
-        let _ = write!(s, "        uWeave DATA (counter {}{}{})", counter, first, last);
+        let _ = write!(
+            s,
+            "        uWeave DATA (counter {}{}{})",
+            counter, first, last
+        );
     }
     Some(1)
 }

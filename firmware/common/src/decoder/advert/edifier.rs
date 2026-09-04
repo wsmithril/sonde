@@ -7,12 +7,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, write_hex, LogStr};
+use super::{LogStr, emit, write_hex};
 
 /// Edifier — manufacturer data (Company ID 0x07E0).
 pub(super) struct Edifier;
 impl super::VendorDecoder for Edifier {
-    fn company_ids(&self) -> &'static [u16] { &[0x07E0] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x07E0]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 6 {
             super::hexdump(body, ctx.base, 6);
@@ -20,9 +22,11 @@ impl super::VendorDecoder for Edifier {
         }
         let m = &body[..6];
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s,
+        let _ = write!(
+            s,
             "    Edifier: classic-MAC={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} state=",
-            m[0], m[1], m[2], m[3], m[4], m[5]);
+            m[0], m[1], m[2], m[3], m[4], m[5]
+        );
         write_hex(&mut s, &body[6..]);
         emit(s);
     }

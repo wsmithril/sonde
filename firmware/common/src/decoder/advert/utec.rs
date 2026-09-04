@@ -7,16 +7,25 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// U-tec / ULTRALOQ smart lock — service data (UUID 0xFF01).
 pub(super) struct Utec;
 impl super::VendorDecoder for Utec {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFF01] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFF01]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    U-tec/ULTRALOQ 0xFF01 (lock, proprietary): type=0x{:02X} data len={}", body[0], body.len() - 1);
+        let _ = write!(
+            s,
+            "    U-tec/ULTRALOQ 0xFF01 (lock, proprietary): type=0x{:02X} data len={}",
+            body[0],
+            body.len() - 1
+        );
         emit(s);
         hexdump(&body[1..], ctx.base + 1, 6);
     }

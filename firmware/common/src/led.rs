@@ -20,11 +20,11 @@
 
 use core::sync::atomic::{Ordering, compiler_fence};
 
+use embassy_nrf::Peri;
 use embassy_nrf::gpio::{AnyPin, Level, Output, OutputDrive};
 use embassy_nrf::pac;
 use embassy_nrf::peripherals::{P0_06, P0_26, P0_30, PWM0};
 use embassy_nrf::pwm::{DutyCycle, Prescaler, SimpleConfig, SimplePwm};
-use embassy_nrf::Peri;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 
@@ -164,9 +164,12 @@ impl Cmd {
     /// that are a single write.
     pub fn total_ms(self) -> u64 {
         match self {
-            Cmd::Blink { count, on_ms, off_ms, .. } => {
-                count as u64 * (on_ms as u64 + off_ms as u64)
-            }
+            Cmd::Blink {
+                count,
+                on_ms,
+                off_ms,
+                ..
+            } => count as u64 * (on_ms as u64 + off_ms as u64),
             _ => 0,
         }
     }
@@ -195,7 +198,13 @@ pub fn blink(colour: Rgb, count: u16, on_ms: u16, off_ms: u16) -> u64 {
 /// [`blink`], but settling on `then` instead of going dark — for a state change
 /// that wants to announce itself and then stay visible.
 pub fn blink_then(colour: Rgb, then: Rgb, count: u16, on_ms: u16, off_ms: u16) -> u64 {
-    let cmd = Cmd::Blink { colour, then, count, on_ms, off_ms };
+    let cmd = Cmd::Blink {
+        colour,
+        then,
+        count,
+        on_ms,
+        off_ms,
+    };
     LED.signal(cmd);
     cmd.total_ms()
 }
@@ -247,7 +256,11 @@ impl Pwm {
         cfg.ch3_idle_level = Level::High;
         let pwm = SimplePwm::new_3ch(pwm0, r, g, b, &cfg);
         let max = pwm.max_duty() as u32;
-        Self { pwm, max, duty: [DutyCycle::normal(0); 4] }
+        Self {
+            pwm,
+            max,
+            duty: [DutyCycle::normal(0); 4],
+        }
     }
 }
 
@@ -294,15 +307,16 @@ pub struct Gpio {
 }
 
 impl Gpio {
-    pub fn new(
-        r: Peri<'static, P0_26>,
-        g: Peri<'static, P0_30>,
-        b: Peri<'static, P0_06>,
-    ) -> Self {
+    pub fn new(r: Peri<'static, P0_26>, g: Peri<'static, P0_30>, b: Peri<'static, P0_06>) -> Self {
         // Level::High is off: start dark rather than lighting whatever the pins
         // were left holding.
         let out = |p: Peri<'static, AnyPin>| Output::new(p, Level::High, OutputDrive::Standard);
-        Self { r: out(r.into()), g: out(g.into()), b: out(b.into()), cur: OFF }
+        Self {
+            r: out(r.into()),
+            g: out(g.into()),
+            b: out(b.into()),
+            cur: OFF,
+        }
     }
 
     /// Takes the pins without going through `Peripherals`, for the boot path that
@@ -372,4 +386,3 @@ pub fn fatal_blink() -> ! {
 }
 
 // ── Indicator task (GATT) ─────────────────────────────────────────────────────
-

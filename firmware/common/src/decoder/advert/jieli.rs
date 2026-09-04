@@ -7,16 +7,25 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Zhuhai Jieli Technology — manufacturer data (Company ID 0x05D6).
 pub(super) struct Jieli;
 impl super::VendorDecoder for Jieli {
-    fn company_ids(&self) -> &'static [u16] { &[0x05D6] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x05D6]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    Jieli SoC: type=0x{:02X} len={}", body[0], body.len());
+        let _ = write!(
+            s,
+            "    Jieli SoC: type=0x{:02X} len={}",
+            body[0],
+            body.len()
+        );
         emit(s);
         hexdump(body, ctx.base, 6);
     }

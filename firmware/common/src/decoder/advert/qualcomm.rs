@@ -7,20 +7,25 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// Qualcomm Technologies International (QTIL) — manufacturer data (0x000A).
 pub(super) struct Qualcomm;
 impl super::VendorDecoder for Qualcomm {
-    fn company_ids(&self) -> &'static [u16] { &[0x000A] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x000A]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 4 {
             hexdump(body, ctx.base, 6);
             return;
         }
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    Qualcomm (unofficial): tag=\"{}{}\" flags=0x{:02X} cnt=0x{:02X}",
-            body[0] as char, body[1] as char, body[2], body[3]);
+        let _ = write!(
+            s,
+            "    Qualcomm (unofficial): tag=\"{}{}\" flags=0x{:02X} cnt=0x{:02X}",
+            body[0] as char, body[1] as char, body[2], body[3]
+        );
         if body.len() > 4 {
             let _ = write!(s, " rotating=");
             write_hex(&mut s, &body[4..]);

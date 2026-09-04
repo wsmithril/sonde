@@ -51,11 +51,36 @@ cargo clippy --release -p sonde-usb -p sonde-headless  # no --all-targets: no_st
 rust-size target/thumbv7em-none-eabi/release/sonde-usb
 ```
 
-Flash occupancy: 276,956 / 811,008 B = 34.1% (`.vector_table + .text + .rodata
-+ .data`). RAM 125,260 / 237,568 B = 52.7%, of which the 192-entry USB `LOG`
-channel is 101 KB — everything else in `.bss` together is under 24 KB. The 91.4%
-flash figure recorded here previously predated the QSPI asset offload, when the
-486 KB of vendor tables still lived in internal flash.
+The current USB release image has 1,056 B of `.data`, 131,176 B of `.bss`, and
+1,024 B of linker-reserved `.uninit`. The 192-entry USB `LOG` channel alone is
+101,416 B, so it remains the dominant allocation; it is deliberately retained
+because the shallow queue previously lost bursty sniff output. The 91.4% flash
+figure recorded here previously predated the QSPI asset offload, when the 486 KB
+of vendor tables still lived in internal flash.
+
+#### Runtime-mode RAM overlay
+
+Boot mode is selected once after reset, yet USB's runtime dispatch makes every
+mode reachable to the linker. Mode-private buffers therefore used to accumulate
+in `.bss` even though their lifetimes can never overlap. Each binary now has one
+`MaybeUninit` union arena (`MODE_ARENA`) containing only the storage that differs
+between its supported modes. Before spawning the selected mode, its `ModeArgs`
+initialises the matching union field and binds the module's `ModeRef` handles to
+it. A `ModeRef` is one-shot and remains valid until reset; it asserts if used
+before binding or bound twice.
+
+Common state deliberately remains outside the arena: USB/SD infrastructure, the
+shared radio/central buffers, capture context, and `LOG` must coexist with the
+selected mode. Task storage also cannot share the arena because the mode's future
+is live while its buffers are in use. The USB arena is 11,280 B (the Recon arm),
+and the single enum-backed `mode_task` pool is 9,208 B (the largest branch),
+rather than one entry pool per mode. Shared indicator/decode task pools remove
+the remaining mutually exclusive helper-task duplication.
+
+This reduced USB `.bss` from 145,208 B to 131,176 B (14,032 B saved); headless
+fell from 217,908 B to 214,504 B (3,404 B saved). Removing `LOG` would reduce
+USB RAM much further, but intentionally removes the USB console and headless
+text-log pipeline, so it is not part of this optimisation.
 
 `AtomicU64` does not exist on this target. Shared mutable state uses the
 `UnsafeCell` + `unsafe impl Sync` idiom (`SEEN`, `STATS`, `SyncBuf`,
@@ -1313,7 +1338,83 @@ puts Beacon Requests, beacons and Association Requests in the clear.
 
 ---
 
-## 10. Working conventions
+## 10. Recon mode and the Midea no-bind control path
+
+Recon (`mode::recon`) scans for devices of interest, and on the on-the-go
+variant stops the scan and *probes* the moment a qualifying advert appears. The
+probe connects, resolves a control profile, and runs a device-specific
+handshake. For Midea the probe is `probe_midea_direct`: classification comes
+from the advert serial at scan time, and the control profile is the FFA0
+AC / digital-control service.
+
+### Which Midea devices get the FFA0 probe
+
+The FFA0 ECDH handshake is Midea's **no-bind** digital-control path — no prior
+bind needed. The Midea cloud publishes a whitelist of SN8 prefixes that use it
+(`getIotCodes`, config mode "17": 37 prefixes in `NO_BIND_SN8`, fetched
+2026-09-01 via `scripts/midea_login.py`). The whitelist is **logged, not gated**:
+the probe runs for every Midea AC and any device advertising `ctl=Y`
+(`is_ble_controller`), and the log line reports `no-bind=Y/N`. Reasoning: the
+server list is per-batch and may be incomplete, so the handshake is the test; a
+non-AC `ctl=N` appliance is skipped because it will not answer FFA0. Note that
+`is_ble_controller` in the advert is *not* a substitute for the whitelist —
+E2 water heaters advertise it yet are absent from the list.
+
+### The connect window is the first lever (2026-09-02)
+
+The no-bind ACs advertise connectably on a ~2 s cadence, and the survey-sized
+connect window (3 rounds × 2 × 3 channels × 60 ms ≈ 1.1 s) missed them most of
+the time — recon logged `connect failed (target=0 connectable=0)`. `try_connect`
+now takes a round budget (`try_connect_rounds`); the Midea no-bind path passes
+`CONNECT_ROUNDS = 24` (≈ 4.3 s, enough to hear two adverts), every other device
+kind keeps the survey-sized window. This mirrors the phone app, whose direct
+connect listens far longer than one dwell (and retries 3× at 2 s).
+
+### FFA0 resolve: FBTV first, full discovery as the fallback
+
+`resolve_ffa0_fast` finds the service by Find-By-Type-Value and **derives** the
+control handles from the service start (`write = start+2`, `notify = start+5`),
+the observed standard layout. Two decisions from the reference app:
+
+- The CCCD subscribe is **best-effort, not a gate**. `RemoteControllerDevice` in
+  the app never writes the FFA2 descriptor (`indicate()` is a no-op) — the
+  appliance sends its replies as notifications regardless, and the handshake's
+  write-and-listen path catches them. A failed subscribe no longer reports
+  `NoChars`; the derived handles are used either way.
+- When FBTV finds nothing but the link is alive, `probe_midea_direct` falls back
+  to the **full primary-service walk** (`discover_services`, Read-By-Group-Type —
+  the discovery Android's `connectGatt` performs). A live link that answers the
+  MTU exchange yet ignores Find-By-Type-Value (`find 0xFFA0: no ATT response`
+  beside `mtu = 247`, 09-01 recon) is the signature of an ATT server that will
+  still answer a standard discovery.
+
+### The serving-state gate is device-side
+
+A connected AC that ignores service discovery is **not** an RF problem: it is
+the appliance withholding its control GATT until it is in a *serving* state
+(app slot / pairing mode) — seen identically on the ESP32-C6 reference. An
+inconclusive resolve returns `ProbeFailed` so the device stays a candidate and
+is retried; a clean absent/gated resolve is stable knowledge (`NoControl`, long
+cooldown).
+
+### Binding (the non-no-bind path) needs three server facts
+
+For appliances that are not no-bind, the bind is the MS-BLE flow
+(`MSBaseDeviceBleBindTask`): the app reads the device SN over BLE (msgtype 99),
+asks the server to register it, and writes the family id + device id + a
+**client-generated random 16-byte UUID** (msgtype 3/9) to the device. Nothing
+the server issues is written to the device — the `btToken` returned by
+`/appliance/home/bind` belongs to the door-lock/AP flow, not this one. The
+server-side inputs are: **accessToken** and **homegroupId** (both already
+available through the `msmart` login used by `scripts/midea_login.py`), and the
+**dataKey** — the login response's `key` field, AES-decrypted with the app key
+(`SecurityUtils.decodeAES128WithAppKey`), used to AES-128-encrypt the SN in the
+registration request. msmart does not expose `key`; the raw `/mj/user/login`
+response does.
+
+---
+
+## 11. Working conventions
 
 **Comments describe what the code does.** Not what it replaced, not what was
 deleted, not what it avoids — unless the "not" is itself load-bearing, as with

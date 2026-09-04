@@ -10,11 +10,13 @@
 //! binary supplies.
 
 use core::cell::UnsafeCell;
+use core::ops::Deref;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use embassy_time::Instant;
 
 use crate::Rng;
-use crate::led::OnBoardLed;
+use crate::led::{OnBoardLed, Pwm};
 
 pub mod ble_sniff;
 pub mod conn_follow;
@@ -28,6 +30,63 @@ pub use conn_follow::ConnFollow;
 pub use gatt::GattEnum;
 pub use rssi::RssiMonitor;
 pub use zigbee::ZigbeeSniff;
+
+/// A tiny, late-bound handle to state owned by the selected boot-mode arena.
+///
+/// Every mode used to declare its own RAM-resident `static` buffers. Runtime
+/// boot selection kept every one of those allocations alive even though reset
+/// guarantees that only one mode can ever run. The binaries now allocate one
+/// union arena and bind only the selected mode's handles before its first task
+/// is spawned. Keeping the handle here lets the existing hot paths continue to
+/// use their named buffer without an arena lookup on every call.
+///
+/// `bind` is one-shot and used only by the two firmware binaries while they
+/// construct their selected launch. Reading an unbound handle is a firmware
+/// construction error, not a recoverable runtime state.
+pub struct ModeRef<T> {
+    ptr: AtomicPtr<T>,
+}
+
+impl<T> ModeRef<T> {
+    pub const fn new() -> Self {
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// Bind this handle to one field in the active mode arena.
+    ///
+    /// # Safety
+    /// `value` must live for the rest of this boot, and this method must be
+    /// called at most once before any dereference. Both are enforced by the
+    /// binary's single boot-mode dispatch before it spawns mode tasks.
+    pub unsafe fn bind(&self, value: &'static T) {
+        let prior = self
+            .ptr
+            .swap(value as *const T as *mut T, Ordering::Release);
+        assert!(prior.is_null(), "mode storage bound twice");
+    }
+}
+
+impl<T> Default for ModeRef<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Deref for ModeRef<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        let ptr = self.ptr.load(Ordering::Acquire);
+        assert!(!ptr.is_null(), "mode storage used before binding");
+        // SAFETY: `bind` accepts only a boot-lifetime arena field, is one-shot,
+        // and dispatch binds the selected mode before spawning its tasks.
+        unsafe { &*ptr }
+    }
+}
+
+unsafe impl<T: Sync> Sync for ModeRef<T> {}
 
 /// Renders [`crate::led::LED`] commands onto the LED — the state-colour indicator
 /// the active-central modes (GATT, Midea) share. Generic over the backend `L`;
@@ -47,7 +106,14 @@ pub async fn drive_indicator<L: OnBoardLed>(led: &mut L) -> ! {
             None => LED.wait().await,
         };
 
-        let Cmd::Blink { colour, then, count, on_ms, off_ms } = cmd else {
+        let Cmd::Blink {
+            colour,
+            then,
+            count,
+            on_ms,
+            off_ms,
+        } = cmd
+        else {
             cur = match cmd {
                 Cmd::Solid(c) => c,
                 Cmd::Chan(ch, on) => cur.with(ch, on),
@@ -76,6 +142,28 @@ pub async fn drive_indicator<L: OnBoardLed>(led: &mut L) -> ! {
                 pending = Some(next);
             }
         }
+    }
+}
+
+/// Shared PWM indicator task for GATT enumeration and recon. Those modes use
+/// the same LED signal protocol, so one task pool covers both runtime branches.
+#[embassy_executor::task]
+pub async fn indicator_led_task(mut leds: Pwm) -> ! {
+    drive_indicator(&mut leds).await
+}
+
+/// Decode-loop choice for modes whose radio producer and log consumer run as a
+/// pair. The single task pool is sized for the larger loop, not both loops.
+pub enum DecodeTask {
+    ConnFollow,
+    Zigbee,
+}
+
+#[embassy_executor::task]
+pub async fn decode_task(kind: DecodeTask) -> ! {
+    match kind {
+        DecodeTask::ConnFollow => conn_follow::log_forever().await,
+        DecodeTask::Zigbee => zigbee::log_forever().await,
     }
 }
 
@@ -140,7 +228,10 @@ unsafe impl<K: CaptureSink> Sync for Ctx<K> {}
 impl<K: CaptureSink> Ctx<K> {
     /// Const so a binary can place it in a `static`.
     pub const fn new(rng: Rng, sink: K) -> Self {
-        Self { rng: UnsafeCell::new(rng), sink: UnsafeCell::new(sink) }
+        Self {
+            rng: UnsafeCell::new(rng),
+            sink: UnsafeCell::new(sink),
+        }
     }
 
     /// The shared RNG. Distinct cell from [`sink`](Ctx::sink), so holding both

@@ -66,7 +66,11 @@ pub(crate) fn decode_time(uuid16: u16, v: &[u8]) -> Option<WallTime> {
         sec,
         dow: if v.len() >= 8 { v[7] } else { 0 },
         // adjust_reason is the trailing byte of Current Time only (index 9).
-        adj: if uuid16 == 0x2A2B && v.len() >= 10 { v[9] } else { 0 },
+        adj: if uuid16 == 0x2A2B && v.len() >= 10 {
+            v[9]
+        } else {
+            0
+        },
         epoch: crate::wallclock::to_epoch(year, month, day, hour, min, sec),
     })
 }
@@ -76,7 +80,15 @@ pub(crate) fn format_walltime(t: &WallTime, uuid16: u16, s: &mut LogStr) {
     let _ = write!(
         s,
         "        walltime: {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z src=0x{:04X} dow={} adj=0x{:02X}",
-        t.year, t.month, t.day, t.hour, t.min, t.sec, uuid16, dow_name(t.dow), t.adj
+        t.year,
+        t.month,
+        t.day,
+        t.hour,
+        t.min,
+        t.sec,
+        uuid16,
+        dow_name(t.dow),
+        t.adj
     );
 }
 
@@ -131,7 +143,12 @@ pub(crate) fn known_value(uuid16: u16, v: &[u8]) -> Option<(LogStr, usize)> {
         // Appearance: 16-bit GAP category.
         0x2A01 if v.len() >= 2 => {
             let a = u16::from_le_bytes([v[0], v[1]]);
-            let _ = write!(s, "        = appearance 0x{:04X} ({})", a, crate::decoder::appearance_name(a));
+            let _ = write!(
+                s,
+                "        = appearance 0x{:04X} ({})",
+                a,
+                crate::decoder::appearance_name(a)
+            );
             2
         }
         // Peripheral Preferred Connection Parameters: 4× u16 (interval unit
@@ -141,7 +158,11 @@ pub(crate) fn known_value(uuid16: u16, v: &[u8]) -> Option<(LogStr, usize)> {
             let mx = u16::from_le_bytes([v[2], v[3]]) as u32 * 5 / 4;
             let lat = u16::from_le_bytes([v[4], v[5]]);
             let to = u16::from_le_bytes([v[6], v[7]]) as u32 * 10;
-            let _ = write!(s, "        = conn {}-{}ms latency={} timeout={}ms", mn, mx, lat, to);
+            let _ = write!(
+                s,
+                "        = conn {}-{}ms latency={} timeout={}ms",
+                mn, mx, lat, to
+            );
             8
         }
         // PnP ID: source(1) + vendor(2) + product(2) + version(2).
@@ -186,15 +207,21 @@ pub(crate) fn known_value(uuid16: u16, v: &[u8]) -> Option<(LogStr, usize)> {
         // central resolves RPAs, so it may use a resolvable private address to us.
         0x2AA6 if !v.is_empty() => {
             let _ = write!(
-                s, "        = addr-resolution {}",
-                if v[0] == 1 { "supported" } else { "not-supported" }
+                s,
+                "        = addr-resolution {}",
+                if v[0] == 1 {
+                    "supported"
+                } else {
+                    "not-supported"
+                }
             );
             1
         }
         // Server Supported Features: one byte. Only bit 0 is defined (EATT).
         0x2B3A if !v.is_empty() => {
             let _ = write!(
-                s, "        = server-features{}",
+                s,
+                "        = server-features{}",
                 if v[0] & 0x01 != 0 { " EATT" } else { "" }
             );
             1
@@ -203,10 +230,18 @@ pub(crate) fn known_value(uuid16: u16, v: &[u8]) -> Option<(LogStr, usize)> {
         0x2B29 if !v.is_empty() => {
             let f = v[0];
             let _ = s.push_str("        = client-features");
-            if f & 0x01 != 0 { let _ = s.push_str(" robust-caching"); }
-            if f & 0x02 != 0 { let _ = s.push_str(" EATT"); }
-            if f & 0x04 != 0 { let _ = s.push_str(" multi-notify"); }
-            if f == 0 { let _ = s.push_str(" none"); }
+            if f & 0x01 != 0 {
+                let _ = s.push_str(" robust-caching");
+            }
+            if f & 0x02 != 0 {
+                let _ = s.push_str(" EATT");
+            }
+            if f & 0x04 != 0 {
+                let _ = s.push_str(" multi-notify");
+            }
+            if f == 0 {
+                let _ = s.push_str(" none");
+            }
             1
         }
         _ => return None,
@@ -247,8 +282,12 @@ pub(crate) fn known_value_128(uuid_le: &[u8], v: &[u8]) -> Option<(LogStr, usize
         let api = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
         let mut s = LogStr::new();
         match android_release(api) {
-            Some(r) => { let _ = write!(s, "        = Android API {} (Android {})", api, r); }
-            None => { let _ = write!(s, "        = Android API {}", api); }
+            Some(r) => {
+                let _ = write!(s, "        = Android API {} (Android {})", api, r);
+            }
+            None => {
+                let _ = write!(s, "        = Android API {}", api);
+            }
         }
         return Some((s, 4));
     }

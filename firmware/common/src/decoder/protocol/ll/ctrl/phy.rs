@@ -7,7 +7,7 @@
 
 use core::fmt::Write;
 
-use super::{line, send, u16le, write_phys, Decoder};
+use super::{Decoder, line, send, u16le, write_phys};
 
 pub(super) struct Phy;
 

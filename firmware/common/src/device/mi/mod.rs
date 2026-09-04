@@ -183,3 +183,35 @@ pub enum Role {
     Config,
     Notify,
 }
+
+/// Probe the Xiaomi Mi Service (0xFE95) auth posture on a connectable device:
+/// discover its characteristics, then read the firmware (0x0004) and attempt the
+/// **beacon key (0x0014)**. A permitted 0x0014 read (the 12-byte key logged by
+/// `read_value`) means the device is bound — that key decrypts its MiBeacon
+/// broadcasts. A `read-not-permitted` (err 0x02) means the device is
+/// **auth-gated** (unbound — the Mi Home app must bind it first).
+pub(crate) async fn probe_fe95(
+    conn: &mut crate::central::Conn,
+    services: &[crate::central::Service],
+) {
+    use crate::central::{Characteristic, MAX_CHARS_PER_SVC, discover_characteristics, read_value};
+
+    for svc in services.iter() {
+        if crate::device::uuid16(&svc.uuid[..svc.uuid_len as usize]) != Some(0xFE95) {
+            continue;
+        }
+        ulogf!("  fe95: Mi Service present — checking auth\r\n");
+        let mut chars: Vec<Characteristic, MAX_CHARS_PER_SVC> = Vec::new();
+        discover_characteristics(conn, svc, &mut chars).await;
+        for c in chars.iter() {
+            // 0x0004 = firmware, 0x0014 = beacon key (the auth gate).
+            if matches!(c.uuid16, Some(0x0004 | 0x0014)) {
+                read_value(conn, c).await;
+            }
+        }
+        ulogf!(
+            "  fe95: see the reads above — 0x0014 readable = bound (key decrypts MiBeacon), err=0x02 = auth-gated\r\n"
+        );
+        return;
+    }
+}

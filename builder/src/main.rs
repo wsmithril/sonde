@@ -2,10 +2,10 @@
 //!
 //! Subcommands:
 //!   * `uf2 <elf>`  — convert a built firmware ELF into `sonde.uf2` (this is
-//!                    the firmware target's Cargo `runner`).
+//!     the firmware target's Cargo `runner`).
 //!   * `provision`  — stream the generated asset image (OUI / company / UUID
-//!                    lookup tables) to the device's external QSPI flash over the
-//!                    USB CDC serial port.
+//!     lookup tables) to the device's external QSPI flash over the USB CDC serial
+//!     port.
 //!
 //! Run via the workspace: `cargo run -p builder -- <subcommand> ...`.
 

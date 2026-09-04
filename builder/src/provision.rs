@@ -30,9 +30,7 @@ pub fn run(port: Option<&str>, image: Option<&str>) -> Result<(), String> {
         .map_err(|e| format!("cannot read asset image {image_path}: {e}"))?;
     let crc = crc32(&payload);
     let len = payload.len() as u32;
-    eprintln!(
-        "asset image: {image_path} ({len} bytes, crc32 0x{crc:08X})"
-    );
+    eprintln!("asset image: {image_path} ({len} bytes, crc32 0x{crc:08X})");
 
     let port_path = match port {
         Some(p) => resolve_port(p)?,
@@ -57,12 +55,16 @@ pub fn run(port: Option<&str>, image: Option<&str>) -> Result<(), String> {
     hs.extend_from_slice(HANDSHAKE);
     hs.extend_from_slice(&len.to_le_bytes());
     hs.extend_from_slice(&crc.to_le_bytes());
-    sp.write_all(&hs).map_err(|e| format!("handshake write: {e}"))?;
+    sp.write_all(&hs)
+        .map_err(|e| format!("handshake write: {e}"))?;
     sp.flush().ok();
 
     eprintln!("waiting for erase…");
-    if wait_for_any(&mut *sp, &["PROV_ERASED", "PROV_ERR"], Duration::from_secs(30))?
-        == "PROV_ERR"
+    if wait_for_any(
+        &mut *sp,
+        &["PROV_ERASED", "PROV_ERR"],
+        Duration::from_secs(30),
+    )? == "PROV_ERR"
     {
         return Err("device reported PROV_ERR during erase".into());
     }
@@ -70,9 +72,10 @@ pub fn run(port: Option<&str>, image: Option<&str>) -> Result<(), String> {
     eprintln!("streaming {len} bytes…");
     let mut written = 0usize;
     for chunk in payload.chunks(CHUNK) {
-        sp.write_all(chunk).map_err(|e| format!("stream write: {e}"))?;
+        sp.write_all(chunk)
+            .map_err(|e| format!("stream write: {e}"))?;
         written += chunk.len();
-        if written % (CHUNK * 256) == 0 || written == payload.len() {
+        if written.is_multiple_of(CHUNK * 256) || written == payload.len() {
             eprint!("\r  {written}/{len}");
         }
     }

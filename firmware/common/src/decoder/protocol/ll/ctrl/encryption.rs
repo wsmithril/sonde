@@ -9,7 +9,7 @@
 
 use core::fmt::Write;
 
-use super::{line, send, u16le, write_hex_be, Decoder};
+use super::{Decoder, line, send, u16le, write_hex_be};
 
 pub(super) struct Encryption;
 

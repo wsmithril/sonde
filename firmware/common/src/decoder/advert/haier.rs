@@ -7,12 +7,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Qingdao Haier Technology — manufacturer data (Company ID 0x0929).
 pub(super) struct Haier;
 impl super::VendorDecoder for Haier {
-    fn company_ids(&self) -> &'static [u16] { &[0x0929] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0929]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 13 || body[0] != 0x10 {
             hexdump(body, ctx.base, 6);
@@ -21,10 +23,17 @@ impl super::VendorDecoder for Haier {
         let mut s: LogStr = LogStr::new();
         let _ = write!(s, "    Haier U-home: addr=");
         super::write_mac_be(&mut s, &body[3..9]);
-        let _ = write!(s, " ver={}.{} product={}",
-            body[9], body[10], u16::from_le_bytes([body[11], body[12]]));
+        let _ = write!(
+            s,
+            " ver={}.{} product={}",
+            body[9],
+            body[10],
+            u16::from_le_bytes([body[11], body[12]])
+        );
         emit(s);
         super::emit_oui_vendor(&body[3..9]);
-        if body.len() > 13 { hexdump(&body[13..], ctx.base + 13, 6); }
+        if body.len() > 13 {
+            hexdump(&body[13..], ctx.base + 13, 6);
+        }
     }
 }

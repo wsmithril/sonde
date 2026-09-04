@@ -12,6 +12,10 @@
 //! One run is opened per boot; hourly sniff rotation, per-connection runs, and
 //! conn-follow AA/channel/RSSI plumbing are marked TODO.
 
+use core::cell::UnsafeCell;
+use core::mem::{ManuallyDrop, MaybeUninit};
+
+use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
@@ -24,7 +28,6 @@ use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
 use static_cell::StaticCell;
-use defmt_rtt as _;
 
 use sonde_common::boot::{self, BootMode, next_boot_mode};
 use sonde_common::mode as capmode;
@@ -63,7 +66,9 @@ pub(crate) struct PcapSink {
 
 impl PcapSink {
     const fn new() -> Self {
-        Self { rec: [0u8; pcap::MAX_RECORD] }
+        Self {
+            rec: [0u8; pcap::MAX_RECORD],
+        }
     }
 }
 
@@ -92,7 +97,57 @@ impl capmode::CaptureSink for PcapSink {
 
 /// This boot's static context (entropy + the PCAP/SD sink), so a mode's `run` can
 /// be a spawned task rather than borrowing `main`'s locals.
-pub(crate) static CTX: capmode::Ctx<PcapSink> = capmode::Ctx::new(Rng(0x1234_5678), PcapSink::new());
+pub(crate) static CTX: capmode::Ctx<PcapSink> =
+    capmode::Ctx::new(Rng(0x1234_5678), PcapSink::new());
+
+// Only these three modes have a headless capture path. Their private buffers
+// are mutually exclusive and share one RAM field; SD/USB/ring state remains
+// deliberately outside this overlay because it is common to every boot.
+#[repr(C)]
+union HeadlessModeStorage {
+    ble_sniff: ManuallyDrop<capmode::ble_sniff::Storage>,
+    gatt: ManuallyDrop<()>,
+    conn_follow: ManuallyDrop<capmode::conn_follow::Storage>,
+}
+
+struct ModeArena(UnsafeCell<MaybeUninit<HeadlessModeStorage>>);
+unsafe impl Sync for ModeArena {}
+static MODE_ARENA: ModeArena = ModeArena(UnsafeCell::new(MaybeUninit::uninit()));
+
+/// # Safety
+/// Called exactly once before this selected capture mode is spawned.
+impl ModeArgs {
+    unsafe fn init_storage(&self) {
+        let arena = MODE_ARENA.0.get();
+        unsafe {
+            match self {
+                ModeArgs::BleSniff(_) => {
+                    (*arena).as_mut_ptr().write(HeadlessModeStorage {
+                        ble_sniff: ManuallyDrop::new(capmode::ble_sniff::Storage::new()),
+                    });
+                    let storage = &*((&(*(*arena).as_ptr()).ble_sniff
+                        as *const ManuallyDrop<capmode::ble_sniff::Storage>)
+                        .cast::<capmode::ble_sniff::Storage>());
+                    capmode::ble_sniff::bind_storage(storage);
+                }
+                ModeArgs::Gatt(_) => {
+                    (*arena).as_mut_ptr().write(HeadlessModeStorage {
+                        gatt: ManuallyDrop::new(()),
+                    });
+                }
+                ModeArgs::ConnFollow(_) => {
+                    (*arena).as_mut_ptr().write(HeadlessModeStorage {
+                        conn_follow: ManuallyDrop::new(capmode::conn_follow::Storage::new()),
+                    });
+                    let storage = &*((&(*(*arena).as_ptr()).conn_follow
+                        as *const ManuallyDrop<capmode::conn_follow::Storage>)
+                        .cast::<capmode::conn_follow::Storage>());
+                    capmode::conn_follow::bind_storage(storage);
+                }
+            }
+        }
+    }
+}
 
 /// The onboard RGB LED: PWM instance + the three channel pins. SD is on P1.x, so
 /// these (P0.26/30/06) are free for the indicator.
@@ -101,6 +156,24 @@ pub(crate) struct LedParts {
     pub r: Peri<'static, peripherals::P0_26>,
     pub g: Peri<'static, peripherals::P0_30>,
     pub b: Peri<'static, peripherals::P0_06>,
+}
+
+/// Headless has three capture modes. One enum-backed task pool is sufficient:
+/// the selected variant owns the RGB peripherals and its future overlays the
+/// other two branches.
+enum ModeArgs {
+    BleSniff(LedParts),
+    Gatt(LedParts),
+    ConnFollow(LedParts),
+}
+
+#[embassy_executor::task]
+async fn mode_task(spawner: Spawner, args: ModeArgs) -> ! {
+    match args {
+        ModeArgs::BleSniff(leds) => callback::ble_sniff::run(spawner, leds).await,
+        ModeArgs::Gatt(leds) => callback::gatt::run(spawner, leds).await,
+        ModeArgs::ConnFollow(leds) => callback::conn_follow::run(spawner, leds).await,
+    }
 }
 
 /// Spawn the chosen capture mode's tasks. The radio capture + ring consumers depend
@@ -116,18 +189,26 @@ fn spawn_capture(
     b: Peri<'static, peripherals::P0_06>,
 ) {
     let l = LedParts { pwm, r, g, b };
-    match mode {
-        BootMode::BleSniff => spawner.spawn(callback::ble_sniff::run(spawner, l).unwrap()),
-        BootMode::GattEnum => spawner.spawn(callback::gatt::run(spawner, l).unwrap()),
-        BootMode::ConnFollow => spawner.spawn(callback::conn_follow::run(spawner, l).unwrap()),
-        _ => {}
-    }
+    let args = match mode {
+        BootMode::BleSniff => ModeArgs::BleSniff(l),
+        BootMode::GattEnum => ModeArgs::Gatt(l),
+        BootMode::ConnFollow => ModeArgs::ConnFollow(l),
+        _ => unreachable!("non-capture boot passed to spawn_capture"),
+    };
+    // The launch value decides both the task branch and its overlaid state.
+    unsafe { args.init_storage() };
+    spawner.spawn(mode_task(spawner, args).unwrap());
 }
 
 // ── Writer: ring → SD blocks for this boot's run ────────────────────────────────
 
 #[embassy_executor::task]
-async fn sd_writer(card: &'static SharedCard, index: &'static SharedIndex, run: usize, start_lba: u32) -> ! {
+async fn sd_writer(
+    card: &'static SharedCard,
+    index: &'static SharedIndex,
+    run: usize,
+    start_lba: u32,
+) -> ! {
     let mut block = [0u8; 512];
     let mut fill = 0usize;
     let mut lba = start_lba;
@@ -206,7 +287,10 @@ async fn main(spawner: Spawner) {
     // card is up (see the storage block below) — there is no console to print to.
 
     let mode = next_boot_mode(p.NVMC);
-    let capture = !matches!(mode, BootMode::RssiMonitor | BootMode::ZigbeeSniff | BootMode::Recon);
+    let capture = !matches!(
+        mode,
+        BootMode::RssiMonitor | BootMode::ZigbeeSniff | BootMode::Recon
+    );
 
     // Radio capture + ring consumers depend on neither the SD card nor USB, so
     // start them now; they fill SD_RING while the card comes up (the ring drops and

@@ -9,8 +9,7 @@ use sonde_common::mode::{self as capmode, Mode as _};
 
 use crate::{CTX, LedParts, PcapSink};
 
-#[embassy_executor::task]
-pub async fn run(spawner: Spawner, l: LedParts) {
+pub async fn run(spawner: Spawner, l: LedParts) -> ! {
     let mut m = capmode::BleSniff::<PcapSink>::new();
     m.init(&CTX, async move {
         let pwm = led::Pwm::new(l.pwm, l.r, l.g, l.b);

@@ -86,7 +86,15 @@ fn onoff(s: &mut LogStr, name: &str, on: bool) {
 /// Write a value scaled by 1/10 as `int.frac` (used for /10 sensors).
 fn tenths(s: &mut LogStr, name: &str, v: i32, unit: &str) {
     let a = v.abs();
-    let _ = write!(s, " {}={}{}.{}{}", name, if v < 0 { "-" } else { "" }, a / 10, a % 10, unit);
+    let _ = write!(
+        s,
+        " {}={}{}.{}{}",
+        name,
+        if v < 0 { "-" } else { "" },
+        a / 10,
+        a % 10,
+        unit
+    );
 }
 
 // ── FC air-purifier ──────────────────────────────────────────────────────────

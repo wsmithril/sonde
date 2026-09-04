@@ -116,7 +116,12 @@ pub fn build_cmd(cmd_id: u16, payload: &[u8], response: bool) -> Option<Frame> {
     let mut f = Frame::new();
     let len = (2 + payload.len()) as u16;
     f.push(HEAD).ok()?;
-    f.push(if response { TYPE_CMD_RSP } else { TYPE_CMD_NORSP }).ok()?;
+    f.push(if response {
+        TYPE_CMD_RSP
+    } else {
+        TYPE_CMD_NORSP
+    })
+    .ok()?;
     f.extend_from_slice(&len.to_le_bytes()).ok()?;
     f.extend_from_slice(&cmd_id.to_le_bytes()).ok()?;
     f.extend_from_slice(payload).ok()?;

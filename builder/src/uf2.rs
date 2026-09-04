@@ -41,10 +41,10 @@ fn extract_load_segments(elf_data: &[u8]) -> Vec<FlashRegion> {
     let mut regions: Vec<FlashRegion> = Vec::new();
 
     for seg in obj.segments() {
-        if let SegmentFlags::Elf { p_flags } = seg.flags() {
-            if p_flags == 0 {
-                continue;
-            }
+        if let SegmentFlags::Elf { p_flags } = seg.flags()
+            && p_flags == 0
+        {
+            continue;
         }
 
         let addr = seg.address() as u32;
@@ -67,10 +67,7 @@ fn extract_load_segments(elf_data: &[u8]) -> Vec<FlashRegion> {
 // ── UF2 encoding ──────────────────────────────────────────────────────────────
 
 fn to_uf2(regions: &[FlashRegion]) -> Vec<u8> {
-    let total_blocks: usize = regions
-        .iter()
-        .map(|r| (r.data.len() + CHUNK - 1) / CHUNK)
-        .sum();
+    let total_blocks: usize = regions.iter().map(|r| r.data.len().div_ceil(CHUNK)).sum();
 
     let mut out = Vec::with_capacity(total_blocks * 512);
     let mut block_num: usize = 0;

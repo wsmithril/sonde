@@ -105,7 +105,11 @@ impl Handshake {
 
     /// conn t1 + fixed get-version body.
     pub fn build_get_version(&mut self) -> Option<Frame> {
-        frame::encode_conn(frame::T1, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0], self.next_conn_seq())
+        frame::encode_conn(
+            frame::T1,
+            &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            self.next_conn_seq(),
+        )
     }
 
     /// c1: body = openId6, rootKey-encrypted, conn type t2.

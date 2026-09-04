@@ -27,7 +27,7 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 const TWS_BLE_TYPE: u8 = 0x08;
 const V1: u8 = 0x01;
@@ -37,9 +37,13 @@ const EXTENDED_MODEL_MARKER: u8 = 0xFF;
 /// vivo — manufacturer data (Company IDs 0x0837 "new" and 0x8486 "legacy").
 pub(super) struct Vivo;
 impl super::VendorDecoder for Vivo {
-    fn company_ids(&self) -> &'static [u16] { &[0x0837, 0x8486] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0837, 0x8486]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         // TWS fast-pair layout: body[0]=ble_type, body[1]=version, body[2..8]=MAC.
         if body.len() >= 4 && body[0] == TWS_BLE_TYPE && (body[1] == V1 || body[1] == V2) {
             Self::decode_tws(ctx, body);
@@ -47,8 +51,12 @@ impl super::VendorDecoder for Vivo {
         }
         // Non-TWS variant on this CID — layout not publicly documented.
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    vivo (unrecognised): frame=0x{:02X} len={}",
-            body[0], body.len());
+        let _ = write!(
+            s,
+            "    vivo (unrecognised): frame=0x{:02X} len={}",
+            body[0],
+            body.len()
+        );
         emit(s);
         hexdump(body, ctx.base, 6);
     }
@@ -80,7 +88,9 @@ impl Vivo {
             if let Some(name) = model_name(model_id) {
                 let _ = write!(s, " ({})", name);
             }
-            if extended { let _ = write!(s, " [ext]"); }
+            if extended {
+                let _ = write!(s, " [ext]");
+            }
         }
         emit(s);
 
@@ -94,21 +104,21 @@ impl Vivo {
 /// not published by vivo; these are the SDK-level identifiers.
 fn model_name(id: u16) -> Option<&'static str> {
     Some(match id {
-        1   => "TWS1_BASE",
-        2   => "TWS1_BLACK/TWS1_TOP",
-        16  => "TWS_NEO_BASE",
-        17  => "TWS_NEO_BLUE",
-        19  => "TWS_NEO_TOP",
-        28  => "TWS2_BASE",
-        29  => "TWS2_BLUE",
-        31  => "TWS2_TOP",
-        32  => "TWS2E_BASE",
-        33  => "TWS2E_BLUE",
-        35  => "TWS2E_TOP",
-        48  => "DPD2135A",
-        49  => "DPD2135A_BLUE",
-        60  => "TWS3_BASE",
-        72  => "DPD2220_BASE",
+        1 => "TWS1_BASE",
+        2 => "TWS1_BLACK/TWS1_TOP",
+        16 => "TWS_NEO_BASE",
+        17 => "TWS_NEO_BLUE",
+        19 => "TWS_NEO_TOP",
+        28 => "TWS2_BASE",
+        29 => "TWS2_BLUE",
+        31 => "TWS2_TOP",
+        32 => "TWS2E_BASE",
+        33 => "TWS2E_BLUE",
+        35 => "TWS2E_TOP",
+        48 => "DPD2135A",
+        49 => "DPD2135A_BLUE",
+        60 => "TWS3_BASE",
+        72 => "DPD2220_BASE",
         156 => "DPD2430_BASE",
         176 => "DPD2430F_VIVO_WHITE",
         177 => "DPD2430F_VIVO_BLUE",
@@ -117,6 +127,6 @@ fn model_name(id: u16) -> Option<&'static str> {
         185 => "DPD2430F_JOVI_BLUE",
         192 => "DPD2523_BASE",
         203 => "DPD2523_TOP",
-        _   => return None,
+        _ => return None,
     })
 }

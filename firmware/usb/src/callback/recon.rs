@@ -5,17 +5,16 @@
 
 use embassy_executor::Spawner;
 
-use sonde_common::mode::recon;
+use sonde_common::mode::{self, recon};
 use sonde_common::{led, ulog};
 
 use crate::{LedParts, QspiParts};
 
-#[embassy_executor::task]
-pub async fn run(spawner: Spawner, q: QspiParts, l: LedParts) {
+pub async fn run(spawner: Spawner, q: QspiParts, l: LedParts) -> ! {
     ulog!("mode=recon\r\n");
     crate::hold_assets(spawner, crate::qspi_setup(q));
 
     let pwm = led::Pwm::new(l.pwm, l.r, l.g, l.b);
-    spawner.spawn(recon::led_task(pwm).unwrap());
-    spawner.spawn(recon::run().unwrap());
+    spawner.spawn(mode::indicator_led_task(pwm).unwrap());
+    recon::run().await
 }

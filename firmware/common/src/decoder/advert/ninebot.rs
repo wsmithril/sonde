@@ -8,11 +8,13 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 pub(super) struct Ninebot;
 impl super::VendorDecoder for Ninebot {
-    fn company_ids(&self) -> &'static [u16] { &[0x06D1] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x06D1]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.is_empty() {
             return;

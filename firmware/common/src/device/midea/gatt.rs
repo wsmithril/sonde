@@ -115,12 +115,24 @@ pub fn frame(v: &[u8]) {
     let chk_ok = v[total - 1] == 0u8.wrapping_sub(sum);
 
     let mut s = line();
-    let _ = write!(s, "  Midea conn: seq={} type={} ({}) len={} chk={}",
-        seq, tn, key, length, if chk_ok { "ok" } else { "BAD" });
+    let _ = write!(
+        s,
+        "  Midea conn: seq={} type={} ({}) len={} chk={}",
+        seq,
+        tn,
+        key,
+        length,
+        if chk_ok { "ok" } else { "BAD" }
+    );
     let body = &v[5..total - 1];
     if matches!(v[4], 0x02 | 0x03) && body.len() >= 3 {
-        let _ = write!(s, " -> sec {} seq={} enc-body={}B",
-            sec_cmd(body[0]), body[1], body.len().saturating_sub(3));
+        let _ = write!(
+            s,
+            " -> sec {} seq={} enc-body={}B",
+            sec_cmd(body[0]),
+            body[1],
+            body.len().saturating_sub(3)
+        );
     }
     send(s);
 }

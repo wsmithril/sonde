@@ -9,14 +9,13 @@ use sonde_common::{led, ulog};
 
 use crate::{CTX, ConsoleSink, LedParts, QspiParts};
 
-#[embassy_executor::task]
-pub async fn run(spawner: Spawner, q: QspiParts, l: LedParts) {
+pub async fn run(spawner: Spawner, q: QspiParts, l: LedParts) -> ! {
     ulog!("mode=gatt_enum\r\n");
     let mut m = mode::GattEnum::<ConsoleSink>::new();
     m.init(&CTX, async move {
         crate::hold_assets(spawner, crate::qspi_setup(q));
         let pwm = led::Pwm::new(l.pwm, l.r, l.g, l.b);
-        spawner.spawn(mode::gatt::led_task(pwm).unwrap());
+        spawner.spawn(mode::indicator_led_task(pwm).unwrap());
     })
     .await;
     m.run(&CTX).await

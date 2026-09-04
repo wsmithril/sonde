@@ -22,28 +22,31 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// Telink SDK default-fill signature — the trailing 10 bytes of a "long" frame.
-const TELINK_SDK_FILL: &[u8; 10] =
-    &[0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F];
+const TELINK_SDK_FILL: &[u8; 10] = &[0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F];
 
 /// Telink Semiconductor — manufacturer data (Company ID 0x0211).
 pub(super) struct Telink;
 impl super::VendorDecoder for Telink {
-    fn company_ids(&self) -> &'static [u16] { &[0x0211] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0211]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
 
         // Frame-shape classifier: the `11 22` TLV prefix + trailing SDK-fill
         // pattern is the Honor-Telink long variant. The short variant is the
         // same 4-byte prefix without any tail.
         let long = body.len() >= 25
-            && body[0] == 0x11 && body[1] == 0x22
+            && body[0] == 0x11
+            && body[1] == 0x22
             && body.ends_with(TELINK_SDK_FILL);
-        let short = body.len() == 6
-            && body[0] == 0x11 && body[1] == 0x22;
+        let short = body.len() == 6 && body[0] == 0x11 && body[1] == 0x22;
 
         if long {
             let _ = write!(s, "    Telink SDK / Honor? (long): token=");

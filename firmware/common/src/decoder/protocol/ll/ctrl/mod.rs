@@ -12,7 +12,7 @@
 
 // Helpers shared by the group modules. Imported once here so each module keeps
 // reaching them as `super::…`.
-use super::super::{line, send, u16le, u24le, write_hex_be, write_interval, Decoder};
+use super::super::{Decoder, line, send, u16le, u24le, write_hex_be, write_interval};
 use super::{ctrl_name, error_name, write_phys};
 
 mod encryption;

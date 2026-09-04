@@ -31,7 +31,11 @@ pub struct SdCard<'d> {
 
 impl<'d> SdCard<'d> {
     pub fn new(spim: Spim<'d>, cs: Output<'d>) -> Self {
-        Self { spim, cs, block_addr: true }
+        Self {
+            spim,
+            cs,
+            block_addr: true,
+        }
     }
 
     /// Clock `n` idle (0xFF) bytes with CS *deasserted* — the card needs ≥74 such

@@ -1,12 +1,15 @@
 //! DX-GP21-A GNSS module integration, on the migrated `dx-gp21-nrf52840` board
 //! layer (Embassy edition, sibling repo `../dx-gp21-rust`).
 //!
-//! XIAO nRF52840 header pins (all free in the sonde build):
+//! XIAO nRF52840 header pins (all free in the sonde build). The module used to
+//! sit on A0–A3, but the 6×10 LED matrix owns D0 (P0.02) now, so the module
+//! moved to the four GPIOs adjacent to the power group on the left header
+//! (D10/D9/D7/D5 — D6/D8 are the onboard green/blue LEDs and stay untouched).
 //! ```text
-//!   A0 (P0.02) → module R (UART TX to the module)        UARTE0 TXD
-//!   A1 (P0.03) ← module T (UART RX — NMEA sentences)     UARTE0 RXD
-//!   A2 (P0.04) ← module P (1PPS, rising edge 1 Hz after fix)  GPIOTE PORT event
-//!   A3 (P0.05) → module W (power: onboard pull-up → float/HIGH = on, LOW = off)
+//!   D10 (P0.08) → module R (UART TX to the module)       UARTE0 TXD
+//!   D9  (P0.07) ← module T (UART RX — NMEA sentences)    UARTE0 RXD
+//!   D7  (P0.31) ← module P (1PPS, rising edge 1 Hz after fix)  GPIOTE PORT event
+//!   D5  (P0.05) → module W (power: onboard pull-up → float/HIGH = on, LOW = off)
 //! ```
 //!
 //! Boot check: [`spawn`] powers the module on, then waits up to [`PROBE_MS`] for
@@ -51,9 +54,9 @@ pub async fn spawn(
         <embassy_nrf::peripherals::UARTE0 as embassy_nrf::uarte::Instance>::Interrupt,
         uarte::InterruptHandler<embassy_nrf::peripherals::UARTE0>,
     > + 'static,
-    tx_pin: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_02>,
-    rx_pin: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_03>,
-    pps_pin: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_04>,
+    tx_pin: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_08>,
+    rx_pin: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_07>,
+    pps_pin: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_31>,
     power_pin: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_05>,
 ) -> bool {
     // Power the module on: W floats high (pull-up) → drive HIGH explicitly.
@@ -79,7 +82,7 @@ pub async fn spawn(
     let module = DxGp21GnssModule::from_uart(
         uart,
         Some(power),
-        Some(Input::new(pps_pin, Pull::Down)),
+        Some(Input::new(pps_pin, Pull::Up)),
         &GNSS_STATE,
     );
     match module.spawn(spawner, gnss_pps) {
@@ -131,7 +134,10 @@ fn gnss_pps(snap: FixSnapshot) {
             time.second as u32,
         );
         crate::wallclock::anchor(epoch, Instant::now());
-        ulogf!("gnss: log timestamps anchored to GPS UTC (epoch {})\r\n", epoch);
+        ulogf!(
+            "gnss: log timestamps anchored to GPS UTC (epoch {})\r\n",
+            epoch
+        );
     }
     match (snap.lat, snap.lon) {
         (Some(lat), Some(lng)) => {

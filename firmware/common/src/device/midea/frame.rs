@@ -42,7 +42,8 @@ pub fn encode_conn(typ: u8, body: &[u8], seq: u8) -> Option<Frame> {
         return None;
     }
     let mut out = Frame::new();
-    out.extend_from_slice(&[0xAA, 0x55, length as u8, seq, typ]).ok()?;
+    out.extend_from_slice(&[0xAA, 0x55, length as u8, seq, typ])
+        .ok()?;
     out.extend_from_slice(body).ok()?;
     let chk = checksum_neg(&out[2..]);
     out.push(chk).ok()?;

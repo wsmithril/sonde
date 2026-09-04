@@ -60,7 +60,11 @@ pub struct RunIndex {
 impl RunIndex {
     /// A fresh (empty) index for a blank or unreadable card.
     pub fn empty() -> Self {
-        Self { runs: Vec::new(), next_idx: [1; 3], next_lba: DATA_START_LBA }
+        Self {
+            runs: Vec::new(),
+            next_idx: [1; 3],
+            next_lba: DATA_START_LBA,
+        }
     }
 
     /// Parse a superblock block; returns [`Self::empty`] if the magic is absent
@@ -78,10 +82,16 @@ impl RunIndex {
                 kind: block[off + 1],
                 index: u16::from_le_bytes([block[off + 2], block[off + 3]]),
                 start_lba: u32::from_le_bytes([
-                    block[off + 4], block[off + 5], block[off + 6], block[off + 7],
+                    block[off + 4],
+                    block[off + 5],
+                    block[off + 6],
+                    block[off + 7],
                 ]),
                 len_bytes: u32::from_le_bytes([
-                    block[off + 8], block[off + 9], block[off + 10], block[off + 11],
+                    block[off + 8],
+                    block[off + 9],
+                    block[off + 10],
+                    block[off + 11],
                 ]),
                 finalized: block[off + 12],
             };

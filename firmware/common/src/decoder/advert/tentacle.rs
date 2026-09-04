@@ -14,12 +14,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// Tentacle Sync (0xFDAC) and Zwift (0xFC82) — service data.
 pub(super) struct Tentacle;
 impl super::VendorDecoder for Tentacle {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFDAC, 0xFC82] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFDAC, 0xFC82]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         let mut s: LogStr = LogStr::new();
         if ctx.key == 0xFC82 {

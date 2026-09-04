@@ -15,7 +15,7 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// LE Audio — ASCS (0x184E), CAS (0x1853), TMAS (0x1855), BASS (0x184F), and the
 /// VCS/PACS/MICS service hints (0x1844/0x1850/0x184D); dispatched by UUID.
@@ -44,9 +44,15 @@ impl super::VendorDecoder for LeAudio {
 
 impl LeAudio {
     fn decode_184e(f: &[u8], base: usize) {
-        if f.is_empty() { return; }
+        if f.is_empty() {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
-        let atype = match f[0] { 0 => "General", 1 => "Targeted", _ => "?" };
+        let atype = match f[0] {
+            0 => "General",
+            1 => "Targeted",
+            _ => "?",
+        };
         let _ = write!(s, "    LE Audio ASCS: announce={}", atype);
         if f.len() >= 5 {
             let sink = u16::from_le_bytes([f[1], f[2]]);
@@ -72,7 +78,11 @@ impl LeAudio {
 
     fn decode_184f(f: &[u8], base: usize) {
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    LE Audio BASS (Broadcast Scan / Scan Delegator) len={}", f.len());
+        let _ = write!(
+            s,
+            "    LE Audio BASS (Broadcast Scan / Scan Delegator) len={}",
+            f.len()
+        );
         emit(s);
         hexdump(f, base, 6);
     }
@@ -85,9 +95,17 @@ impl LeAudio {
         let mut s: LogStr = LogStr::new();
         if f.len() >= 3 {
             let bid = u32::from_le_bytes([f[0], f[1], f[2], 0]);
-            let _ = write!(s, "    LE Audio Broadcast Announce: broadcast_id=0x{:06X}", bid);
+            let _ = write!(
+                s,
+                "    LE Audio Broadcast Announce: broadcast_id=0x{:06X}",
+                bid
+            );
         } else {
-            let _ = write!(s, "    LE Audio Broadcast Announce: truncated ({}B)", f.len());
+            let _ = write!(
+                s,
+                "    LE Audio Broadcast Announce: truncated ({}B)",
+                f.len()
+            );
         }
         emit(s);
     }
@@ -101,7 +119,11 @@ impl LeAudio {
         }
         let mut s: LogStr = LogStr::new();
         let feat = f[0];
-        let _ = write!(s, "    LE Audio PBP: enc={}", if feat & 0x01 != 0 { "yes" } else { "no" });
+        let _ = write!(
+            s,
+            "    LE Audio PBP: enc={}",
+            if feat & 0x01 != 0 { "yes" } else { "no" }
+        );
         let mut q: LogStr = LogStr::new();
         if feat & 0x02 != 0 {
             let _ = write!(q, "SQ");
@@ -129,7 +151,11 @@ impl LeAudio {
     /// (General/Targeted), same encoding as the ASCS announcement.
     fn decode_cas(f: &[u8]) {
         let mut s: LogStr = LogStr::new();
-        let atype = match f.first() { Some(0) => "General", Some(1) => "Targeted", _ => "?" };
+        let atype = match f.first() {
+            Some(0) => "General",
+            Some(1) => "Targeted",
+            _ => "?",
+        };
         let _ = write!(s, "    LE Audio CAS: announce={}", atype);
         emit(s);
     }
@@ -145,12 +171,16 @@ impl LeAudio {
             let mut first = true;
             for (i, n) in NAMES.iter().enumerate() {
                 if role & (1 << i) != 0 {
-                    if !first { let _ = write!(s, ","); }
+                    if !first {
+                        let _ = write!(s, ",");
+                    }
                     let _ = write!(s, "{}", n);
                     first = false;
                 }
             }
-            if first { let _ = write!(s, "none"); }
+            if first {
+                let _ = write!(s, "none");
+            }
             let _ = write!(s, "] (0x{:04X})", role);
         } else {
             let _ = write!(s, "?]");
@@ -170,8 +200,8 @@ impl LeAudio {
     /// Append the set "Context Type" bits (Assigned Numbers §6.12.3) as short names.
     fn write_contexts(s: &mut LogStr, bits: u16) {
         const NAMES: [&str; 12] = [
-            "Unspec", "Conv", "Media", "Game", "Instr", "VA",
-            "Live", "SFX", "Notif", "Ring", "Alert", "Emrg",
+            "Unspec", "Conv", "Media", "Game", "Instr", "VA", "Live", "SFX", "Notif", "Ring",
+            "Alert", "Emrg",
         ];
         if bits == 0 {
             let _ = write!(s, "none");
@@ -180,12 +210,16 @@ impl LeAudio {
         let mut first = true;
         for (i, n) in NAMES.iter().enumerate() {
             if bits & (1 << i) != 0 {
-                if !first { let _ = write!(s, ","); }
+                if !first {
+                    let _ = write!(s, ",");
+                }
                 let _ = write!(s, "{}", n);
                 first = false;
             }
         }
         let extra = bits & !0x0FFF;
-        if extra != 0 { let _ = write!(s, ",+0x{:03X}", extra); }
+        if extra != 0 {
+            let _ = write!(s, ",+0x{:03X}", extra);
+        }
     }
 }

@@ -10,14 +10,13 @@ use sonde_common::{led, ulog};
 
 use crate::{CTX, ConsoleSink, LedParts, QspiParts};
 
-#[embassy_executor::task]
-pub async fn run(spawner: Spawner, q: QspiParts, l: LedParts) {
+pub async fn run(spawner: Spawner, q: QspiParts, l: LedParts) -> ! {
     ulog!("mode=conn_follow\r\n");
     let leds = led::Gpio::new(l.r, l.g, l.b);
     let mut m = mode::ConnFollow::<ConsoleSink>::new(leds);
     m.init(&CTX, async move {
         crate::hold_assets(spawner, crate::qspi_setup(q));
-        spawner.spawn(mode::conn_follow::log_task().unwrap());
+        spawner.spawn(mode::decode_task(mode::DecodeTask::ConnFollow).unwrap());
     })
     .await;
     m.run(&CTX).await

@@ -17,7 +17,7 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Byte offset (after the company ID) of the reversed reconnect-host address.
 const HOST_ADDR_OFF: usize = 10;
@@ -25,28 +25,42 @@ const HOST_ADDR_OFF: usize = 10;
 /// Nintendo Co., Ltd. — manufacturer data (Company ID 0x0553).
 pub(super) struct Nintendo;
 impl super::VendorDecoder for Nintendo {
-    fn company_ids(&self) -> &'static [u16] { &[0x0553] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0553]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
         let _ = write!(s, "    Nintendo:");
 
         // Recognised Switch-2 reconnect/wake frame: fixed prefix 01 00 03 and
         // vendor 0x057E (little-endian 7E 05).
         if body.len() >= HOST_ADDR_OFF + 6
-            && body[0] == 0x01 && body[1] == 0x00 && body[2] == 0x03
-            && body[3] == 0x7E && body[4] == 0x05
+            && body[0] == 0x01
+            && body[1] == 0x00
+            && body[2] == 0x03
+            && body[3] == 0x7E
+            && body[4] == 0x05
         {
             let pid = u16::from_le_bytes([body[5], body[6]]);
             let _ = write!(s, " {} (pid=0x{:04X})", Self::controller_name(pid), pid);
-            let _ = write!(s, " {}", match body[9] {
-                0x81 => "wake-console",
-                0x00 => "reconnect",
-                _ => "state?",
-            });
+            let _ = write!(
+                s,
+                " {}",
+                match body[9] {
+                    0x81 => "wake-console",
+                    0x00 => "reconnect",
+                    _ => "state?",
+                }
+            );
             let a = &body[HOST_ADDR_OFF..HOST_ADDR_OFF + 6];
-            let _ = write!(s, " host={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                a[5], a[4], a[3], a[2], a[1], a[0]);
+            let _ = write!(
+                s,
+                " host={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                a[5], a[4], a[3], a[2], a[1], a[0]
+            );
             emit(s);
             // The remainder is the fixed 0x0F marker + reserved zeros — nothing to show.
             return;
@@ -56,8 +70,11 @@ impl super::VendorDecoder for Nintendo {
         let _ = write!(s, " len={}", body.len());
         if body.len() >= HOST_ADDR_OFF + 6 {
             let a = &body[HOST_ADDR_OFF..HOST_ADDR_OFF + 6];
-            let _ = write!(s, " host≈{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                a[5], a[4], a[3], a[2], a[1], a[0]);
+            let _ = write!(
+                s,
+                " host≈{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                a[5], a[4], a[3], a[2], a[1], a[0]
+            );
         }
         emit(s);
         hexdump(body, ctx.base, 6);

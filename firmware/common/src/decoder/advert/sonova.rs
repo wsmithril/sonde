@@ -15,7 +15,7 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Sonova Consumer Hearing GmbH — manufacturer data (Company ID 0x0BA3).
 ///
@@ -24,20 +24,27 @@ use super::{emit, hexdump, LogStr};
 /// byte 0 contains a connection-state nibble (0x01 = advertising, 0x02 = bonded).
 pub(super) struct Sonova;
 impl super::VendorDecoder for Sonova {
-    fn company_ids(&self) -> &'static [u16] { &[0x0BA3] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0BA3]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         let state = body[0];
         let state_str = match state {
             0x01 => "advertising",
             0x02 => "bonded",
             0x03 => "reconnecting",
-            _    => "?",
+            _ => "?",
         };
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s,
+        let _ = write!(
+            s,
             "    Sonova (hearing/TWS): state=0x{:02X}({}) payload_len={}",
-            state, state_str, body.len()
+            state,
+            state_str,
+            body.len()
         );
         emit(s);
         // Remaining bytes: rotating device credential — no public layout.

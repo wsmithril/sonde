@@ -25,8 +25,8 @@
 //! all, or the Access Address kept matching through the outage — which is a bug
 //! in our timeline, not the end of a connection.
 //!
-//! Timing is anchored to the *actual* master packet each event: we measure its
-//! air-start (`END` timestamp − air duration) and schedule the next event a
+//! Timing is anchored to the *actual* master packet each event: hardware latches
+//! its END time into TIMER1, we subtract its air duration, and schedule the next event a
 //! `connInterval` later, which keeps the timeline drift-free.
 //!
 //! A connection update breaks that chain for exactly one event: its `WinOffset`
@@ -94,28 +94,54 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 
-use super::{Ctx, Mode};
+use super::{Ctx, Mode, ModeRef};
+use crate::decoder::protocol::{l2cap, ll};
+use crate::decoder::{ConnSpec, parse_connect_ind};
 use crate::hal::csa2;
 use crate::hal::radio::{
-    arm_rxen_after, configure_ble, data_ch_freq, disarm_rxen, ensure_disabled, set_access_address,
-    set_pcnf0, ADV_CRC_POLY,
+    ADV_CRC_POLY, BleCrcRepair, configure_ble, data_ch_freq, disarm_rxen, ensure_disabled,
+    set_access_address, set_pcnf0, start_end_capture,
 };
-use crate::decoder::protocol::{l2cap, ll};
-use crate::decoder::{parse_connect_ind, ConnSpec};
 use crate::led::{Gpio, OnBoardLed};
-use crate::{led, SyncBuf};
+use crate::{SyncBuf, led};
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
 
 const T_IFS_US: u16 = 150; // inter-frame spacing enforced by the RADIO
 
+/// Wake this much before a TIMER1 deadline, then busy-wait the final fraction.
+/// RADIO RXEN itself is PPI-scheduled, so this only ensures software notices the
+/// master's END before the peripheral's 150 µs reply can overwrite CC1.
+const TIMER_WAKE_EARLY_US: u32 = 250;
+
+/// `a` precedes `b` in TIMER1's wrapping 1 MHz domain. All follower deadlines
+/// are within one connection interval, far below TIMER1's half-wrap range.
+fn tick_before(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+/// Wait until an absolute TIMER1 tick without using RTC1 for the final timing.
+async fn wait_until_tick(clock: &crate::hal::radio::RadioEndClock, at: u32) {
+    loop {
+        let remaining = at.wrapping_sub(clock.now_ticks()) as i32;
+        if remaining <= 0 {
+            return;
+        }
+        if remaining as u32 > TIMER_WAKE_EARLY_US {
+            Timer::after_micros((remaining as u32 - TIMER_WAKE_EARLY_US) as u64).await;
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Open RX this long *before* the predicted anchor.
 ///
 /// Has to cover everything that makes the prediction late rather than early:
-/// radio ramp-up, and above all the software latency baked into `connect_end` —
-/// that instant comes from a poll loop noticing `EVENTS_END`, not from a
-/// hardware capture, and the CONNECT_IND decode/log runs before `follow()` is
-/// even entered. Measured on hardware, the master's first packet arrived
+/// radio ramp-up, and the setup/decode latency between receiving the
+/// CONNECT_IND and entering `follow()`. The initial anchor now comes from a
+/// hardware END capture rather than the poll loop, but that hand-off still has
+/// non-radio work in it. Measured on hardware, the master's first packet arrived
 /// **368 µs before** the predicted anchor, so the old 200 µs lead missed it by
 /// ~170 µs. Drift between re-anchors is negligible by comparison (500 ppm over
 /// 30 ms ≈ 15 µs).
@@ -188,8 +214,8 @@ const ADV_BLINK_US: u64 = 1000; // blue blink duration on each advertising packe
 // Two EasyDMA buffers so the peripheral's reply doesn't overwrite the master
 // packet before we decode it. LL data PDUs are ≤ 2-byte header + 251-byte
 // payload; 258 covers the maximum with margin.
-static RX_M: SyncBuf<258> = SyncBuf::new();
-static RX_S: SyncBuf<258> = SyncBuf::new();
+static RX_M: ModeRef<SyncBuf<258>> = ModeRef::new();
+static RX_S: ModeRef<SyncBuf<258>> = ModeRef::new();
 
 // ── Pending LL updates (applied at their Instant) ─────────────────────────────
 
@@ -302,20 +328,23 @@ pub async fn run(mut leds: impl led::ChanSink) {
         // All off while we hunt for the next CONNECT_IND.
         leds.set(led::OFF);
 
-        let (spec, connect_end) = listen_for_connect_ind(&mut leds).await;
-        follow(&spec, connect_end, &mut leds).await;
+        let (spec, end_clock, connect_end) = listen_for_connect_ind(&mut leds).await;
+        follow(&spec, end_clock, connect_end, &mut leds).await;
     }
 }
 
 /// Passively scan the advertising channels until a `CONNECT_IND` is captured,
-/// returning its parsed [`ConnSpec`] and the `EVENTS_END` timestamp of the PDU
-/// (the connection timeline anchors on it). Blinks blue for ~1 ms on every
+/// returning its parsed [`ConnSpec`], a still-running hardware timestamp clock,
+/// and the PDU's TIMER1 `END` tick (the connection timeline anchors on it).
+/// Blinks blue for ~1 ms on every
 /// advertising packet received so activity is visible.
 ///
 /// Re-arms the advertising AA/CRC via [`configure_ble`] at entry, which
 /// also undoes the connection-specific AA a previous [`follow`] left behind (so
 /// the receiver isn't wedged on the wrong access address).
-async fn listen_for_connect_ind(leds: &mut impl led::ChanSink) -> (ConnSpec, Instant) {
+async fn listen_for_connect_ind(
+    leds: &mut impl led::ChanSink,
+) -> (ConnSpec, crate::hal::radio::RadioEndClock, u32) {
     let r = pac::RADIO;
     configure_ble();
     let mut blue_off: Option<Instant> = None;
@@ -323,7 +352,10 @@ async fn listen_for_connect_ind(leds: &mut impl led::ChanSink) -> (ConnSpec, Ins
     loop {
         for &(ch_idx, freq) in ADV_CHANNELS.iter() {
             ensure_disabled();
-            r.frequency().write(|w| { w.set_frequency(freq); w.set_map(vals::Map::Default); });
+            r.frequency().write(|w| {
+                w.set_frequency(freq);
+                w.set_map(vals::Map::Default);
+            });
             r.datawhiteiv().write(|w| w.set_datawhiteiv(ch_idx));
             r.packetptr().write_value(RX_M.0.get() as u32);
             r.events_end().write_value(0);
@@ -334,6 +366,11 @@ async fn listen_for_connect_ind(leds: &mut impl led::ChanSink) -> (ConnSpec, Ins
                 w.set_rxready_start(true);
                 w.set_address_rssistart(true);
             });
+            // Latch RADIO.END into TIMER1 over PPI before reception starts. The
+            // CONNECT_IND end time seeds the first connection anchor, so using
+            // the poll loop's Instant::now() here would inject RTC quantization
+            // into every later prediction.
+            let end_clock = start_end_capture();
             r.tasks_rxen().write_value(1);
 
             let deadline = Instant::now() + Duration::from_millis(LISTEN_DWELL_MS);
@@ -348,7 +385,7 @@ async fn listen_for_connect_ind(leds: &mut impl led::ChanSink) -> (ConnSpec, Ins
 
                 if r.events_end().read() != 0 {
                     r.events_end().write_value(0);
-                    let t_end = Instant::now();
+                    let t_end = end_clock.end_ticks();
                     // EVENTS_CRCOK is a latch, not a per-packet flag: the radio
                     // sets it and never clears it. Since this loop re-arms with
                     // TASKS_START and keeps reading, it MUST be cleared here —
@@ -369,7 +406,8 @@ async fn listen_for_connect_ind(leds: &mut impl led::ChanSink) -> (ConnSpec, Ins
                         let length = buf[1] as usize;
                         if pdu_type == 0x05 && length >= 34 {
                             let payload_len = length.min(buf.len() - 2);
-                            if let Some(spec) = parse_connect_ind(buf[0], &buf[2..2 + payload_len]) {
+                            if let Some(spec) = parse_connect_ind(buf[0], &buf[2..2 + payload_len])
+                            {
                                 // Second gate: a CONNECT_IND we cannot follow is
                                 // worse than none at all — we would commit the
                                 // radio to a timeline derived from nonsense and
@@ -378,16 +416,25 @@ async fn listen_for_connect_ind(leds: &mut impl led::ChanSink) -> (ConnSpec, Ins
                                 if !spec.is_followable() {
                                     ulogf!(
                                         "[ERR] ignored malformed CONNECT_IND ch={} aa=0x{:08X} interval={} hop={} timeout={}\r\n",
-                                        ch_idx, spec.aa, spec.interval, spec.hop, spec.timeout
+                                        ch_idx,
+                                        spec.aa,
+                                        spec.interval,
+                                        spec.hop,
+                                        spec.timeout
                                     );
                                     r.tasks_start().write_value(1);
                                     continue;
                                 }
                                 ulogf!("CONNECT_IND ch={} aa=0x{:08X}\r\n", ch_idx, spec.aa);
-                                crate::decoder::decode_connect_ind(buf[0], &buf[2..2 + payload_len]);
-                                disable_radio();
+                                crate::decoder::decode_connect_ind(
+                                    buf[0],
+                                    &buf[2..2 + payload_len],
+                                );
+                                // Keep TIMER1 running: `t_end` and all later
+                                // connection anchors live in its 1 MHz domain.
+                                disable_radio_keep_timer();
                                 leds.set_chan(led::Chan::B, false);
-                                return (spec, t_end);
+                                return (spec, end_clock, t_end);
                             }
                         }
                     }
@@ -409,6 +456,14 @@ async fn listen_for_connect_ind(leds: &mut impl led::ChanSink) -> (ConnSpec, Ins
 /// Clear SHORTS and force the radio to DISABLED (busy-wait). Used between listen
 /// channels and before handing off to [`follow`].
 fn disable_radio() {
+    disable_radio_keep_timer();
+    // Also releases the TIMER1/PPI END capture installed while scanning this
+    // advertising channel. Harmless when the caller did not arm it.
+    disarm_rxen();
+}
+
+/// Disable RADIO without disturbing the live TIMER1 connection timeline.
+fn disable_radio_keep_timer() {
     let r = pac::RADIO;
     r.shorts().write(|_w| {});
     r.tasks_disable().write_value(1);
@@ -430,7 +485,8 @@ fn disable_radio() {
 /// the connection's AA.
 pub async fn follow(
     spec: &ConnSpec,
-    connect_end: Instant,
+    end_clock: crate::hal::radio::RadioEndClock,
+    connect_end: u32,
     leds: &mut impl led::ChanSink,
 ) {
     // Live link state — mutated as LL control PDUs are applied.
@@ -449,10 +505,17 @@ pub async fn follow(
 
     ulogf!(
         "  FOLLOW aa=0x{:08X} crcinit=0x{:06X} interval={}.{:02}ms csa={} hop={} chmap={:02X}{:02X}{:02X}{:02X}{:02X} start\r\n",
-        spec.aa, spec.crc_init,
-        (interval as u32 * 125) / 100, (interval as u32 * 125) % 100,
-        if spec.csa2 { 2 } else { 1 }, hop,
-        chm[0], chm[1], chm[2], chm[3], chm[4]
+        spec.aa,
+        spec.crc_init,
+        (interval as u32 * 125) / 100,
+        (interval as u32 * 125) % 100,
+        if spec.csa2 { 2 } else { 1 },
+        hop,
+        chm[0],
+        chm[1],
+        chm[2],
+        chm[3],
+        chm[4]
     );
 
     configure_radio(spec.aa, spec.crc_init);
@@ -460,8 +523,7 @@ pub async fn follow(
     // First anchor = connEnd + transmitWindowDelay (1.25 ms) + WinOffset·1.25 ms.
     // The master's first packet may land anywhere in the transmit window, so this
     // event uses a widened receive span.
-    let mut anchor = connect_end
-        + Duration::from_micros(1250 + spec.win_offset as u64 * 1250);
+    let mut anchor = connect_end.wrapping_add(1250 + spec.win_offset as u32 * 1250);
     // The transmit window is the dominant unknown for as long as we haven't
     // locked, so hunt mode re-applies it every event; `wide_us` is the one-shot
     // version, consumed by the first event and re-armed by connection updates.
@@ -505,6 +567,10 @@ pub async fn follow(
     let mut n_empty: u32 = 0; // empty PDUs seen — the keepalives capture() drops undecoded
     let mut n_addr: u32 = 0; // events where EVENTS_ADDRESS fired (AA matched)
     let mut n_crc: u32 = 0; // …and the packet passed CRC
+    let mut n_crc_repaired: u32 = 0; // CRC-error PDUs repaired by one-bit syndrome
+    // Learn how this RADIO presents RXCRC from a CRC-good PDU before accepting
+    // any correction. The calibration remains fixed for this connection.
+    let mut crc_repair = BleCrcRepair::default();
     // Miss breakdown, the two failures that need opposite fixes. A miss where
     // EVENTS_ADDRESS fired means we were on the right channel at the right time and
     // lost the packet mid-air (reception / window tail). A *silent* miss saw no
@@ -540,7 +606,8 @@ pub async fn follow(
     // Supervision budget: how many consecutive events may be missed before the
     // link is presumed lost. supervisionTimeout / connInterval, with a floor.
     // Recomputed whenever a connection update changes the interval/timeout.
-    let supervision_cap = |to: u16, iv: u16| ((to as u32 * 10 * 1000) / (iv as u32 * 1250)).max(MIN_MISS_CAP);
+    let supervision_cap =
+        |to: u16, iv: u16| ((to as u32 * 10 * 1000) / (iv as u32 * 1250)).max(MIN_MISS_CAP);
     let mut miss_cap = supervision_cap(timeout, interval);
 
     let mut pending_upd: Option<PendUpd> = None;
@@ -581,13 +648,17 @@ pub async fn follow(
             // 6.25 ms on a 7.5 ms interval does not: the instant is missed and
             // `anchor` is then a whole new interval behind the event counter, so
             // every channel from there on is the previous event's.
-            anchor += Duration::from_micros(1250 + u.win_offset as u64 * 1250);
+            anchor = anchor.wrapping_add(1250 + u.win_offset as u32 * 1250);
             // Anchored on the window's start, only its width is still unknown.
             wide_us = (u.win_size as u64 + 1) * 1250;
             pending_upd = None;
-            ulogf!("    applied CONNECTION_UPDATE @ev={} interval={}.{:02}ms anchor+{}us\r\n",
-                ev, (interval as u32 * 125) / 100, (interval as u32 * 125) % 100,
-                1250 + u.win_offset as u64 * 1250);
+            ulogf!(
+                "    applied CONNECTION_UPDATE @ev={} interval={}.{:02}ms anchor+{}us\r\n",
+                ev,
+                (interval as u32 * 125) / 100,
+                (interval as u32 * 125) % 100,
+                1250 + u.win_offset as u64 * 1250
+            );
         }
         // The radio is disabled here (`cleanup_radio` ran at the end of the
         // previous event), which is the only point in the loop where MODE may
@@ -603,7 +674,11 @@ pub async fn follow(
             // trusting a window sized for the old PHY.
             synced = false;
             hunt_wide_us = (win_size as u64 + 1) * 1250;
-            ulogf!("    applied PHY_UPDATE @ev={} phy={}\r\n", ev, phy_name(phy));
+            ulogf!(
+                "    applied PHY_UPDATE @ev={} phy={}\r\n",
+                ev,
+                phy_name(phy)
+            );
         }
 
         // Phase-preserving catch-up. Everything below assumes `anchor` is still
@@ -613,11 +688,11 @@ pub async fn follow(
         // mismatch that is self-consistent and never recovers. Skip whole
         // intervals instead, advancing the event index and the hop with them, so
         // time and channel stay in step.
-        let interval_us = Duration::from_micros(interval as u64 * 1250);
-        let floor = Instant::now() + Duration::from_micros(RX_LEAD_US);
+        let interval_us = interval as u32 * 1250;
+        let floor = end_clock.now_ticks().wrapping_add(RX_LEAD_US as u32);
         let mut skipped = 0u32;
-        while anchor < floor {
-            anchor += interval_us;
+        while tick_before(anchor, floor) {
+            anchor = anchor.wrapping_add(interval_us);
             if !spec.csa2 {
                 unmapped = (unmapped + hop) % 37;
             }
@@ -625,7 +700,11 @@ pub async fn follow(
             skipped += 1;
         }
         if skipped > 0 {
-            ulogf!("    [ERR] anchor was {} event(s) behind the clock, skipped to ev={}\r\n", skipped, ev);
+            ulogf!(
+                "    [ERR] anchor was {} event(s) behind the clock, skipped to ev={}\r\n",
+                skipped,
+                ev
+            );
         }
 
         // Apply a pending channel map here — after the catch-up loop, and keyed on
@@ -640,8 +719,15 @@ pub async fn follow(
         {
             chm = m.chm;
             pending_map = None;
-            ulogf!("    applied CHANNEL_MAP @ev={} chmap={:02X}{:02X}{:02X}{:02X}{:02X}\r\n",
-                ev, chm[0], chm[1], chm[2], chm[3], chm[4]);
+            ulogf!(
+                "    applied CHANNEL_MAP @ev={} chmap={:02X}{:02X}{:02X}{:02X}{:02X}\r\n",
+                ev,
+                chm[0],
+                chm[1],
+                chm[2],
+                chm[3],
+                chm[4]
+            );
         }
 
         // The CSA#1 unmapped index advances one hop every event — including the
@@ -679,7 +765,10 @@ pub async fn follow(
         };
         let (ch, freq) = match selected {
             Some(cf) => cf,
-            None => { reason = EndReason::BadChannel; break; }
+            None => {
+                reason = EndReason::BadChannel;
+                break;
+            }
         };
         // Announce the escalation once per outage, at the event it begins.
         if scanning && consec_miss == SCAN_AFTER_MISSES {
@@ -701,18 +790,14 @@ pub async fn follow(
         // module note describes: a window reaching anchor[N+1] receives the next
         // event on this event's channel. Short intervals are where it bites —
         // at 7.5 ms the hunt tail alone already exceeds one interval.
-        let span = (RX_LEAD_US + tail).min(interval as u64 * 1250 * 3 / 4);
-        let rx_open = anchor - Duration::from_micros(RX_LEAD_US);
+        let span = (RX_LEAD_US + tail).min(interval as u64 * 1250 * 3 / 4) as u32;
+        let rx_open = anchor.wrapping_sub(RX_LEAD_US as u32);
         // Wait until RX opens: microseconds from now until `rx_open`. This is a
         // schedule-slack measurement — how much time we have BEFORE the RX
         // window's start, NOT how far we are from the master's transmit window.
         // Positive = we finished early and will sleep `pre_rx_wait_us`; negative = the
         // anchor is already in the past and the window will open late.
-        let now = Instant::now();
-        let pre_rx_wait_us = match rx_open.checked_duration_since(now) {
-            Some(d) => d.as_micros() as i32,
-            None => -(now.duration_since(rx_open).as_micros() as i32),
-        };
+        let pre_rx_wait_us = rx_open.wrapping_sub(end_clock.now_ticks()) as i32;
         if first_pre_rx_wait_us == i32::MIN {
             first_pre_rx_wait_us = pre_rx_wait_us;
         }
@@ -728,7 +813,10 @@ pub async fn follow(
         // trigger opens RX at the scheduled instant no matter what the CPU is
         // doing; EVENTS_END latches, so even a late wake reads the packet.
         ensure_disabled();
-        r.frequency().write(|w| { w.set_frequency(freq); w.set_map(vals::Map::Default); });
+        r.frequency().write(|w| {
+            w.set_frequency(freq);
+            w.set_map(vals::Map::Default);
+        });
         r.datawhiteiv().write(|w| w.set_datawhiteiv(ch));
         r.packetptr().write_value(RX_M.0.get() as u32);
         r.events_end().write_value(0);
@@ -743,24 +831,26 @@ pub async fn follow(
             w.set_disabled_rxen(true);
             w.set_address_rssistart(true);
         });
-        // pre_rx_wait_us is non-negative here: the catch-up loop above guarantees
-        // anchor ≥ now + RX_LEAD_US, so rx_open ≥ now. A lead inside
-        // RXEN_MIN_LEAD_US fires immediately inside the helper.
-        arm_rxen_after(pre_rx_wait_us.max(0) as u32);
+        // TIMER1 remains live across the whole connection. Re-checking inside
+        // `arm_rxen_at` accounts for radio setup time without rounding the
+        // deadline through RTC1.
+        end_clock.arm_rxen_at(rx_open);
         // Wait out the pre-anchor lead (yields to the executor so USB drains),
         // then busy-poll the reception window at µs precision. RX is already
         // opening on the hardware trigger while this waits.
-        Timer::at(rx_open).await;
+        wait_until_tick(&end_clock, rx_open).await;
 
         // ── Master packet ────────────────────────────────────────────────────
-        let rx_opened = Instant::now();
-        let m_deadline = rx_opened + Duration::from_micros(span);
+        let m_deadline = rx_open.wrapping_add(span);
         let mut got_m = false;
-        let mut t_m_end = Instant::now();
-        while Instant::now() < m_deadline {
+        let mut t_m_end = 0u32;
+        while tick_before(end_clock.now_ticks(), m_deadline) {
             if r.events_end().read() != 0 {
                 r.events_end().write_value(0);
-                t_m_end = Instant::now();
+                // PPI latched this at the hardware END edge. Keep its TIMER1
+                // tick for the anchor; converting it to Instant would round it
+                // to RTC1's 30.5 µs clock.
+                t_m_end = end_clock.end_ticks();
                 // Redirect the (already re-arming) RX to the second buffer so the
                 // reply doesn't clobber the master packet. PACKETPTR latches at
                 // the next START, which the shorts chain hasn't reached yet.
@@ -800,8 +890,14 @@ pub async fn follow(
             if ever_synced && (synced || consec_miss.is_multiple_of(64)) {
                 ulogf!(
                     "    miss @ev={} ch={} pre_rx_wait={}us {}\r\n",
-                    ev, ch, pre_rx_wait_us,
-                    if addr_seen { "on-channel (ADDR, no END)" } else { "silent (no ADDR)" }
+                    ev,
+                    ch,
+                    pre_rx_wait_us,
+                    if addr_seen {
+                        "on-channel (ADDR, no END)"
+                    } else {
+                        "silent (no ADDR)"
+                    }
                 );
             }
             // Fall back into hunt mode after a short run of misses.
@@ -831,8 +927,14 @@ pub async fn follow(
                 // with the packet lost mid-air from hearing nothing whatsoever.
                 ulogf!(
                     "    lost lock @ev={} ch={} after {} misses{}\r\n",
-                    ev, ch, consec_miss,
-                    if addr_seen { " (ADDR-no-END: on channel, losing packets)" } else { "" }
+                    ev,
+                    ch,
+                    consec_miss,
+                    if addr_seen {
+                        " (ADDR-no-END: on channel, losing packets)"
+                    } else {
+                        ""
+                    }
                 );
             }
             if consec_miss >= miss_cap {
@@ -858,7 +960,7 @@ pub async fn follow(
                 };
                 break;
             }
-            anchor += interval_us;
+            anchor = anchor.wrapping_add(interval_us);
             ev = ev.wrapping_add(1);
             continue;
         }
@@ -866,10 +968,10 @@ pub async fn follow(
         outage_addr = false;
         n_m += 1;
         n_addr += 1;
-        let crc_m = r.events_crcok().read() != 0;
-        if crc_m {
-            n_crc += 1;
-        }
+        let mut crc_m = r.events_crcok().read() != 0;
+        // RXCRC belongs to the master until the slave reply reaches END, so read
+        // it before entering the T_IFS receive window.
+        let rxcrc_m = r.rxcrc().read().rxcrc();
         // Still read for the re-anchor below, which needs its air time.
         let len_m = unsafe { (*RX_M.0.get())[1] };
         // Captured, so the base colour goes back to blue for this event.
@@ -879,21 +981,69 @@ pub async fn follow(
         // ── Peripheral reply ─────────────────────────────────────────────────
         r.events_end().write_value(0);
         r.events_crcok().write_value(0);
-        let s_deadline = Instant::now() + Duration::from_micros(SLAVE_SPAN_US);
+        let s_deadline = end_clock.now_ticks().wrapping_add(SLAVE_SPAN_US as u32);
         let mut got_s = false;
-        let mut t_s_end = Instant::now();
-        while Instant::now() < s_deadline {
+        let mut t_s_end = 0u32;
+        while tick_before(end_clock.now_ticks(), s_deadline) {
             if r.events_end().read() != 0 {
                 r.events_end().write_value(0);
-                t_s_end = Instant::now();
+                t_s_end = end_clock.end_ticks();
                 got_s = true;
                 break;
             }
         }
-        let crc_s = got_s && r.events_crcok().read() != 0;
-        let len_s = if got_s { unsafe { (*RX_S.0.get())[1] } } else { 0 };
+        let mut crc_s = got_s && r.events_crcok().read() != 0;
+        let rxcrc_s = if got_s { r.rxcrc().read().rxcrc() } else { 0 };
+        let len_s = if got_s {
+            unsafe { (*RX_S.0.get())[1] }
+        } else {
+            0
+        };
 
         cleanup_radio();
+
+        // The radio is now disabled, so repairing the DMA buffers cannot race a
+        // later packet. Header bits are deliberately excluded by BleCrcRepair:
+        // their length field determines how many bytes EasyDMA actually wrote.
+        let m_len = (2 + len_m as usize).min(unsafe { (&*RX_M.0.get()).len() });
+        let repaired_m = unsafe {
+            let pdu = &mut (&mut *RX_M.0.get())[..m_len];
+            if crc_m {
+                crc_repair.observe_good(pdu, spec.crc_init, rxcrc_m);
+                None
+            } else {
+                crc_repair.repair_one_payload_bit(pdu, spec.crc_init, rxcrc_m)
+            }
+        };
+        if repaired_m.is_some() {
+            crc_m = true;
+            n_crc_repaired += 1;
+        }
+        if crc_m {
+            n_crc += 1;
+        }
+
+        let repaired_s = if got_s {
+            let s_len = (2 + len_s as usize).min(unsafe { (&*RX_S.0.get()).len() });
+            unsafe {
+                let pdu = &mut (&mut *RX_S.0.get())[..s_len];
+                if crc_s {
+                    crc_repair.observe_good(pdu, spec.crc_init, rxcrc_s);
+                    None
+                } else {
+                    crc_repair.repair_one_payload_bit(pdu, spec.crc_init, rxcrc_s)
+                }
+            }
+        } else {
+            None
+        };
+        if repaired_s.is_some() {
+            crc_s = true;
+            n_crc_repaired += 1;
+        }
+        if crc_s {
+            n_crc += 1;
+        }
 
         // Green flashes on a connection event that carried a payload. Every event
         // has a master packet and on an idle link nearly all of them are empty
@@ -921,16 +1071,12 @@ pub async fn follow(
 
         // Re-anchor to the master's actual air-start (drift-free, and absorbs any
         // transmit-window offset).
-        let m_air = Duration::from_micros(air_us(phy, len_m));
-        let air_start = t_m_end - m_air;
+        let air_start = t_m_end.wrapping_sub(air_us(phy, len_m) as u32);
         // Where the master actually landed relative to the prediction, every
         // event — not just the first. Once locked this should hover near zero;
         // a steady drift means the interval is wrong, a jump means the peer
         // re-anchored (or we followed the wrong packet).
-        let d_m_us = match air_start.checked_duration_since(anchor) {
-            Some(d) => d.as_micros() as i32,
-            None => -(anchor.duration_since(air_start).as_micros() as i32),
-        };
+        let d_m_us = air_start.wrapping_sub(anchor) as i32;
         if !synced {
             if ever_synced {
                 n_relock += 1;
@@ -944,20 +1090,43 @@ pub async fn follow(
             // have been an unrecoverable blackout before hunt mode existed.
             ulogf!(
                 "    synced @ev={} ch={} offset={}us len={} (window was [{},+{}]us)\r\n",
-                ev, ch, d_m_us, len_m, -(RX_LEAD_US as i64), span - RX_LEAD_US
+                ev,
+                ch,
+                d_m_us,
+                len_m,
+                -(RX_LEAD_US as i64),
+                (span as u64) - RX_LEAD_US
             );
         }
-        anchor = air_start + interval_us;
+        anchor = air_start.wrapping_add(interval_us);
 
         // ── Queue for decode + apply control ─────────────────────────────────
         // Both directions are queued in the order they aired, so the decoded
         // capture still reads as a conversation.
-        let mut act = capture(DIR_C2P, ev, crc_m, air_start, RX_M.0.get(), &mut pkt_no, &mut enc);
+        let mut act = capture(
+            DIR_C2P,
+            ev,
+            crc_m,
+            end_clock.instant_at(air_start),
+            RX_M.0.get(),
+            repaired_m,
+            &mut pkt_no,
+            &mut enc,
+        );
         if got_s {
             // The reply's air-start, derived the same way as the master's: its
             // END timestamp less its own air time.
-            let s_air = t_s_end - Duration::from_micros(air_us(phy, len_s));
-            let s_act = capture(DIR_P2C, ev, crc_s, s_air, RX_S.0.get(), &mut pkt_no, &mut enc);
+            let s_air = t_s_end.wrapping_sub(air_us(phy, len_s) as u32);
+            let s_act = capture(
+                DIR_P2C,
+                ev,
+                crc_s,
+                end_clock.instant_at(s_air),
+                RX_S.0.get(),
+                repaired_s,
+                &mut pkt_no,
+                &mut enc,
+            );
             // A control PDU from either side is applied. When both carry one the
             // peripheral's is the later of the two on air, except that a
             // termination from the central ends the link whatever answers it.
@@ -966,7 +1135,10 @@ pub async fn follow(
             }
         }
         match act {
-            ControlAction::Terminate => { reason = EndReason::Terminate; break; }
+            ControlAction::Terminate => {
+                reason = EndReason::Terminate;
+                break;
+            }
             ControlAction::Update(u) => pending_upd = Some(u),
             ControlAction::Map(m) => pending_map = Some(m),
             ControlAction::Phy(p) => {
@@ -982,7 +1154,9 @@ pub async fn follow(
                 if asym || (want != PHY_1M && want != PHY_2M) {
                     ulogf!(
                         "  LL_PHY_UPDATE_IND @ev={} c_to_p=0x{:02X} p_to_c=0x{:02X} — not followable\r\n",
-                        ev, p.c_to_p, p.p_to_c
+                        ev,
+                        p.c_to_p,
+                        p.p_to_c
                     );
                     reason = EndReason::PhyUnsupported;
                     break;
@@ -996,6 +1170,9 @@ pub async fn follow(
     }
 
     ensure_disabled();
+    // The 1 MHz timeline is intentionally kept alive between events and is
+    // released only once this follow ends.
+    disarm_rxen();
     // Back to the listen state: dark until the next advertising packet blinks it
     // blue. Leaving a follow's last colour lit would report a lock that ended.
     leds.set(led::OFF);
@@ -1013,20 +1190,51 @@ pub async fn follow(
     drain_queue().await;
     // Sentinels mean the loop broke before a window ever opened (e.g. bad channel
     // on the first event); report 0 rather than the raw i32 extremes.
-    let first_pre_rx_wait = if first_pre_rx_wait_us == i32::MIN { 0 } else { first_pre_rx_wait_us };
-    let min_pre_rx_wait = if min_pre_rx_wait_us == i32::MAX { 0 } else { min_pre_rx_wait_us };
-    let miss_lo = if miss_pre_rx_wait_min_us == i32::MAX { 0 } else { miss_pre_rx_wait_min_us };
-    let miss_hi = if miss_pre_rx_wait_max_us == i32::MIN { 0 } else { miss_pre_rx_wait_max_us };
+    let first_pre_rx_wait = if first_pre_rx_wait_us == i32::MIN {
+        0
+    } else {
+        first_pre_rx_wait_us
+    };
+    let min_pre_rx_wait = if min_pre_rx_wait_us == i32::MAX {
+        0
+    } else {
+        min_pre_rx_wait_us
+    };
+    let miss_lo = if miss_pre_rx_wait_min_us == i32::MAX {
+        0
+    } else {
+        miss_pre_rx_wait_min_us
+    };
+    let miss_hi = if miss_pre_rx_wait_max_us == i32::MIN {
+        0
+    } else {
+        miss_pre_rx_wait_max_us
+    };
     // `enc=on` here is diagnostic for the `reason=supervision` label. Once the
     // link goes encrypted, `LL_TERMINATE_IND` is invisible to us — a clean peer
     // terminate is indistinguishable from radio-side link loss. Print the flag so
     // a supervision-timeout on an encrypted link reads as "peer probably ended
     // it" rather than "we lost the link" for post-hoc analysis.
     ulogf!(
-        "  FOLLOW end reason={} events={} master={} slave={} empty={} addr={} crcok={} dropped={} miss_addr={} miss_silent={} relock={} enc={} phy={} pre_rx_wait_all_first={}us pre_rx_wait_all_min={}us pre_rx_wait_miss={}..{}us\r\n",
-        tag, ev, n_m, n_s, n_empty, n_addr, n_crc, DROPPED.swap(0, Ordering::Relaxed),
-        n_miss_addr, n_miss_silent, n_relock, if enc.on { "on" } else { "off" },
-        phy_name(phy), first_pre_rx_wait, min_pre_rx_wait, miss_lo, miss_hi
+        "  FOLLOW end reason={} events={} master={} slave={} empty={} addr={} crcok={} crc1fix={} dropped={} miss_addr={} miss_silent={} relock={} enc={} phy={} pre_rx_wait_all_first={}us pre_rx_wait_all_min={}us pre_rx_wait_miss={}..{}us\r\n",
+        tag,
+        ev,
+        n_m,
+        n_s,
+        n_empty,
+        n_addr,
+        n_crc,
+        n_crc_repaired,
+        DROPPED.swap(0, Ordering::Relaxed),
+        n_miss_addr,
+        n_miss_silent,
+        n_relock,
+        if enc.on { "on" } else { "off" },
+        phy_name(phy),
+        first_pre_rx_wait,
+        min_pre_rx_wait,
+        miss_lo,
+        miss_hi
     );
 }
 
@@ -1087,10 +1295,6 @@ fn cleanup_radio() {
     r.tasks_disable().write_value(1);
     let _ = crate::hal::radio::wait_disabled();
     r.events_disabled().write_value(0);
-    // Release the TIMER1+PPI one-shot that armed this event's RXEN. The compare
-    // has already fired and stopped the timer by now; this only disables the PPI
-    // channel so nothing lingers between events.
-    disarm_rxen();
 }
 
 // ── Decode queue ──────────────────────────────────────────────────────────────
@@ -1124,18 +1328,58 @@ pub struct RxPdu {
     pub pkt_no: u32,
     pub dir: &'static str,
     pub crc_ok: bool,
+    /// Payload bit corrected by the bounded CRC syndrome repair, if any.
+    pub repaired_bit: Option<u16>,
     /// The link was encrypted when this PDU aired. Its payload is ciphertext, so
     /// [`emit_pdu`] dumps the bytes without decoding them.
     pub encrypted: bool,
 }
 
-pub static RX_QUEUE: Channel<CriticalSectionRawMutex, RxPdu, RX_QUEUE_DEPTH> = Channel::new();
+pub static RX_QUEUE: ModeRef<Channel<CriticalSectionRawMutex, RxPdu, RX_QUEUE_DEPTH>> =
+    ModeRef::new();
 
 /// PDUs captured but never decoded because the queue was full. Reported on the
 /// `FOLLOW end` line: `Packet[N]` numbers are assigned at capture, so a gap in
 /// the printed sequence is explained by this counter rather than by a lost
 /// packet on air.
-static DROPPED: AtomicU32 = AtomicU32::new(0);
+static DROPPED: ModeRef<AtomicU32> = ModeRef::new();
+
+/// All connection-follower-only RAM, overlaid with the selected boot mode's
+/// state by the binary.
+pub struct Storage {
+    rx_m: SyncBuf<258>,
+    rx_s: SyncBuf<258>,
+    rx_queue: Channel<CriticalSectionRawMutex, RxPdu, RX_QUEUE_DEPTH>,
+    dropped: AtomicU32,
+}
+
+impl Storage {
+    pub const fn new() -> Self {
+        Self {
+            rx_m: SyncBuf::new(),
+            rx_s: SyncBuf::new(),
+            rx_queue: Channel::new(),
+            dropped: AtomicU32::new(0),
+        }
+    }
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// # Safety
+/// Must be called exactly once before any connection-follower task starts.
+pub unsafe fn bind_storage(storage: &'static Storage) {
+    unsafe {
+        RX_M.bind(&storage.rx_m);
+        RX_S.bind(&storage.rx_s);
+        RX_QUEUE.bind(&storage.rx_queue);
+        DROPPED.bind(&storage.dropped);
+    }
+}
 
 /// Per-connection encryption tracking threaded through [`capture`].
 #[derive(Default)]
@@ -1157,12 +1401,14 @@ struct EncState {
 /// happen whenever the decoder gets there. Empty PDUs — the keepalives that make
 /// up most of an idle link — are neither queued nor numbered; the closing
 /// `empty=` count accounts for them.
+#[allow(clippy::too_many_arguments)]
 fn capture(
     dir: &'static str,
     ev: u32,
     crc_ok: bool,
     t_air: Instant,
     buf: *mut [u8; 258],
+    repaired_bit: Option<u16>,
     pkt_no: &mut u32,
     enc: &mut EncState,
 ) -> ControlAction {
@@ -1178,12 +1424,12 @@ fn capture(
     // the master's next PDU lands inside the reply window. `CONNECTION_UPDATE_IND`
     // (0x00) and `CHANNEL_MAP_IND` (0x01) are central-only, so one showing up in the
     // slave slot is that case — label it C->P by what it is, not where it landed.
-    let dir = if dir == DIR_P2C && crc_ok && hdr.llid == 0b11 && matches!(b.get(2), Some(0x00 | 0x01))
-    {
-        DIR_C2P
-    } else {
-        dir
-    };
+    let dir =
+        if dir == DIR_P2C && crc_ok && hdr.llid == 0b11 && matches!(b.get(2), Some(0x00 | 0x01)) {
+            DIR_C2P
+        } else {
+            dir
+        };
 
     // Grace fallback: if the LL_ENC_RSP/START_ENC that normally latches `enc.on`
     // was missed, the LL_ENC_REQ we did see still tells us encryption is imminent.
@@ -1207,6 +1453,7 @@ fn capture(
         pkt_no: *pkt_no,
         dir,
         crc_ok,
+        repaired_bit,
         encrypted: enc.on,
     };
     p.data[..end].copy_from_slice(&b[..end]);
@@ -1248,8 +1495,7 @@ fn capture(
 ///
 /// Runs between connection events, so the decode overlaps the receive windows
 /// the follow loop is waiting on.
-#[embassy_executor::task]
-pub async fn log_task() -> ! {
+pub async fn log_forever() -> ! {
     loop {
         let p = RX_QUEUE.receive().await;
         crate::with_log_stamp(p.t_air, || emit_pdu(&p));
@@ -1285,8 +1531,21 @@ fn emit_pdu(p: &RxPdu) {
     let _ = write!(head, "    Packet[{}] EV{} {} ", p.pkt_no, p.ev, p.dir);
     hdr.write_flags(&mut head);
 
+    if let Some(bit) = p.repaired_bit {
+        ulogf!(
+            "      CRC-REPAIRED one-bit pdu_byte={} bit={}\r\n",
+            bit / 8,
+            bit % 8
+        );
+    }
+
     if !p.crc_ok {
-        ulogf!("{} CRC-ERR llid={} len={} (not decoded)\r\n", head, hdr.llid, hdr.len);
+        ulogf!(
+            "{} CRC-ERR llid={} len={} (not decoded)\r\n",
+            head,
+            hdr.llid,
+            hdr.len
+        );
         crate::hexdump(payload, 0, 6);
         return;
     }
@@ -1300,7 +1559,12 @@ fn emit_pdu(p: &RxPdu) {
         // probe can read them. Dense: 128 to a line, which holds the 251-byte
         // PDUs a Data Length Update negotiates to two lines. `ct` marks them as
         // ciphertext + a trailing 4-byte MIC, not a decodable payload.
-        ulogf!("{} encrypted llid={} len={} (ciphertext)\r\n", head, hdr.llid, hdr.len);
+        ulogf!(
+            "{} encrypted llid={} len={} (ciphertext)\r\n",
+            head,
+            hdr.llid,
+            hdr.len
+        );
         crate::hexdump_dense("ct", payload, 6);
         return;
     }
@@ -1311,7 +1575,10 @@ fn emit_pdu(p: &RxPdu) {
         0b11 => {
             ulogf!(
                 "{} LL_CTRL {} (0x{:02X}) len={}\r\n",
-                head, ll::ctrl_name(payload[0]), payload[0], hdr.len
+                head,
+                ll::ctrl_name(payload[0]),
+                payload[0],
+                hdr.len
             );
             if !ll::emit_ctrl_params(payload) {
                 crate::hexdump(payload, 0, 6);
@@ -1418,14 +1685,21 @@ pub struct ConnFollow<K: super::CaptureSink> {
 
 impl<K: super::CaptureSink> ConnFollow<K> {
     pub fn new(leds: Gpio) -> Self {
-        Self { leds: Some(leds), _k: PhantomData }
+        Self {
+            leds: Some(leds),
+            _k: PhantomData,
+        }
     }
 }
 
 impl<K: super::CaptureSink> Mode for ConnFollow<K> {
     type Sink = K;
 
-    async fn init<F: core::future::Future<Output = ()>>(&mut self, _ctx: &'static Ctx<K>, setup: F) {
+    async fn init<F: core::future::Future<Output = ()>>(
+        &mut self,
+        _ctx: &'static Ctx<K>,
+        setup: F,
+    ) {
         setup.await;
     }
 

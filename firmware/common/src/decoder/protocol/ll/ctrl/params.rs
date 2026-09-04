@@ -7,7 +7,7 @@
 
 use core::fmt::Write;
 
-use super::{line, send, u16le, write_interval, Decoder};
+use super::{Decoder, line, send, u16le, write_interval};
 
 pub(super) struct Params;
 
@@ -35,7 +35,10 @@ impl Decoder<u8> for Params {
                 let _ = write!(
                     s,
                     " latency={} timeout={}ms periodicity={} ref_ev={}",
-                    u16le(d, 4), u16le(d, 6) as u32 * 10, d[8], u16le(d, 9)
+                    u16le(d, 4),
+                    u16le(d, 6) as u32 * 10,
+                    d[8],
+                    u16le(d, 9)
                 );
                 send(s);
                 let mut s = line();
@@ -64,7 +67,10 @@ impl Decoder<u8> for Params {
                 let _ = write!(
                     s,
                     "rx={}B/{}us tx={}B/{}us",
-                    u16le(d, 0), u16le(d, 2), u16le(d, 4), u16le(d, 6)
+                    u16le(d, 0),
+                    u16le(d, 2),
+                    u16le(d, 4),
+                    u16le(d, 6)
                 );
                 send(s);
             }
@@ -80,7 +86,10 @@ impl Decoder<u8> for Params {
                 let _ = write!(
                     s,
                     "subrate={}..{} max_latency={} continuation={} timeout={}ms",
-                    u16le(d, 0), u16le(d, 2), u16le(d, 4), u16le(d, 6),
+                    u16le(d, 0),
+                    u16le(d, 2),
+                    u16le(d, 4),
+                    u16le(d, 6),
                     u16le(d, 8) as u32 * 10
                 );
                 send(s);
@@ -94,7 +103,10 @@ impl Decoder<u8> for Params {
                 let _ = write!(
                     s,
                     "factor={} base_ev={} latency={} continuation={} timeout={}ms",
-                    u16le(d, 0), u16le(d, 2), u16le(d, 4), u16le(d, 6),
+                    u16le(d, 0),
+                    u16le(d, 2),
+                    u16le(d, 4),
+                    u16le(d, 6),
                     u16le(d, 8) as u32 * 10
                 );
                 send(s);
@@ -105,7 +117,6 @@ impl Decoder<u8> for Params {
 }
 /// The clock-accuracy table the `LL_CLOCK_ACCURACY_*` arms read.
 impl Params {
-
     /// Sleep clock accuracy, as the worst-case ppm of the `SCA` field's range.
     ///
     /// The follower's own anchor error grows at the sum of both peers' accuracies,

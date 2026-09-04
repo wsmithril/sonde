@@ -57,7 +57,10 @@ impl RngCore for HwRng {
         }
     }
 
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), p256::elliptic_curve::rand_core::Error> {
+    fn try_fill_bytes(
+        &mut self,
+        dest: &mut [u8],
+    ) -> Result<(), p256::elliptic_curve::rand_core::Error> {
         self.fill_bytes(dest);
         Ok(())
     }

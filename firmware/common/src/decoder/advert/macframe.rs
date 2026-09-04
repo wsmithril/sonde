@@ -10,12 +10,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Manufacturer frames that consist of a single 6-byte address.
 pub(super) struct MacFrame;
 impl super::VendorDecoder for MacFrame {
-    fn company_ids(&self) -> &'static [u16] { &[0x0020, 0x034C, 0x00FF, 0x1200] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0020, 0x034C, 0x00FF, 0x1200]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() != 6 {
             hexdump(body, ctx.base, 6);

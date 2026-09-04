@@ -15,19 +15,25 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// tatwah SA — manufacturer data (Company ID 0x0818): "KeepBL" asset beacons.
 pub(super) struct Tatwah;
 impl super::VendorDecoder for Tatwah {
-    fn company_ids(&self) -> &'static [u16] { &[0x0818] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0818]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 9 {
             hexdump(body, ctx.base, 6);
             return;
         }
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    tatwah beacon (unofficial): type=0x{:02X} group=", body[0]);
+        let _ = write!(
+            s,
+            "    tatwah beacon (unofficial): type=0x{:02X} group=",
+            body[0]
+        );
         write_hex(&mut s, &body[1..3]);
         let _ = write!(s, " id=");
         write_hex(&mut s, &body[3..6]);

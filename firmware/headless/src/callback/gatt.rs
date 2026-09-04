@@ -17,12 +17,11 @@ async fn text_to_ring() -> ! {
     }
 }
 
-#[embassy_executor::task]
-pub async fn run(spawner: Spawner, l: LedParts) {
+pub async fn run(spawner: Spawner, l: LedParts) -> ! {
     let mut m = capmode::GattEnum::<PcapSink>::new();
     m.init(&CTX, async move {
         let pwm = led::Pwm::new(l.pwm, l.r, l.g, l.b);
-        spawner.spawn(capmode::gatt::led_task(pwm).unwrap());
+        spawner.spawn(capmode::indicator_led_task(pwm).unwrap());
         spawner.spawn(text_to_ring().unwrap());
     })
     .await;

@@ -14,8 +14,14 @@ use crate::central::Interest;
 pub mod airoha;
 pub mod daikin;
 pub mod dessmann;
-pub mod midea;
+pub mod fanlight;
+pub mod haier;
+pub mod hisense;
+pub mod jomoo;
 pub mod mi;
+pub mod midea;
+pub mod portasplit;
+pub mod utech;
 
 /// Single entry point for device-of-interest detection from an advertising
 /// payload: Midea (0x06A8 serial), DESSMANN lock (name `LOCK_`), MiBeacon
@@ -28,13 +34,41 @@ pub mod mi;
 pub(crate) fn classify_interest(ad: &[u8], bad_sn: &mut Option<[u8; 14]>) -> Option<Interest> {
     if let Some(sn) = midea::parse_midea_sn(ad) {
         if midea::sn_matches(&sn) {
-            return Some(Interest::Midea(sn));
+            return Some(Interest::Midea {
+                sn,
+                mac: midea::parse_midea_mac(ad),
+            });
         }
         *bad_sn = Some(sn);
         return None;
     }
+    // PortaSplit is a separate family (different advert layout) — checked on its
+    // own, not as a Midea variant.
+    if let Some(mat) = portasplit::material_of_ad(ad) {
+        return Some(Interest::PortaSplit(mat));
+    }
+    // Fan-and-light: another separate family (0x06A8 `81 63 01` state advert).
+    if let Some(st) = fanlight::state_of_ad(ad) {
+        return Some(Interest::FanLight(st));
+    }
+    // Haier U-home appliance (mfg 0x0929) — probed by GATT walk.
+    if haier::is_haier_advert(ad) {
+        return Some(Interest::Haier);
+    }
+    // Hisense smart-life appliance (ServiceData16 0xF005) — BLE control via the
+    // `3a69…` GATT profile.
+    if hisense::is_hisense_advert(ad) {
+        return Some(Interest::Hisense);
+    }
+    // JOMOO smart bathroom (name `JOMOO…`) — Telink 0xFFF0 control profile.
+    if jomoo::is_jomoo_advert(ad) {
+        return Some(Interest::Jomoo);
+    }
     if dessmann::is_dessmann_advert(ad) {
         return Some(Interest::Dessmann);
+    }
+    if utech::is_utech_advert(ad) {
+        return Some(Interest::Utech);
     }
     if mi::is_sensor_advert(ad) {
         return Some(Interest::MiSensor);
@@ -58,5 +92,6 @@ pub(crate) fn uuid16(u: &[u8]) -> Option<u16> {
 
 /// The Bluetooth Base UUID prefix (on-air LE) — identifies 16-bit UUIDs widened to
 /// the full 128-bit form. Bytes [12..14] carry the 16-bit value; [14..16] are zero.
-const BASE_UUID_PREFIX_LE: [u8; 12] =
-    [0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00];
+const BASE_UUID_PREFIX_LE: [u8; 12] = [
+    0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00,
+];

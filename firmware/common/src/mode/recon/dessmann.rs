@@ -4,8 +4,8 @@
 //! [`crate::device::dessmann`]; this driver only moves frames over ATT.
 
 use crate::central::{ATT_MTU_MAX, Conn, att_write_await_notify};
-use crate::device::dessmann::{self, Cmd, Profile, build_cmd};
 use crate::decoder;
+use crate::device::dessmann::{self, Cmd, Profile, build_cmd};
 
 use super::HS_REPLY_EVENTS;
 
@@ -20,9 +20,20 @@ pub(super) async fn probe(conn: &mut Conn, prof: &Profile) {
     // the challenge first — its reply length decides the rest.
     let mut cipher = false;
     let frame = build_cmd(Cmd::GetChallenge, &[]);
-    ulogf!("  dessmann: {} (0x{:02X})\r\n", Cmd::GetChallenge.name(), Cmd::GetChallenge.byte());
-    if let Some(n) =
-        att_write_await_notify(conn, prof.write_h, &frame, prof.notify_h, HS_REPLY_EVENTS, &mut out).await
+    ulogf!(
+        "  dessmann: {} (0x{:02X})\r\n",
+        Cmd::GetChallenge.name(),
+        Cmd::GetChallenge.byte()
+    );
+    if let Some(n) = att_write_await_notify(
+        conn,
+        prof.write_h,
+        &frame,
+        prof.notify_h,
+        HS_REPLY_EVENTS,
+        &mut out,
+    )
+    .await
     {
         ulogf!("    reply len={}\r\n", n);
         decoder::hexdump(&out[..n], 0, 4);
@@ -40,8 +51,15 @@ pub(super) async fn probe(conn: &mut Conn, prof: &Profile) {
         }
         let frame = build_cmd(cmd, &[]);
         ulogf!("  dessmann: {} (0x{:02X})\r\n", cmd.name(), cmd.byte());
-        if let Some(n) =
-            att_write_await_notify(conn, prof.write_h, &frame, prof.notify_h, HS_REPLY_EVENTS, &mut out).await
+        if let Some(n) = att_write_await_notify(
+            conn,
+            prof.write_h,
+            &frame,
+            prof.notify_h,
+            HS_REPLY_EVENTS,
+            &mut out,
+        )
+        .await
         {
             ulogf!("    reply len={}\r\n", n);
             decoder::hexdump(&out[..n], 0, 4);
@@ -53,12 +71,21 @@ pub(super) async fn probe(conn: &mut Conn, prof: &Profile) {
     // State-changing commands: only on a cipher-capable lock (they need the MAC
     // and will error, mapping the response surface), and only when enabled.
     if cipher && dessmann::PROBE_MUTATING {
-        ulogf!("  dessmann: cipher-capable — probing state-changing commands (inert without sekey MAC)\r\n");
+        ulogf!(
+            "  dessmann: cipher-capable — probing state-changing commands (inert without sekey MAC)\r\n"
+        );
         for cmd in Cmd::MUTATING {
             let frame = build_cmd(cmd, &[]);
             ulogf!("  dessmann: {} (0x{:02X})\r\n", cmd.name(), cmd.byte());
-            if let Some(n) =
-                att_write_await_notify(conn, prof.write_h, &frame, prof.notify_h, HS_REPLY_EVENTS, &mut out).await
+            if let Some(n) = att_write_await_notify(
+                conn,
+                prof.write_h,
+                &frame,
+                prof.notify_h,
+                HS_REPLY_EVENTS,
+                &mut out,
+            )
+            .await
             {
                 ulogf!("    reply len={}\r\n", n);
                 decoder::hexdump(&out[..n], 0, 4);

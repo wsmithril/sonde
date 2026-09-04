@@ -6,12 +6,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// GREE Electric Appliances — manufacturer data (Company ID 0x0D23).
 pub(super) struct Gree;
 impl super::VendorDecoder for Gree {
-    fn company_ids(&self) -> &'static [u16] { &[0x0D23] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0D23]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 10 {
             hexdump(body, ctx.base, 6);

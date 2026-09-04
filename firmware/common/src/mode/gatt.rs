@@ -63,7 +63,7 @@ use embassy_time::{Duration, Instant, Timer};
 use super::{Ctx, Mode, drive_indicator};
 use crate::central::*;
 use crate::hal::radio::{configure_ble, ensure_disabled};
-use crate::led::{OnBoardLed, Pwm};
+use crate::led::OnBoardLed;
 use crate::{Rng, led};
 
 // ── Public entry ──────────────────────────────────────────────────────────────
@@ -94,14 +94,22 @@ pub async fn run(rng: &mut Rng) {
 
     ulogf!(
         "target {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} rssi={} {}\r\n",
-        cand.addr[5], cand.addr[4], cand.addr[3], cand.addr[2], cand.addr[1], cand.addr[0],
+        cand.addr[5],
+        cand.addr[4],
+        cand.addr[3],
+        cand.addr[2],
+        cand.addr[1],
+        cand.addr[0],
         cand.rssi,
         if cand.addr_random { "rand" } else { "pub" }
     );
 
     // Fresh access address and initiator address for this link, before anything
     // reads either back.
-    CONN_AA.store(pick_access_address(rng), core::sync::atomic::Ordering::Relaxed);
+    CONN_AA.store(
+        pick_access_address(rng),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     pick_conn_params(rng);
     randomize_our_addr(rng);
 
@@ -109,7 +117,11 @@ pub async fn run(rng: &mut Rng) {
     let Some(mut conn) = try_connect(&cand, &mut st).await else {
         ulogf!(
             "[ERR] connect failed (pkts={} crcok={} target={} connectable={} txfail={})\r\n",
-            st.pkts, st.crcok, st.target, st.connectable, st.txfail
+            st.pkts,
+            st.crcok,
+            st.target,
+            st.connectable,
+            st.txfail
         );
         // Yellow flash, not red: red now means "the peer answered this
         // connection event", and a solid red would be indistinguishable from a
@@ -179,7 +191,11 @@ pub async fn run(rng: &mut Rng) {
     if DIAG_CONN_TRACE {
         ulogf!(
             "conn stats ev={} txdone={} addr={} crcok={} first_anchor={}us\r\n",
-            conn.ev_total, conn.ev_txdone, conn.ev_addr, conn.ev_crcok, conn.first_late_us
+            conn.ev_total,
+            conn.ev_txdone,
+            conn.ev_addr,
+            conn.ev_crcok,
+            conn.first_late_us
         );
         dump_trace(&conn).await;
     } else if conn.ev_addr == 0 {
@@ -193,7 +209,11 @@ pub async fn run(rng: &mut Rng) {
         // anchored wrong" (first_anchor far from 0) without a reflash.
         ulogf!(
             "[ERR] peer never transmitted (ev={} txdone={} addr={} crcok={} first_anchor={}us)\r\n",
-            conn.ev_total, conn.ev_txdone, conn.ev_addr, conn.ev_crcok, conn.first_late_us
+            conn.ev_total,
+            conn.ev_txdone,
+            conn.ev_addr,
+            conn.ev_crcok,
+            conn.first_late_us
         );
     }
 
@@ -311,7 +331,11 @@ impl<K: super::CaptureSink> Default for GattEnum<K> {
 impl<K: super::CaptureSink> Mode for GattEnum<K> {
     type Sink = K;
 
-    async fn init<F: core::future::Future<Output = ()>>(&mut self, _ctx: &'static Ctx<K>, setup: F) {
+    async fn init<F: core::future::Future<Output = ()>>(
+        &mut self,
+        _ctx: &'static Ctx<K>,
+        setup: F,
+    ) {
         setup.await;
     }
 
@@ -324,11 +348,4 @@ impl<K: super::CaptureSink> Mode for GattEnum<K> {
     async fn led_control<L: OnBoardLed>(led: &mut L) -> ! {
         drive_indicator(led).await
     }
-}
-
-/// Spawnable LED task — the state-colour indicator (`crate::led::LED` signal).
-/// Shared with the Midea mode.
-#[embassy_executor::task]
-pub async fn led_task(mut leds: Pwm) -> ! {
-    drive_indicator(&mut leds).await
 }

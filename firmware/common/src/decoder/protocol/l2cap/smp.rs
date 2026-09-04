@@ -7,7 +7,7 @@
 
 use core::fmt::Write;
 
-use super::{line, send, u16le, write_hex_be, write_hex_capped, Decoder};
+use super::{Decoder, line, send, u16le, write_hex_be, write_hex_capped};
 
 pub struct Smp;
 
@@ -30,8 +30,15 @@ impl Decoder<u16> for Smp {
                 let _ = write!(
                     s,
                     "iocap={} ({}) oob={} max_key={}B bonding={} mitm={} sc={} keypress={} ct2={}",
-                    p[0], Self::io_cap_name(p[0]), p[1], p[3],
-                    auth & 0x03, (auth >> 2) & 1, (auth >> 3) & 1, (auth >> 4) & 1, (auth >> 5) & 1
+                    p[0],
+                    Self::io_cap_name(p[0]),
+                    p[1],
+                    p[3],
+                    auth & 0x03,
+                    (auth >> 2) & 1,
+                    (auth >> 3) & 1,
+                    (auth >> 4) & 1,
+                    (auth >> 5) & 1
                 );
                 send(s);
                 let mut s = line();
@@ -61,7 +68,10 @@ impl Decoder<u16> for Smp {
             0x09 if p.len() >= 7 => {
                 let mut s = line();
                 let _ = write!(
-                    s, "addr_type={} addr=", if p[0] == 0 { "public" } else { "random" });
+                    s,
+                    "addr_type={} addr=",
+                    if p[0] == 0 { "public" } else { "random" }
+                );
                 for (i, b) in p[1..7].iter().rev().enumerate() {
                     if i > 0 {
                         let _ = s.push(':');
@@ -74,8 +84,12 @@ impl Decoder<u16> for Smp {
             0x0B if !p.is_empty() => {
                 let mut s = line();
                 let _ = write!(
-                    s, "bonding={} mitm={} sc={} keypress={}",
-                    p[0] & 0x03, (p[0] >> 2) & 1, (p[0] >> 3) & 1, (p[0] >> 4) & 1
+                    s,
+                    "bonding={} mitm={} sc={} keypress={}",
+                    p[0] & 0x03,
+                    (p[0] >> 2) & 1,
+                    (p[0] >> 3) & 1,
+                    (p[0] >> 4) & 1
                 );
                 send(s);
             }

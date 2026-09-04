@@ -8,17 +8,23 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Amap in-car navigation — service data (UUID 0xFDD6).
 pub(super) struct Amap;
 impl super::VendorDecoder for Amap {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFDD6] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFDD6]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         match core::str::from_utf8(body) {
             Ok(t) if !t.is_empty() && t.chars().all(|c| !c.is_control()) => {
                 let mut s: LogStr = LogStr::new();
-                let _ = write!(s, "    Amap 0xFDD6 (squats Ministry of Supply): tag=\"{}\"", t);
+                let _ = write!(
+                    s,
+                    "    Amap 0xFDD6 (squats Ministry of Supply): tag=\"{}\"",
+                    t
+                );
                 emit(s);
             }
             _ => hexdump(body, ctx.base, 6),

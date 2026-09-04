@@ -10,7 +10,7 @@
 
 use core::fmt::Write;
 
-use super::{line, send, u16le, u24le, write_interval, write_phys, Decoder};
+use super::{Decoder, line, send, u16le, u24le, write_interval, write_phys};
 
 pub(super) struct Sync;
 
@@ -36,7 +36,12 @@ impl Decoder<u8> for Sync {
         let offset_us = (sf & 0x1FFF) as u32 * units + adjust;
 
         let mut s = line();
-        let _ = write!(s, "id=0x{:04X} offset={}us interval=", u16le(d, 0), offset_us);
+        let _ = write!(
+            s,
+            "id=0x{:04X} offset={}us interval=",
+            u16le(d, 0),
+            offset_us
+        );
         write_interval(&mut s, u16le(d, 4));
         let _ = s.push_str(" phy=");
         write_phys(&mut s, d[25]);
@@ -61,7 +66,10 @@ impl Decoder<u8> for Sync {
         let _ = write!(
             s,
             "pa_evt={} conn_ev={} last_pa_ev={} sync_conn_ev={} adva=",
-            u16le(d, 18), u16le(d, 20), u16le(d, 22), u16le(d, 32)
+            u16le(d, 18),
+            u16le(d, 20),
+            u16le(d, 22),
+            u16le(d, 32)
         );
         for (i, b) in d[26..32].iter().rev().enumerate() {
             if i > 0 {
@@ -79,7 +87,10 @@ impl Decoder<u8> for Sync {
                 s,
                 "rsp_aa=0x{:08X} nse={} subevt_int={} rsp_slot_delay={} rsp_slot_spacing={}",
                 u32::from_le_bytes([d[34], d[35], d[36], d[37]]),
-                d[38], d[39], d[40], d[41]
+                d[38],
+                d[39],
+                d[40],
+                d[41]
             );
             send(s);
         }

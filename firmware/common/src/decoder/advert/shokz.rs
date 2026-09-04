@@ -8,12 +8,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// Shenzhen Shokz Co., Ltd. — manufacturer data (Company ID 0x0CAC).
 pub(super) struct Shokz;
 impl super::VendorDecoder for Shokz {
-    fn company_ids(&self) -> &'static [u16] { &[0x0CAC] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0CAC]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 6 {
             hexdump(body, ctx.base, 6);

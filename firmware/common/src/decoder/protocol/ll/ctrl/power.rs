@@ -8,7 +8,7 @@
 
 use core::fmt::Write;
 
-use super::{line, send, write_phys, Decoder};
+use super::{Decoder, line, send, write_phys};
 
 pub(super) struct Power;
 

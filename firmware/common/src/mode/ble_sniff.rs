@@ -21,15 +21,15 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 
-use super::{Ctx, Mode};
+use super::{Ctx, Mode, ModeRef};
 use crate::hal::csa2;
 use crate::hal::hash::fnv1a;
 use crate::hal::radio::{
-    arm_rxen_after, data_ch_freq, disable_silent, disarm_rxen, ensure_disabled, set_access_address,
-    set_pcnf0, set_pcnf0_coded, use_fast_ramp_up, ADV_AA, ADV_CRC_INIT,
+    ADV_AA, ADV_CRC_INIT, BleCrcRepair, arm_rxen_after, data_ch_freq, disable_silent, disarm_rxen,
+    ensure_disabled, set_access_address, set_pcnf0, set_pcnf0_coded, use_fast_ramp_up,
 };
 use crate::led::{OFF, OnBoardLed, Pwm, RED, Rgb};
-use crate::{decoder, Rng, SyncBuf};
+use crate::{Rng, SyncBuf, decoder};
 
 // ── BLE advertising constants ─────────────────────────────────────────────────
 
@@ -61,7 +61,6 @@ const ADV_DWELL_JITTER_MS: u32 = 20;
 // poll costs a torn snapshot (counted as `torn=`), not a missed reception.
 const PRIMARY_POLL_US: u64 = 150;
 
-
 // ── Extended-advertising AuxPtr following ─────────────────────────────────────
 // When an ADV_EXT_IND carries an AuxPtr, we schedule an RX window near the aux
 // packet's predicted air time, catch it, then chain onto any further AuxPtr
@@ -83,7 +82,7 @@ const AUX_MAX_LEAD_US: u32 = 60_000; // skip absurdly-distant aux (keep scanner 
 
 // EasyDMA receive buffer for BLE advertising PDUs. Sized for the largest aux
 // packet: AUX_ADV_IND AdvData can reach 255 bytes, plus the 2-byte PDU header.
-static RX_BUF: SyncBuf<258> = SyncBuf::new();
+static RX_BUF: ModeRef<SyncBuf<258>> = ModeRef::new();
 
 /// Snapshot of the packet currently being processed, copied out of [`RX_BUF`].
 ///
@@ -92,7 +91,7 @@ static RX_BUF: SyncBuf<258> = SyncBuf::new();
 /// T_IFS follow-up begins overwriting it ~190 µs later — while we are still
 /// reading this one. Everything downstream of the copy works from here, off the
 /// DMA path. Static rather than a local so it stays out of the scan future.
-static PKT_BUF: SyncBuf<258> = SyncBuf::new();
+static PKT_BUF: ModeRef<SyncBuf<258>> = ModeRef::new();
 
 // ── Decode queue ──────────────────────────────────────────────────────────────
 // Decoding and formatting a packet costs ~0.6 ms (≈100 µs per log line, of which
@@ -138,10 +137,13 @@ pub struct RxPacket {
     /// PDU type from the header, or 0xFF when `crc_ok` is false.
     pub pdu_type: u8,
     pub crc_ok: bool,
+    /// Payload bit corrected by the bounded CRC syndrome repair, if any.
+    pub repaired_bit: Option<u16>,
     pub src: RxSrc,
 }
 
-pub static RX_QUEUE: Channel<CriticalSectionRawMutex, RxPacket, RX_QUEUE_DEPTH> = Channel::new();
+pub static RX_QUEUE: ModeRef<Channel<CriticalSectionRawMutex, RxPacket, RX_QUEUE_DEPTH>> =
+    ModeRef::new();
 
 /// Copies the first `len` bytes of `bytes` into the decode queue.
 ///
@@ -159,6 +161,7 @@ fn enqueue(
     len: usize,
     rpt: u32,
     fp: u16,
+    repaired_bit: Option<u16>,
     src: RxSrc,
 ) {
     let len = len.min(bytes.len());
@@ -172,6 +175,7 @@ fn enqueue(
         ch,
         pdu_type,
         crc_ok,
+        repaired_bit,
         src,
     };
     p.data[..len].copy_from_slice(&bytes[..len]);
@@ -216,9 +220,7 @@ struct SeenEntry {
 
 struct SeenCache(UnsafeCell<[SeenEntry; THROTTLE_SLOTS]>);
 unsafe impl Sync for SeenCache {}
-static SEEN: SeenCache = SeenCache(UnsafeCell::new(
-    [SeenEntry { used: false, addr: [0; 6], hash: 0, count: 0 }; THROTTLE_SLOTS],
-));
+static SEEN: ModeRef<SeenCache> = ModeRef::new();
 
 enum Repeat {
     New,
@@ -265,7 +267,12 @@ fn note_and_throttle(addr: [u8; 6], payload: &[u8]) -> Repeat {
             victim = i;
         }
     }
-    cache[victim] = SeenEntry { used: true, addr, hash, count: 0 };
+    cache[victim] = SeenEntry {
+        used: true,
+        addr,
+        hash,
+        count: 0,
+    };
     Repeat::New
 }
 
@@ -288,34 +295,99 @@ struct Stats {
     /// CRC-failed frames that passed the [`salvage`] plausibility gate and were
     /// logged anyway.
     salvaged: u32,
+    /// CRC-error PDUs corrected by the bounded one-bit syndrome search.
+    crc1fix: u32,
     strongest: i16,
+    /// 5 dBm RSSI histogram, −105…−30 — for the window median + weak-tail share.
+    rssi_hist: [u32; 28],
+}
+
+fn rssi_bucket(rssi: i16) -> usize {
+    ((rssi + 105) / 5).clamp(0, 27) as usize
 }
 
 struct StatsCell(UnsafeCell<Stats>);
 unsafe impl Sync for StatsCell {}
-static STATS: StatsCell = StatsCell(UnsafeCell::new(Stats {
-    cycles: 0,
-    pkts: 0,
-    crc_ok: 0,
-    suppressed: 0,
-    dropped: 0,
-    torn: 0,
-    salvaged: 0,
-    strongest: -128,
-}));
+static STATS: ModeRef<StatsCell> = ModeRef::new();
 
 /// Packets captured since boot, for [`crate::sniff_led`].
 ///
 /// [`Stats`] is reset at the end of every window, so it cannot be differenced by
 /// an observer on its own schedule. This one only ever counts up; the indicator
 /// samples it and takes the difference itself.
-pub static PKT_TOTAL: AtomicU32 = AtomicU32::new(0);
+pub static PKT_TOTAL: ModeRef<AtomicU32> = ModeRef::new();
 
 /// The [`crate::RADIO_RECOVERED`] reading at the last window emit, so `stats_tick`
 /// can report the per-window count as a difference. `RADIO_RECOVERED` only counts
 /// up (the LED and the log both want the all-time total intact), so the window
 /// figure is this subtraction rather than a field reset with the rest of [`Stats`].
-static RECOVERED_PREV: AtomicU32 = AtomicU32::new(0);
+static RECOVERED_PREV: ModeRef<AtomicU32> = ModeRef::new();
+
+/// All BLE-sniffer-only RAM. The binary places this in its boot-mode union,
+/// rather than allocating it beside every other selectable mode's state.
+pub struct Storage {
+    rx_buf: SyncBuf<258>,
+    pkt_buf: SyncBuf<258>,
+    rx_queue: Channel<CriticalSectionRawMutex, RxPacket, RX_QUEUE_DEPTH>,
+    seen: SeenCache,
+    stats: StatsCell,
+    pkt_total: AtomicU32,
+    recovered_prev: AtomicU32,
+}
+
+impl Storage {
+    pub const fn new() -> Self {
+        Self {
+            rx_buf: SyncBuf::new(),
+            pkt_buf: SyncBuf::new(),
+            rx_queue: Channel::new(),
+            seen: SeenCache(UnsafeCell::new(
+                [SeenEntry {
+                    used: false,
+                    addr: [0; 6],
+                    hash: 0,
+                    count: 0,
+                }; THROTTLE_SLOTS],
+            )),
+            stats: StatsCell(UnsafeCell::new(Stats {
+                cycles: 0,
+                pkts: 0,
+                crc_ok: 0,
+                suppressed: 0,
+                dropped: 0,
+                torn: 0,
+                salvaged: 0,
+                crc1fix: 0,
+                strongest: -128,
+                rssi_hist: [0; 28],
+            })),
+            pkt_total: AtomicU32::new(0),
+            recovered_prev: AtomicU32::new(0),
+        }
+    }
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Bind the module's hot-path handles to the selected union field.
+///
+/// # Safety
+/// The caller must invoke this exactly once before this mode spawns any task.
+pub unsafe fn bind_storage(storage: &'static Storage) {
+    unsafe {
+        RX_BUF.bind(&storage.rx_buf);
+        PKT_BUF.bind(&storage.pkt_buf);
+        RX_QUEUE.bind(&storage.rx_queue);
+        SEEN.bind(&storage.seen);
+        STATS.bind(&storage.stats);
+        PKT_TOTAL.bind(&storage.pkt_total);
+        RECOVERED_PREV.bind(&storage.recovered_prev);
+    }
+}
 
 fn stats_record(crc_ok: bool, rssi_dbm: i16, suppressed: bool) {
     let s = unsafe { &mut *STATS.0.get() };
@@ -330,6 +402,7 @@ fn stats_record(crc_ok: bool, rssi_dbm: i16, suppressed: bool) {
     if rssi_dbm > s.strongest {
         s.strongest = rssi_dbm;
     }
+    s.rssi_hist[rssi_bucket(rssi_dbm)] += 1;
 }
 
 fn stats_drop() {
@@ -349,6 +422,11 @@ fn stats_salvage() {
     s.salvaged += 1;
 }
 
+fn stats_crc1fix() {
+    let s = unsafe { &mut *STATS.0.get() };
+    s.crc1fix += 1;
+}
+
 /// Called once per scan cycle; emits and resets the window every STATS_CYCLES.
 fn stats_tick() {
     let s = unsafe { &mut *STATS.0.get() };
@@ -360,15 +438,52 @@ fn stats_tick() {
     // radio_stuck recoveries since the last window: RADIO_RECOVERED is monotonic,
     // so difference it here rather than resetting a Stats field.
     let recovered_now = crate::RADIO_RECOVERED.load(Ordering::Relaxed);
-    let recovered = recovered_now.wrapping_sub(RECOVERED_PREV.swap(recovered_now, Ordering::Relaxed));
-    // Every field describes the window that is about to be reset.
+    let recovered =
+        recovered_now.wrapping_sub(RECOVERED_PREV.swap(recovered_now, Ordering::Relaxed));
+    // Median + weak-tail (≤−85 dBm) from the window's RSSI histogram.
+    let mut med = -128i16;
+    let mut weak = 0u32;
+    let mut cum = 0u32;
+    for (i, &c) in s.rssi_hist.iter().enumerate() {
+        cum += c;
+        let dbm = i as i16 * 5 - 105;
+        if med == -128 && s.pkts > 0 && cum >= s.pkts / 2 {
+            med = dbm;
+        }
+        if dbm <= -85 {
+            weak += c;
+        }
+    }
+    let weak_pct = weak
+        .checked_mul(100)
+        .and_then(|w| w.checked_div(s.pkts))
+        .unwrap_or(0);
     ulogf!(
-        "[STAT] cycles={} pkts={} crc_ok={}% strongest={}dBm suppressed={} dropped={} torn={} salvaged={} recovered={}\r\n",
-        s.cycles, s.pkts, pct, s.strongest, s.suppressed, s.dropped, s.torn, s.salvaged, recovered
+        "[STAT] cycles={} pkts={} crc_ok={}% median={}dBm weak={}% strongest={}dBm suppressed={} dropped={} torn={} salvaged={} crc1fix={} recovered={}\r\n",
+        s.cycles,
+        s.pkts,
+        pct,
+        med,
+        weak_pct,
+        s.strongest,
+        s.suppressed,
+        s.dropped,
+        s.torn,
+        s.salvaged,
+        s.crc1fix,
+        recovered
     );
     *s = Stats {
-        cycles: 0, pkts: 0, crc_ok: 0, suppressed: 0, dropped: 0, torn: 0, salvaged: 0,
+        cycles: 0,
+        pkts: 0,
+        crc_ok: 0,
+        suppressed: 0,
+        dropped: 0,
+        torn: 0,
+        salvaged: 0,
+        crc1fix: 0,
         strongest: -128,
+        rssi_hist: [0; 28],
     };
 }
 
@@ -407,7 +522,10 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
         // far) also leave the radio disabled instead of tripping the restore's
         // `ensure_disabled` as a spurious radio_stuck.
         disable_silent();
-        if hops >= AUX_MAX_HOPS { ulog!("[ERR] aux_max_hops\r\n"); break; }
+        if hops >= AUX_MAX_HOPS {
+            ulog!("[ERR] aux_max_hops\r\n");
+            break;
+        }
         hops += 1;
 
         // PHY: 1M, 2M, and Coded (LE Long Range) are all followed.
@@ -415,14 +533,23 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
             0 => (vals::Mode::Ble1mbit, vals::Plen::_8bit, false),
             1 => (vals::Mode::Ble2mbit, vals::Plen::_16bit, false),
             2 => (vals::Mode::BleLr125kbit, vals::Plen::LongRange, true),
-            _ => { ulog!("[ERR] aux_bad_phy\r\n"); break; }
+            _ => {
+                ulog!("[ERR] aux_bad_phy\r\n");
+                break;
+            }
         };
         let freq = match data_ch_freq(aux.chan) {
             Some(f) => f,
-            None => { ulog!("[ERR] aux_bad_ch\r\n"); break; }
+            None => {
+                ulog!("[ERR] aux_bad_ch\r\n");
+                break;
+            }
         };
         // A distant aux would stall the primary scan for tens of ms; skip it.
-        if aux.offset_us > AUX_MAX_LEAD_US { ulog!("[ERR] aux_offset_far\r\n"); break; }
+        if aux.offset_us > AUX_MAX_LEAD_US {
+            ulog!("[ERR] aux_offset_far\r\n");
+            break;
+        }
 
         // Schedule against the absolute air-start reference: the aux airs at
         // `t_ref + offset`. Open RX AUX_OPEN_LEAD_US before that (radio ramp +
@@ -444,8 +571,15 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
         // Safe across the yield because the scan task is the sole owner of the
         // RADIO in this mode; the decode and log tasks never touch it.
         r.mode().write(|w| w.set_mode(mode));
-        if coded { set_pcnf0_coded(); } else { set_pcnf0(plen); }
-        r.frequency().write(|w| { w.set_frequency(freq); w.set_map(vals::Map::Default); });
+        if coded {
+            set_pcnf0_coded();
+        } else {
+            set_pcnf0(plen);
+        }
+        r.frequency().write(|w| {
+            w.set_frequency(freq);
+            w.set_map(vals::Map::Default);
+        });
         r.datawhiteiv().write(|w| w.set_datawhiteiv(aux.chan));
         r.packetptr().write_value(RX_BUF.0.get() as u32);
 
@@ -475,7 +609,11 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
         // fixed span covering clock drift + air time.
         let mut got = false;
         let mut t_aux_end = Instant::now();
-        let window_us = if coded { AUX_RX_WINDOW_CODED_US } else { AUX_RX_WINDOW_US };
+        let window_us = if coded {
+            AUX_RX_WINDOW_CODED_US
+        } else {
+            AUX_RX_WINDOW_US
+        };
         for _ in 0..(window_us / 200 + 1) {
             if r.events_end().read() != 0 {
                 r.events_end().write_value(0);
@@ -489,12 +627,15 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
         disable_silent();
         disarm_rxen();
 
-        if !got { ulog!("[ERR] aux_miss\r\n"); break; }
+        if !got {
+            ulog!("[ERR] aux_miss\r\n");
+            break;
+        }
 
-        let crc_ok   = r.events_crcok().read() != 0;
+        let crc_ok = r.events_crcok().read() != 0;
         let rssi_dbm = -(r.rssisample().read().rssisample() as i16);
-        let buf      = unsafe { &*RX_BUF.0.get() };
-        let length   = buf[1]; // ext-adv length is a full 8-bit field (LFLEN=8)
+        let buf = unsafe { &*RX_BUF.0.get() };
+        let length = buf[1]; // ext-adv length is a full 8-bit field (LFLEN=8)
         let payload_len = (length as usize).min(buf.len().saturating_sub(2));
 
         // Air-start of the aux just received. Uncoded: (10 + len) bytes × per-byte
@@ -510,8 +651,19 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
         let t_air = t_aux_end - Duration::from_micros(air_us);
 
         if !crc_ok {
-            enqueue(buf, t_air, aux.chan, rssi_dbm, false, 0xFF, 2 + payload_len, 0, 0,
-                RxSrc::Aux { phy: aux.phy, adi });
+            enqueue(
+                buf,
+                t_air,
+                aux.chan,
+                rssi_dbm,
+                false,
+                0xFF,
+                2 + payload_len,
+                0,
+                0,
+                None,
+                RxSrc::Aux { phy: aux.phy, adi },
+            );
             break;
         }
 
@@ -528,8 +680,19 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
             sync_seen = Some((si, t_air, aux.phy));
         }
 
-        enqueue(buf, t_air, aux.chan, rssi_dbm, true, 0x07, 2 + payload_len, 0, 0,
-            RxSrc::Aux { phy: aux.phy, adi });
+        enqueue(
+            buf,
+            t_air,
+            aux.chan,
+            rssi_dbm,
+            true,
+            0x07,
+            2 + payload_len,
+            0,
+            0,
+            None,
+            RxSrc::Aux { phy: aux.phy, adi },
+        );
 
         // ADI collision check: an aux channel is shared, so the packet we caught
         // may belong to a different advertiser. If the trigger's ADI and the aux's
@@ -537,7 +700,11 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
         if let (Some(want), Some(got_adi)) = (adi, ext.adi)
             && want != got_adi
         {
-            ulogf!("[ERR] aux_adi_mismatch want=0x{:03X} got=0x{:03X}\r\n", want, got_adi);
+            ulogf!(
+                "[ERR] aux_adi_mismatch want=0x{:03X} got=0x{:03X}\r\n",
+                want,
+                got_adi
+            );
             break;
         }
 
@@ -612,9 +779,16 @@ async fn capture_ext_pdu(
     if coded {
         set_pcnf0_coded();
     } else {
-        set_pcnf0(if phy == 1 { vals::Plen::_16bit } else { vals::Plen::_8bit });
+        set_pcnf0(if phy == 1 {
+            vals::Plen::_16bit
+        } else {
+            vals::Plen::_8bit
+        });
     }
-    r.frequency().write(|w| { w.set_frequency(freq); w.set_map(vals::Map::Default); });
+    r.frequency().write(|w| {
+        w.set_frequency(freq);
+        w.set_map(vals::Map::Default);
+    });
     r.datawhiteiv().write(|w| w.set_datawhiteiv(chan));
     r.packetptr().write_value(RX_BUF.0.get() as u32);
     r.events_end().write_value(0);
@@ -654,7 +828,12 @@ async fn capture_ext_pdu(
         2 => 400 + (5 + length as u64) * 64,
         _ => (10 + length as u64) * 8,
     };
-    Some(ExtCapture { t_air: t_end - Duration::from_micros(air_us), crc_ok, payload_len, rssi_dbm })
+    Some(ExtCapture {
+        t_air: t_end - Duration::from_micros(air_us),
+        crc_ok,
+        payload_len,
+        rssi_dbm,
+    })
 }
 
 /// Follow a periodic advertising train announced by `si`, caught in an
@@ -669,7 +848,12 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
         || interval_us == 0
         || interval_us > PSYNC_MAX_INTERVAL_US
     {
-        ulogf!("[ERR] psync_skip aa=0x{:08X} off={}us int={}us\r\n", si.aa, si.offset_us, interval_us);
+        ulogf!(
+            "[ERR] psync_skip aa=0x{:08X} off={}us int={}us\r\n",
+            si.aa,
+            si.offset_us,
+            interval_us
+        );
         return;
     }
     if phy > 2 {
@@ -678,7 +862,11 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
     }
 
     let coded = phy == 2;
-    let window_us = if coded { AUX_RX_WINDOW_CODED_US } else { PSYNC_RX_WINDOW_US };
+    let window_us = if coded {
+        AUX_RX_WINDOW_CODED_US
+    } else {
+        PSYNC_RX_WINDOW_US
+    };
     let chan_id = csa2::chan_id(si.aa);
     let mut counter = si.event_counter;
     // First AUX_SYNC_IND airs at the anchor + SyncInfo offset.
@@ -694,7 +882,10 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
     while events < PSYNC_MAX_EVENTS && miss < PSYNC_MAX_MISS {
         let (ch, freq) = match csa2::channel(counter, chan_id, &si.chm) {
             Some(cf) => cf,
-            None => { ulog!("[ERR] psync_no_chan\r\n"); break; }
+            None => {
+                ulog!("[ERR] psync_no_chan\r\n");
+                break;
+            }
         };
         let open_at = t_ref - Duration::from_micros(PSYNC_OPEN_LEAD_US as u64);
         let cap = capture_ext_pdu(ch, freq, phy, open_at, window_us).await;
@@ -707,9 +898,19 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
         };
 
         let plen = cap.payload_len;
-        enqueue(unsafe { &*RX_BUF.0.get() }, cap.t_air, ch, cap.rssi_dbm, cap.crc_ok,
-            if cap.crc_ok { 0x07 } else { 0xFF }, 2 + plen, 0, 0,
-            RxSrc::Aux { phy, adi: None });
+        enqueue(
+            unsafe { &*RX_BUF.0.get() },
+            cap.t_air,
+            ch,
+            cap.rssi_dbm,
+            cap.crc_ok,
+            if cap.crc_ok { 0x07 } else { 0xFF },
+            2 + plen,
+            0,
+            0,
+            None,
+            RxSrc::Aux { phy, adi: None },
+        );
 
         if !cap.crc_ok {
             miss += 1;
@@ -736,16 +937,33 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
                 Some(f) => f,
                 None => break,
             };
-            let cwin = if cx.phy == 2 { AUX_RX_WINDOW_CODED_US } else { PSYNC_RX_WINDOW_US };
+            let cwin = if cx.phy == 2 {
+                AUX_RX_WINDOW_CODED_US
+            } else {
+                PSYNC_RX_WINDOW_US
+            };
             let copen = chain_ref + Duration::from_micros(cx.offset_us as u64)
                 - Duration::from_micros(PSYNC_OPEN_LEAD_US as u64);
             let Some(cc) = capture_ext_pdu(cx.chan, cfreq, cx.phy, copen, cwin).await else {
                 break;
             };
             let cplen = cc.payload_len;
-            enqueue(unsafe { &*RX_BUF.0.get() }, cc.t_air, cx.chan, cc.rssi_dbm, cc.crc_ok,
-                if cc.crc_ok { 0x07 } else { 0xFF }, 2 + cplen, 0, 0,
-                RxSrc::Aux { phy: cx.phy, adi: None });
+            enqueue(
+                unsafe { &*RX_BUF.0.get() },
+                cc.t_air,
+                cx.chan,
+                cc.rssi_dbm,
+                cc.crc_ok,
+                if cc.crc_ok { 0x07 } else { 0xFF },
+                2 + cplen,
+                0,
+                0,
+                None,
+                RxSrc::Aux {
+                    phy: cx.phy,
+                    adi: None,
+                },
+            );
             if !cc.crc_ok {
                 break;
             }
@@ -758,8 +976,15 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
     }
 
     let ms_x100 = si.interval_125us as u32 * 125;
-    ulogf!("psync aa=0x{:08X} evt0={} interval={}.{:02}ms events={} miss={}\r\n",
-        si.aa, si.event_counter, ms_x100 / 100, ms_x100 % 100, events, miss);
+    ulogf!(
+        "psync aa=0x{:08X} evt0={} interval={}.{:02}ms events={} miss={}\r\n",
+        si.aa,
+        si.event_counter,
+        ms_x100 / 100,
+        ms_x100 % 100,
+        events,
+        miss
+    );
 
     // Restore advertising AA/CRCInit + 1M primary for the scanner.
     ensure_disabled();
@@ -775,7 +1000,7 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
 // so active channels return within ~150 µs of a packet landing (and we timestamp
 // it for aux scheduling); quiet channels burn the full (jittered) dwell window.
 // Any AuxPtr is followed inline before moving on.
-pub async fn scan(rng: &mut Rng) {
+pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
     // ── Polling-based BLE advertising packet detection ────────────────────────
     // Interrupt-driven reception (ISR) was not working — neither #[no_mangle]
     // nor bind_interrupts! correctly wired the RADIO vector on this embassy-nrf
@@ -797,7 +1022,10 @@ pub async fn scan(rng: &mut Rng) {
         let r = pac::RADIO;
 
         ensure_disabled();
-        r.frequency().write(|w| { w.set_frequency(freq); w.set_map(vals::Map::Default); });
+        r.frequency().write(|w| {
+            w.set_frequency(freq);
+            w.set_map(vals::Map::Default);
+        });
         r.datawhiteiv().write(|w| w.set_datawhiteiv(ch_idx));
         r.packetptr().write_value(RX_BUF.0.get() as u32);
 
@@ -823,9 +1051,8 @@ pub async fn scan(rng: &mut Rng) {
         });
         r.tasks_rxen().write_value(1);
 
-        let dwell = Duration::from_micros(
-            (ADV_DWELL_MS + rng.below(ADV_DWELL_JITTER_MS) as u64) * 1000,
-        );
+        let dwell =
+            Duration::from_micros((ADV_DWELL_MS + rng.below(ADV_DWELL_JITTER_MS) as u64) * 1000);
         let deadline = Instant::now() + dwell;
         // Set when an AuxPtr was followed: the radio has been retuned and
         // reconfigured, so this channel visit is over.
@@ -842,8 +1069,11 @@ pub async fn scan(rng: &mut Rng) {
             // (ADDRESS→RSSISTART re-samples RSSI on the next address match),
             // then snapshot the buffer, then check whether we won the race.
             r.events_end().write_value(0);
-            let t_end  = Instant::now();
-            let crc_ok = r.events_crcok().read() != 0;
+            let t_end = Instant::now();
+            let mut crc_ok = r.events_crcok().read() != 0;
+            // Read RXCRC before END_START can receive and overwrite it with the
+            // next packet. We only use this value after snapshotting the PDU.
+            let rxcrc = r.rxcrc().read().rxcrc();
             r.events_crcok().write_value(0);
             r.events_crcerror().write_value(0);
             let rssi_dbm = -(r.rssisample().read().rssisample() as i16);
@@ -860,17 +1090,41 @@ pub async fn scan(rng: &mut Rng) {
                 continue;
             }
 
+            // Work solely on the private snapshot, never on RX_BUF while the
+            // hardware is listening again. The search is bounded to one payload
+            // bit (≤2,064 state updates); if a new address arrives while it runs,
+            // drop this candidate and return to the next packet immediately.
+            let repaired_bit = unsafe {
+                let pdu = &mut (&mut *PKT_BUF.0.get())[..n];
+                if crc_ok {
+                    crc_repair.observe_good(pdu, ADV_CRC_INIT, rxcrc);
+                    None
+                } else {
+                    crc_repair.repair_one_payload_bit_until(pdu, ADV_CRC_INIT, rxcrc, || {
+                        r.events_address().read() != 0
+                    })
+                }
+            };
+            if r.events_address().read() != 0 {
+                stats_torn();
+                continue;
+            }
+            if repaired_bit.is_some() {
+                crc_ok = true;
+                stats_crc1fix();
+            }
+
             let buf = &unsafe { &*PKT_BUF.0.get() }[..n];
             // BLE 5 advertising PDU header Length is a full 8 bits. Masking it
             // to 6 (the BLE 4.0 field width) truncated every ADV_EXT_IND
             // payload over 63 bytes.
-            let length   = buf[1];
+            let length = buf[1];
             let pdu_type = if crc_ok { buf[0] & 0x0F } else { 0xFF };
 
             // ADV_EXT_IND carries no legacy AdvA at the payload start (its AdvA,
             // if present, lives in the extended header), so it has no address to
             // classify or throttle on here.
-            let is_ext      = pdu_type == 0x07;
+            let is_ext = pdu_type == 0x07;
             // A CRC-failed reception has no trustworthy header: `length`, the
             // TxAdd bit and the six bytes that would be AdvA all come out of a
             // corrupted buffer. Reporting them produced a fabricated address —
@@ -881,7 +1135,7 @@ pub async fn scan(rng: &mut Rng) {
             // short (as little as the 2-byte header) while the length byte still
             // claims ≥6 — reading the 6-byte AdvA at buf[2..8] then indexes past the
             // buffer and panics. Require the buffer to actually hold the AdvA.
-            let has_addr    = crc_ok && !is_ext && length >= 6 && n >= 8;
+            let has_addr = crc_ok && !is_ext && length >= 6 && n >= 8;
             let payload_len = (length as usize).min(buf.len().saturating_sub(2));
 
             // ── Repeat throttling ────────────────────────────────────────────
@@ -932,8 +1186,19 @@ pub async fn scan(rng: &mut Rng) {
             let t_air = t_end - Duration::from_micros((10 + length as u64) * 8);
 
             let rpt = if let Repeat::Again(n) = repeat { n } else { 0 };
-            enqueue(buf, t_air, ch_idx, rssi_dbm, crc_ok, pdu_type, 2 + payload_len,
-                rpt, fp, RxSrc::Primary);
+            enqueue(
+                buf,
+                t_air,
+                ch_idx,
+                rssi_dbm,
+                crc_ok,
+                pdu_type,
+                2 + payload_len,
+                rpt,
+                fp,
+                repaired_bit,
+                RxSrc::Primary,
+            );
 
             // ── Follow AuxPtr to the secondary channel ───────────────────────
             // Runs inline: preempts the remaining channel walk and delays the
@@ -969,7 +1234,10 @@ impl crate::mode::Frame for RxPacket {
         self.t_air
     }
     fn decode_to<S: crate::Sink>(&self, out: &mut S) {
-        let d = Decoded { hdr: Header::parse(self), pkt: self };
+        let d = Decoded {
+            hdr: Header::parse(self),
+            pkt: self,
+        };
         d.write_text_to(out);
     }
     fn ch(&self) -> u8 {
@@ -1168,26 +1436,31 @@ fn salvage(buf: &[u8]) -> Option<u8> {
         }
         i += 1 + l;
     }
-    if i == buf.len() {
-        Some(t)
-    } else {
-        None
-    }
+    if i == buf.len() { Some(t) } else { None }
 }
 
 fn emit_primary(p: &RxPacket, h: &Header) {
-    let buf      = &p.data[..p.len as usize];
-    let length   = p.len - 2; // the on-air length field, as captured
-    let hdr0     = buf[0];
-    let tx_add   = (hdr0 >> 6) & 1; // 1=random, 0=public
-    let crc_ok   = p.crc_ok;
-    let ch_idx   = p.ch;
+    let buf = &p.data[..p.len as usize];
+    let length = p.len - 2; // the on-air length field, as captured
+    let hdr0 = buf[0];
+    let tx_add = (hdr0 >> 6) & 1; // 1=random, 0=public
+    let crc_ok = p.crc_ok;
+    let ch_idx = p.ch;
     let rssi_dbm = p.rssi_dbm;
+
+    if let Some(bit) = p.repaired_bit {
+        emitf!(
+            "CRC-REPAIRED one-bit ch={} pdu_byte={} bit={}\r\n",
+            ch_idx,
+            bit / 8,
+            bit % 8
+        );
+    }
 
     // The header fields (name, address, classification, len, crc, …) are the
     // typed `Header` parsed in `Header::parse`; the header line is rendered from
     // it below. The locals above stay for the body/salvage decode that follows.
-    let is_ext   = p.pdu_type == 0x07;
+    let is_ext = p.pdu_type == 0x07;
 
     // Where the hex dump at the bottom starts, as an offset into the payload
     // (`buf[2..]`), or `None` for no dump at all. Every decode path below narrows
@@ -1205,13 +1478,32 @@ fn emit_primary(p: &RxPacket, h: &Header) {
         // Header line rendered from the typed `Header` and routed through the sink
         // (byte-identical to the previous `ulogf!` form).
         let mut line = decoder::LogStr::new();
-        let _ = write!(line,
+        let _ = write!(
+            line,
             "{} ch={} rssi={} len={} addr={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} {} fp={:04X} crc={}",
-            h.name(), h.ch, h.rssi_dbm, h.len,
-            ad[0], ad[1], ad[2], ad[3], ad[4], ad[5], h.addr_type(), h.fp,
-            if h.crc_ok { "ok" } else { "err" });
+            h.name(),
+            h.ch,
+            h.rssi_dbm,
+            h.len,
+            ad[0],
+            ad[1],
+            ad[2],
+            ad[3],
+            ad[4],
+            ad[5],
+            h.addr_type(),
+            h.fp,
+            if h.crc_ok { "ok" } else { "err" }
+        );
         if h.rpt > 0 {
             let _ = write!(line, " rpt={}", h.rpt);
+        }
+        // A legacy (non-extended) advertising PDU physically cannot exceed
+        // 39 bytes (2 header + 6 AdvA + 31 AdvData). A longer one that still
+        // passes CRC is a non-conforming transmitter (or a decode artifact) —
+        // flag it so the impossible length isn't read as normal traffic.
+        if !h.is_ext && h.len > 39 {
+            let _ = write!(line, " [oversized legacy PDU {}B — non-conforming]", h.len);
         }
         let _ = write!(line, "\r\n");
         decoder::emit(line);
@@ -1245,9 +1537,15 @@ fn emit_primary(p: &RxPacket, h: &Header) {
         }
     } else if h.crc_ok {
         let mut line = decoder::LogStr::new();
-        let _ = write!(line, "{} ch={} rssi={} len={} {} crc=ok\r\n",
-            h.name(), h.ch, h.rssi_dbm, h.len,
-            if tx_add == 1 { "rand" } else { "pub" });
+        let _ = write!(
+            line,
+            "{} ch={} rssi={} len={} {} crc=ok\r\n",
+            h.name(),
+            h.ch,
+            h.rssi_dbm,
+            h.len,
+            if tx_add == 1 { "rand" } else { "pub" }
+        );
         decoder::emit(line);
     } else {
         // Channel and RSSI are measured by the radio and stand on their own;
@@ -1262,21 +1560,37 @@ fn emit_primary(p: &RxPacket, h: &Header) {
             Some(t) => {
                 stats_salvage();
                 let a = &buf[2..8];
-                emitf!("CRC-ERR ch={} rssi={} rawlen={} crc=err salvaged={} \
+                emitf!(
+                    "CRC-ERR ch={} rssi={} rawlen={} crc=err salvaged={} \
                         addr?={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}\r\n",
-                    ch_idx, rssi_dbm, length, pdu_name(t),
-                    a[5], a[4], a[3], a[2], a[1], a[0]);
+                    ch_idx,
+                    rssi_dbm,
+                    length,
+                    pdu_name(t),
+                    a[5],
+                    a[4],
+                    a[3],
+                    a[2],
+                    a[1],
+                    a[0]
+                );
                 // Every field on the following lines is unverified: the trailing
                 // `?` on `addr?` above and this marker are the only claim made
                 // for them. Nothing here reaches the repeat throttle — a salvaged
                 // address is for a human reading the log, not for state that has
                 // to be defensible.
-                emitf!("  (salvaged: header and AD structure both walk clean; \
-                        CRC still failed — treat every field as unverified)\r\n");
+                emitf!(
+                    "  (salvaged: header and AD structure both walk clean; \
+                        CRC still failed — treat every field as unverified)\r\n"
+                );
                 if matches!(t, 0x00 | 0x02 | 0x04 | 0x06) && length > 6 {
                     let adva = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
                     let ad = &buf[8..];
-                    unparsed = tail(6, decoder::log_ad_structures(ad, Some(adva), false), ad.len());
+                    unparsed = tail(
+                        6,
+                        decoder::log_ad_structures(ad, Some(adva), false),
+                        ad.len(),
+                    );
                 }
             }
             None => {
@@ -1284,8 +1598,12 @@ fn emit_primary(p: &RxPacket, h: &Header) {
                 // no byte worth printing: the header line's channel and RSSI are
                 // measured, the payload is noise. This is the single largest
                 // source of log volume in a busy capture, so it stops here.
-                emitf!("CRC-ERR ch={} rssi={} rawlen={} crc=err\r\n",
-                    ch_idx, rssi_dbm, length);
+                emitf!(
+                    "CRC-ERR ch={} rssi={} rawlen={} crc=err\r\n",
+                    ch_idx,
+                    rssi_dbm,
+                    length
+                );
                 unparsed = None;
             }
         }
@@ -1302,14 +1620,22 @@ fn emit_primary(p: &RxPacket, h: &Header) {
             // The walk reports whole-payload success or nothing; unlike the AD
             // walk it cannot say *where* it gave up, because a malformed
             // extended header invalidates every offset derived from it.
-            unparsed = if decoder::decode_ext_adv(&buf[2..]).ok { None } else { Some(0) };
+            unparsed = if decoder::decode_ext_adv(&buf[2..]).ok {
+                None
+            } else {
+                Some(0)
+            };
         } else if matches!(p.pdu_type, 0x00 | 0x02 | 0x04 | 0x06) && length > 6 {
             // Legacy undirected adv / scan-response: AdvA[6] then AD structures.
             // Pass AdvA (buf[2..8], on-air LE) so the decoder can flag "mfg data
             // == own address".
             let adva = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
             let ad = &buf[8..];
-            unparsed = tail(6, decoder::log_ad_structures(ad, Some(adva), true), ad.len());
+            unparsed = tail(
+                6,
+                decoder::log_ad_structures(ad, Some(adva), true),
+                ad.len(),
+            );
         } else if matches!(p.pdu_type, 0x01 | 0x03) && length == 12 {
             // ADV_DIRECT_IND (AdvA, TargetA) and SCAN_REQ (ScanA, AdvA) carry two
             // addresses and nothing else. The header line already named the first
@@ -1328,12 +1654,28 @@ fn emit_primary(p: &RxPacket, h: &Header) {
                     0b11 => "rand-static",
                     0b01 => "rand-rpa",
                     0b00 => "rand-nonres",
-                    _    => "rand-rfu",
+                    _ => "rand-rfu",
                 }
             };
             let role = if p.pdu_type == 0x01 { "target" } else { "adv" };
-            ulogf!("  {}={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} {}\r\n",
-                role, b[5], b[4], b[3], b[2], b[1], b[0], bt);
+            ulogf!(
+                "  {}={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} {}\r\n",
+                role,
+                b[5],
+                b[4],
+                b[3],
+                b[2],
+                b[1],
+                b[0],
+                bt
+            );
+            unparsed = None;
+        } else if p.pdu_type == 0x04 && length == 6 {
+            // A SCAN_RSP carrying exactly the responder's own address and
+            // nothing else — a non-conforming reply that echoes its AdvA back.
+            // There is no AD data to decode; name it instead of dumping 6 raw
+            // bytes (these were the whole SCAN_RSP coverage gap).
+            ulogf!("  (address-echo SCAN_RSP — no AD data)\r\n");
             unparsed = None;
         } else if p.pdu_type == 0x05 && length == 34 {
             // CONNECT_IND: InitA[6] AdvA[6] LLData[22]. Sniff mode only decodes
@@ -1379,27 +1721,46 @@ fn emit_primary(p: &RxPacket, h: &Header) {
 /// The dump start for a walk that consumed `consumed` of `total` bytes beginning
 /// at payload offset `base`, or `None` when it consumed all of them.
 fn tail(base: usize, consumed: usize, total: usize) -> Option<usize> {
-    if consumed >= total { None } else { Some(base + consumed) }
+    if consumed >= total {
+        None
+    } else {
+        Some(base + consumed)
+    }
 }
 
 /// Logs a packet caught by following an AuxPtr onto a secondary channel.
 fn emit_aux(p: &RxPacket, phy: u8, adi: Option<u16>) {
-    let buf    = &p.data[..p.len as usize];
+    let buf = &p.data[..p.len as usize];
     let length = p.len - 2;
 
     if !p.crc_ok {
-        emitf!("AUX_ADV_IND ch={} rssi={} len={} crc=err\r\n",
-            p.ch, p.rssi_dbm, length);
+        emitf!(
+            "AUX_ADV_IND ch={} rssi={} len={} crc=err\r\n",
+            p.ch,
+            p.rssi_dbm,
+            length
+        );
         return;
     }
 
     // The ADI shown is the trigger's — the scan's collision check confirms the
     // aux matches it.
     match adi {
-        Some(a) => emitf!("AUX_ADV_IND ch={} phy={} rssi={} len={} adi=0x{:03X} crc=ok\r\n",
-            p.ch, if phy == 1 { "2M" } else { "1M" }, p.rssi_dbm, length, a),
-        None => emitf!("AUX_ADV_IND ch={} phy={} rssi={} len={} crc=ok\r\n",
-            p.ch, if phy == 1 { "2M" } else { "1M" }, p.rssi_dbm, length),
+        Some(a) => emitf!(
+            "AUX_ADV_IND ch={} phy={} rssi={} len={} adi=0x{:03X} crc=ok\r\n",
+            p.ch,
+            if phy == 1 { "2M" } else { "1M" },
+            p.rssi_dbm,
+            length,
+            a
+        ),
+        None => emitf!(
+            "AUX_ADV_IND ch={} phy={} rssi={} len={} crc=ok\r\n",
+            p.ch,
+            if phy == 1 { "2M" } else { "1M" },
+            p.rssi_dbm,
+            length
+        ),
     }
 
     if !decoder::decode_ext_adv(&buf[2..]).ok {
@@ -1433,7 +1794,11 @@ impl<K: super::CaptureSink> Default for BleSniff<K> {
 impl<K: super::CaptureSink> Mode for BleSniff<K> {
     type Sink = K;
 
-    async fn init<F: core::future::Future<Output = ()>>(&mut self, _ctx: &'static Ctx<K>, setup: F) {
+    async fn init<F: core::future::Future<Output = ()>>(
+        &mut self,
+        _ctx: &'static Ctx<K>,
+        setup: F,
+    ) {
         // Build-specific plumbing first (USB: QSPI asset window + provisioning + LED;
         // headless: LED task) — the mode stays oblivious to which.
         setup.await;
@@ -1454,8 +1819,9 @@ impl<K: super::CaptureSink> Mode for BleSniff<K> {
         let sink = ctx.sink();
 
         let produce = async {
+            let mut crc_repair = BleCrcRepair::default();
             loop {
-                scan(rng).await;
+                scan(rng, &mut crc_repair).await;
             }
         };
         // Decode/format overlaps reception: the radio is listening again while

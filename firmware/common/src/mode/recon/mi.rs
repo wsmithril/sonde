@@ -6,12 +6,11 @@
 use embassy_time::{Duration, Instant};
 
 use crate::central::{
-    ATT_HANDLE_VALUE_IND, ATT_HANDLE_VALUE_NTF, Conn, LISTEN_EVENTS, MAX_CONSEC_MISS,
-    RX_BUF, Reasm, Service, conn_event, listen_notifications, stage_empty, update_flow,
-    walk_services,
+    ATT_HANDLE_VALUE_IND, ATT_HANDLE_VALUE_NTF, Conn, LISTEN_EVENTS, MAX_CONSEC_MISS, RX_BUF,
+    Reasm, Service, conn_event, listen_notifications, stage_empty, update_flow, walk_services,
 };
-use crate::device::mi;
 use crate::decoder;
+use crate::device::mi;
 
 /// Mi Body Composition Scale probe: hold the link with the measurement channel
 /// subscribed and wait for a weigh-in — the scale only pushes a 13-byte
@@ -22,7 +21,10 @@ pub(super) async fn probe_scale(conn: &mut Conn, prof: &mi::Profile) {
     let mut miss = 0u32;
     let mut got = 0u32;
     let deadline = Instant::now() + Duration::from_secs(60);
-    ulogf!("  miscale: awaiting a weigh-in on h={:04X} (60 s)\r\n", prof.notify_h);
+    ulogf!(
+        "  miscale: awaiting a weigh-in on h={:04X} (60 s)\r\n",
+        prof.notify_h
+    );
     while Instant::now() < deadline {
         let Some(rx) = conn_event(conn, stage_empty(conn)).await else {
             miss += 1;
@@ -53,15 +55,28 @@ pub(super) async fn probe_scale(conn: &mut Conn, prof: &mi::Profile) {
                         ulogf!(
                             "  miscale: WEIGH-IN {} {:04}-{:02}-{:02} {:02}:{:02}:{:02} weight={:.2} kg impedance={} {}\r\n",
                             if m.lbs { "(lbs)" } else { "(kg)" },
-                            m.year, m.month, m.day, m.hour, m.minute, m.second,
-                            m.weight_kg(), m.impedance,
-                            if m.has_impedance { "(composition possible)" } else { "(no impedance)" }
+                            m.year,
+                            m.month,
+                            m.day,
+                            m.hour,
+                            m.minute,
+                            m.second,
+                            m.weight_kg(),
+                            m.impedance,
+                            if m.has_impedance {
+                                "(composition possible)"
+                            } else {
+                                "(no impedance)"
+                            }
                         );
                         got += 1;
                     }
                     None => {
-                        ulogf!("  miscale: notification h={:04X} len={} (not a measurement)\r\n",
-                            prof.notify_h, val.len());
+                        ulogf!(
+                            "  miscale: notification h={:04X} len={} (not a measurement)\r\n",
+                            prof.notify_h,
+                            val.len()
+                        );
                         decoder::hexdump(val, 0, 4);
                     }
                 }

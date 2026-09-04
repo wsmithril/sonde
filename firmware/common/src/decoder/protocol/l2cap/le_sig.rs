@@ -6,7 +6,7 @@
 
 use core::fmt::Write;
 
-use super::{line, send, u16le, write_interval, Decoder};
+use super::{Decoder, line, send, u16le, write_interval};
 
 pub struct LeSig;
 
@@ -22,7 +22,12 @@ impl Decoder<u16> for LeSig {
             return;
         }
         crate::ulogf!(
-            "  LE_SIG {} (0x{:02X}) id={} plen={}\r\n", Self::name(op), op, d[1], u16le(d, 2));
+            "  LE_SIG {} (0x{:02X}) id={} plen={}\r\n",
+            Self::name(op),
+            op,
+            d[1],
+            u16le(d, 2)
+        );
         let p = &d[4..];
         match op {
             // Disconnection Req / Rsp: the two channel endpoints.
@@ -42,14 +47,22 @@ impl Decoder<u16> for LeSig {
                 let _ = s.push_str("..");
                 write_interval(&mut s, u16le(p, 2));
                 let _ = write!(
-                    s, " latency={} timeout={}ms", u16le(p, 4), u16le(p, 6) as u32 * 10);
+                    s,
+                    " latency={} timeout={}ms",
+                    u16le(p, 4),
+                    u16le(p, 6) as u32 * 10
+                );
                 send(s);
             }
             0x13 if p.len() >= 2 => {
                 let mut s = line();
                 let r = u16le(p, 0);
                 let _ = write!(
-                    s, "result={} ({})", r, if r == 0 { "accepted" } else { "rejected" });
+                    s,
+                    "result={} ({})",
+                    r,
+                    if r == 0 { "accepted" } else { "rejected" }
+                );
                 send(s);
             }
             // LE Credit Based Connection Req: SPSM, source CID, MTU, MPS, and
@@ -57,8 +70,13 @@ impl Decoder<u16> for LeSig {
             0x14 if p.len() >= 10 => {
                 let mut s = line();
                 let _ = write!(
-                    s, "spsm=0x{:04X} scid=0x{:04X} mtu={} mps={} credits={}",
-                    u16le(p, 0), u16le(p, 2), u16le(p, 4), u16le(p, 6), u16le(p, 8)
+                    s,
+                    "spsm=0x{:04X} scid=0x{:04X} mtu={} mps={} credits={}",
+                    u16le(p, 0),
+                    u16le(p, 2),
+                    u16le(p, 4),
+                    u16le(p, 6),
+                    u16le(p, 8)
                 );
                 send(s);
             }
@@ -66,8 +84,14 @@ impl Decoder<u16> for LeSig {
                 let mut s = line();
                 let res = u16le(p, 8);
                 let _ = write!(
-                    s, "dcid=0x{:04X} mtu={} mps={} credits={} result=0x{:04X} ({})",
-                    u16le(p, 0), u16le(p, 2), u16le(p, 4), u16le(p, 6), res, Self::conn_result(res)
+                    s,
+                    "dcid=0x{:04X} mtu={} mps={} credits={} result=0x{:04X} ({})",
+                    u16le(p, 0),
+                    u16le(p, 2),
+                    u16le(p, 4),
+                    u16le(p, 6),
+                    res,
+                    Self::conn_result(res)
                 );
                 send(s);
             }

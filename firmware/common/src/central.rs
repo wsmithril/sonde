@@ -23,9 +23,10 @@
 //! only disarms the direction-flip short once it has fired, so neither chain
 //! loops. `PACKETPTR` is *latched at each START
 //! task*, so swapping it after a START safely redirects only the next
-//! transfer. Connection-event *anchors* are absolute `Timer::at` deadlines (as in
-//! [`crate::mode::ble_sniff::follow_aux`]); within an event we busy-poll the sub-ms
-//! events so reaction stays tight.
+//! transfer. Connection-event *anchors* are absolute 1 MHz TIMER1 deadlines,
+//! captured from the CONNECT_IND's physical end; a PPI edge starts TX ramp-up
+//! before each anchor, so no executor or 32 kHz RTC jitter reaches the air.
+//! Within an event we busy-poll the sub-ms events so reaction stays tight.
 //!
 //! ## Onboard LED
 //!
@@ -39,7 +40,7 @@
 //! | Red           | last connection event: the peer answered |
 //! | Yellow flash  | the attempt failed — CONNECT_IND refused, or the link formed and yielded no services |
 //!
-//! Blue and red are set once per connection event and held for the whole 31.25 ms
+//! Blue and red are set once per connection event and held for the whole 7.5 ms
 //! interval, so a healthy enumeration reads as steady red with blue flickers on
 //! retransmits, and a link that never comes up is solid blue.
 //!
@@ -63,13 +64,13 @@ use embassy_nrf::pac::radio::vals;
 use embassy_time::{Duration, Instant, Timer};
 use heapless::Vec;
 
-use crate::hal::radio::{
-    configure_ble, data_ch_freq, disable_silent, ensure_disabled, set_access_address, set_pcnf0,
-    wait_disabled, ADV_AA, ADV_CRC_POLY,
-};
 use crate::decoder::protocol::Decoder as _; // `.decode()` on the ATT channel decoder
-use crate::device::midea::parse_midea_sn;
-use crate::{decoder, led, Rng};
+use crate::device::midea::{Capability, parse_midea_sn};
+use crate::hal::radio::{
+    ADV_AA, ADV_CRC_POLY, RadioEndClock, configure_ble, data_ch_freq, disable_silent, disarm_rxen,
+    ensure_disabled, set_access_address, set_pcnf0, start_end_capture, wait_disabled,
+};
+use crate::{Rng, decoder, led};
 
 // ── Connection parameters (our choices as master) ─────────────────────────────
 
@@ -92,7 +93,8 @@ const FALLBACK_AA: u32 = 0xA5B6_C9D3;
 /// requires a fresh one each time. Reusing a constant also made every attempt in
 /// a capture look alike, so a stale link and a new one to the same peer were
 /// indistinguishable in the log.
-pub(crate) static CONN_AA: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(FALLBACK_AA);
+pub(crate) static CONN_AA: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(FALLBACK_AA);
 
 fn conn_aa() -> u32 {
     CONN_AA.load(core::sync::atomic::Ordering::Relaxed)
@@ -187,19 +189,16 @@ pub(crate) fn pick_access_address(rng: &mut Rng) -> u32 {
     }
     FALLBACK_AA
 }
-// ×1.25 ms between connection events. Chosen so the interval is a whole number
-// of timer ticks: 25 × 1.25 ms = 31.25 ms = exactly 1024 ticks at 32768 Hz. With
-// a non-exact interval (36 → 45 ms → 1474.56 ticks) `Duration::from_micros`
-// truncates and the anchor loses ~17 µs *per event* — a 380 ppm drift away from
-// the peer's clock that walks us out of its receive window within a few events.
-pub(crate) const CONN_INTERVAL: u16 = 25;
-/// [`CONN_INTERVAL`] as timer ticks. The assert below fails the build if the
-/// interval is ever changed to a value that is not tick-exact.
-const CONN_INTERVAL_TICKS: u64 =
-    (CONN_INTERVAL as u64 * 1250 * embassy_time::TICK_HZ) / 1_000_000;
-const _: () = assert!(
-    CONN_INTERVAL_TICKS * 1_000_000 == CONN_INTERVAL as u64 * 1250 * embassy_time::TICK_HZ
-);
+// ×1.25 ms between connection events. 6 is the shortest LE-valid interval
+// (7.5 ms), raising the event budget from 32 to 133 events/second. Anchors are
+// scheduled by TIMER1 at 1 MHz, not the 32,768 Hz Embassy tick: at 7.5 ms the
+// latter would introduce a 10.25 µs truncation every event (1,367 ppm), enough
+// to walk out of a peer's receive window in a few hundred events.
+pub(crate) const CONN_INTERVAL: u16 = 6;
+const CONN_INTERVAL_US: u32 = CONN_INTERVAL as u32 * 1250;
+/// Default-RU lead time. The PPI starts TX ramp-up this far before the anchor,
+/// making READY (and hence the first bit) coincide with the anchor.
+const TX_RAMP_US: u32 = 140;
 const CONN_LATENCY: u16 = 0;
 const CONN_TIMEOUT: u16 = 300; // ×10 ms = 3 s supervision (we track it as an event budget)
 const WIN_SIZE: u8 = 2; // ×1.25 ms transmit-window width
@@ -251,13 +250,13 @@ pub(crate) fn randomize_our_addr(rng: &mut Rng) {
 
 // ── Event / discovery budgets ─────────────────────────────────────────────────
 
-const MAX_EVENTS_PER_TXN: u32 = 60; // connection events to await one ATT response
+const MAX_EVENTS_PER_TXN: u32 = 250; // ~1.875 s at the 7.5 ms interval
 /// Short budget for the *optional* Exchange MTU: these appliances often ignore it
 /// entirely, and enumeration proceeds fine at ATT_MTU_DEFAULT — so fail fast (~0.5 s)
 /// rather than burning the full budget before discovery even starts.
-const MTU_EVENTS: u32 = 16;
+const MTU_EVENTS: u32 = 67; // ~0.5 s at the 7.5 ms interval
 
-pub(crate) const MAX_CONSEC_MISS: u32 = 40; // consecutive peer no-shows on a *live* link → lost
+pub(crate) const MAX_CONSEC_MISS: u32 = 167; // ~1.25 s of consecutive peer no-shows → lost
 // Consecutive no-shows tolerated *before the peer has ever replied*. Three in
 // four accepted connections in captured runs are silent: the CONNECT_IND is
 // taken but the peer never sends a single data-channel PDU (already bonded to
@@ -265,7 +264,7 @@ pub(crate) const MAX_CONSEC_MISS: u32 = 40; // consecutive peer no-shows on a *l
 // contrast, answer within the first few events (ev=1..4 observed). Waiting the
 // full 40 events (~1.2 s) on a peer that will never speak is pure dead time, so
 // bail early until the link proves itself, then extend to MAX_CONSEC_MISS.
-const MAX_CONSEC_MISS_UNPROVEN: u32 = 10;
+const MAX_CONSEC_MISS_UNPROVEN: u32 = 42; // ~312 ms before a link proves itself
 pub(crate) const MAX_SERVICES: usize = 16;
 pub(crate) const MAX_CHARS_PER_SVC: usize = 24;
 
@@ -294,16 +293,16 @@ const ATT_VALUE_CAP: usize = 256;
 /// written by an unbonded client is reset when the link drops.
 const SUBSCRIBE: bool = true;
 
-/// Connection events to hold the link open after enumeration, collecting
-/// whatever the subscriptions push. 64 × 31.25 ms = 2 s.
-pub(crate) const LISTEN_EVENTS: u32 = 64;
-
+/// Short notification collection window for targeted recon probes. It keeps a
+/// probe from monopolising the sole radio when it is only looking for an
+/// immediate reply.
+pub(crate) const LISTEN_EVENTS: u32 = 267; // approximately 2 s at 7.5 ms
 /// Diagnostic: when non-zero, skip enumeration and instead spend this many ms
 /// after the `CONNECT_IND` counting advertisements still coming from the target
 /// (see [`peer_readv_count`]). 0 = normal operation. Set this when connections
 /// form but no peer data ever arrives — it separates "the peer never accepted
 /// the CONNECT_IND" from "the link formed but our event timing is wrong".
-pub(crate) const DIAG_READV_MS: u64 = 180;
+pub(crate) const DIAG_READV_MS: u64 = 45;
 
 /// Run that probe in place of a real connection on every Nth attempt (0 = never).
 ///
@@ -321,10 +320,10 @@ pub(crate) const DIAG_READV_MS: u64 = 180;
 /// of time, so they cannot run in the same attempt. Alternating keeps both
 /// signals — `conn stats` and `accept probe` — in one capture.
 ///
-/// 180 ms is chosen to sit just inside the peripheral's connection-establishment
-/// timeout (6 × 31.25 ms ≈ 187 ms) and to exactly match `scan_probe`'s
-/// 3 × [`SCAN_PROBE_DWELL_MS`] listen, so the advert counts before and after are
-/// directly comparable.
+/// 45 ms sits just inside the peripheral's connection-establishment timeout
+/// (6 × 7.5 ms) for our chosen interval. The probe is diagnostic-only and off
+/// by default, so its short dwell deliberately favours the timing distinction
+/// over a representative survey sample.
 const ACCEPT_PROBE_EVERY: u32 = 0;
 
 /// Print the `conn stats` line and the per-event [`EvTrace`] table when a
@@ -363,12 +362,16 @@ static TX_BUF: crate::SyncBuf<CONN_BUF_LEN> = crate::SyncBuf::new();
 /// header. See the `MAXLEN` note in [`configure_conn_radio`].
 const CONN_MAX_PAYLOAD: usize = CONN_BUF_LEN - 2;
 
-/// Largest LL data-PDU payload we transmit when an L2CAP frame must be split
-/// across connection events. 27 is the BLE default every peer is guaranteed to
-/// receive; a peer with a small controller RX silently drops an oversized
-/// single PDU — the c3 write (120-byte value → 129-byte PDU) got no response
-/// until the request was segmented.
-const LL_PAYLOAD_MAX: usize = 27;
+/// Legacy LL payload limit, which every LE peer must accept before Data Length
+/// Extension has completed.
+const LL_PAYLOAD_DEFAULT: usize = 27;
+/// Largest LL payload this buffer and our advertised DLE values can carry.
+const LL_PAYLOAD_DLE: usize = 251;
+/// Uncoded 1M air-time for a 251-octet data PDU, in the LL_LENGTH fields.
+const LL_TIME_DLE_US: u16 = 2120;
+/// Keep DLE strictly best-effort: an old peer that ignores it should cost only
+/// a few 7.5 ms events before normal ATT discovery starts.
+const DLE_EVENTS: u32 = 12;
 
 // ── "Seen recently" tracking ──────────────────────────────────────────────────
 
@@ -417,13 +420,19 @@ struct RecentEntry {
 struct RecentCache(UnsafeCell<[RecentEntry; RECENT_SLOTS]>);
 unsafe impl Sync for RecentCache {}
 static RECENT: RecentCache = RecentCache(UnsafeCell::new(
-    [RecentEntry { used: false, addr: [0; 6], until: Instant::from_ticks(0) }; RECENT_SLOTS],
+    [RecentEntry {
+        used: false,
+        addr: [0; 6],
+        until: Instant::from_ticks(0),
+    }; RECENT_SLOTS],
 ));
 
 /// True if `addr` is still inside its cooldown and should be skipped.
 pub(crate) fn recently_enumerated(addr: [u8; 6], now: Instant) -> bool {
     let cache = unsafe { &*RECENT.0.get() };
-    cache.iter().any(|e| e.used && e.addr == addr && now < e.until)
+    cache
+        .iter()
+        .any(|e| e.used && e.addr == addr && now < e.until)
 }
 
 /// Puts `addr` on cooldown for `window_s` seconds, refreshing an existing slot or
@@ -454,7 +463,11 @@ pub(crate) fn mark_attempted(addr: [u8; 6], now: Instant, window_s: u64) {
             victim = i;
         }
     }
-    cache[victim] = RecentEntry { used: true, addr, until };
+    cache[victim] = RecentEntry {
+        used: true,
+        addr,
+        until,
+    };
 }
 
 // ── Survey: pick the strongest eligible target ────────────────────────────────
@@ -463,29 +476,65 @@ pub(crate) const ADV_CHANNELS: [(u8, u8); 3] = [(37, 2), (38, 26), (39, 80)];
 pub(crate) const SURVEY_DWELL_MS: u64 = 60; // per channel; three channels ≈ 180 ms
 pub(crate) const SURVEY_ROUNDS: u32 = 3;
 
+/// Connect-round budget for the Midea no-bind (FFA0) path. These appliances
+/// advertise connectably on a ~2 s cadence; the survey-sized window
+/// (`SURVEY_ROUNDS * 2`) catches such a sparse advertiser only about half the
+/// time (observed as `connect failed (target=0)` in recon), while the phone
+/// app's direct connect listens far longer. 24 rounds × 3 channels × 60 ms ≈
+/// 4.3 s — enough to hear two adverts from a 2 s advertiser.
+pub(crate) const CONNECT_ROUNDS: u32 = 24;
+
 /// The device-of-interest class a scan candidate was recognised as from its
 /// advertising payload alone. A generic advertiser is `None` — counted by the
 /// scan but never connected to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Interest {
-    /// Midea 0x06A8 appliance, carrying the 14-byte ASCII short serial needed to
-    /// derive the control-channel rootKey.
-    Midea([u8; 14]),
+    /// Midea 0x06A8 appliance, carrying the 14-byte ASCII short serial and the
+    /// device's real MAC (embedded in the longer mfg frame; `None` when absent)
+    /// — both feed the control-channel rootKey.
+    Midea { sn: [u8; 14], mac: Option<[u8; 6]> },
     /// DESSMANN smart lock (advert name `LOCK_`).
     Dessmann,
+    /// U-tec / ULTRALOQ smart lock (ServiceData16 0xFF01).
+    Utech,
     /// MiBeacon sensor (XMZNMS08LM door/window, LYWSD03MMC temp/humidity).
     MiSensor,
     /// Weight scale (Service UUID16 0x181D).
     MiScale,
+    /// Midea "PortaSplit" portable air conditioner — a *separate* family from
+    /// the 0x06A8 appliances above: different advert layout (company `0x0002`,
+    /// product `0xAC`) and a write-only `0xFF02/0xFF01` control channel with no
+    /// ECDH handshake. Carries the 18-byte advert key material
+    /// (`mac ‖ sn ‖ token`) that derives the control key.
+    PortaSplit([u8; 18]),
+    /// Midea fan-and-light — another separate family: `0xAAAA` GATT service
+    /// (`0xBBB0` write / `0xBBB1` notify), XOR-base obfuscation, state broadcast
+    /// in the `0x06A8` advert. Carries the 6-byte last-seen state
+    /// (`mode, brightness, color, timer LE, speed`).
+    FanLight([u8; 6]),
+    /// Haier U-home appliance (mfg company `0x0929`) — probed by GATT walk to
+    /// discover what a raw connection serves.
+    Haier,
+    /// Hisense smart-life appliance (ServiceData16 `0xF005`) — BLE control via
+    /// the `3a69…` GATT profile.
+    Hisense,
+    /// JOMOO smart bathroom (name `JOMOO…`) — Telink `0xFFF0` control profile
+    /// (write `0xFFF2` / notify `0xFFF1`).
+    Jomoo,
 }
 
 impl Interest {
-    /// Probe priority: a DESSMANN lock goes first (few, persistent, quick probe),
-    /// then the Midea fleet, then sensors/scales.
+    /// Probe priority: a lock (DESSMANN or U-tec) goes first (few, persistent,
+    /// quick probe), then the Midea fleet (PortaSplit included), then
+    /// sensors/scales.
     pub(crate) fn priority(&self) -> u8 {
         match self {
             Interest::Dessmann => 3,
-            Interest::Midea(_) => 2,
+            Interest::Utech => 3,
+            Interest::Midea { .. } | Interest::PortaSplit(_) | Interest::FanLight(_) => 2,
+            Interest::Haier => 1,
+            Interest::Hisense => 1,
+            Interest::Jomoo => 1,
             Interest::MiSensor => 1,
             Interest::MiScale => 0,
         }
@@ -494,7 +543,33 @@ impl Interest {
     /// The Midea short serial, when this is a Midea interest.
     pub(crate) fn midea_sn(&self) -> Option<[u8; 14]> {
         match self {
-            Interest::Midea(sn) => Some(*sn),
+            Interest::Midea { sn, .. } => Some(*sn),
+            _ => None,
+        }
+    }
+
+    /// The Midea device's real MAC from the advert, when present.
+    pub(crate) fn midea_mac(&self) -> Option<[u8; 6]> {
+        match self {
+            Interest::Midea { mac, .. } => *mac,
+            _ => None,
+        }
+    }
+
+    /// The PortaSplit advert key material (`mac ‖ sn ‖ token`), when this is a
+    /// PortaSplit interest.
+    pub(crate) fn portasplit_material(&self) -> Option<[u8; 18]> {
+        match self {
+            Interest::PortaSplit(m) => Some(*m),
+            _ => None,
+        }
+    }
+
+    /// The fan-light last-seen state (`mode, brightness, color, timer LE, speed`),
+    /// when this is a fan-light interest.
+    pub(crate) fn fanlight_state(&self) -> Option<[u8; 6]> {
+        match self {
+            Interest::FanLight(st) => Some(*st),
             _ => None,
         }
     }
@@ -508,6 +583,10 @@ pub(crate) struct Candidate {
     /// The device-of-interest class recognised from the advert, if any. A generic
     /// device is counted but never connected to.
     pub(crate) interest: Option<Interest>,
+    /// Midea v2 capability block decoded from the advert (bind/config posture,
+    /// `is_ble_controller` — the FFA0 no-bind signal), when the device broadcast
+    /// it (rarely). `None` for non-Midea or adverts without the block.
+    pub(crate) cap: Option<Capability>,
 }
 
 /// Dwell on the primary advertising channels collecting connectable advertisers
@@ -615,7 +694,13 @@ fn record_candidate(
     if recently_enumerated(addr, Instant::now()) {
         return;
     }
-    *best = Some(Candidate { addr, addr_random, rssi, interest: sn.map(Interest::Midea) });
+    *best = Some(Candidate {
+        addr,
+        addr_random,
+        rssi,
+        interest: sn.map(|s| Interest::Midea { sn: s, mac: None }),
+        cap: None,
+    });
 }
 
 /// Whether this connection attempt should be spent on the accept probe rather
@@ -634,12 +719,12 @@ pub(crate) fn accept_probe_round() -> bool {
 /// DIAGNOSTIC: after a CONNECT_IND, listen ~`window_ms` on the advertising
 /// channels and count how many ADVs from `cand.addr` we hear. A peer that
 /// *accepted* the CONNECT_IND stops advertising and waits for the master until
-/// its establishment timeout expires (6 connection intervals ≈ 187 ms at our
-/// 31.25 ms interval) → count should be 0. A peer that *ignored* it keeps
+/// its establishment timeout expires (6 connection intervals ≈ 45 ms at our
+/// 7.5 ms interval) → count should be 0. A peer that *ignored* it keeps
 /// advertising → count > 0. Distinguishes "CONNECT_IND not accepted" from
 /// "connection formed but data exchange fails".
 ///
-/// `window_ms` must stay under that 187 ms or the two cases converge. Callers
+/// `window_ms` must stay under that 45 ms or the two cases converge. Callers
 /// should pair the result with a later [`scan_probe`] of the same target —
 /// see the call site in [`run`].
 pub(crate) async fn peer_readv_count(cand: &Candidate, window_ms: u64) -> u32 {
@@ -737,10 +822,26 @@ pub(crate) struct Turnaround {
 /// ramp misses more adverts while re-arming. That depresses its sample size,
 /// not its hit *rate*, which is what the comparison uses.
 pub(crate) const TURNAROUNDS: [Turnaround; 4] = [
-    Turnaround { fast_ru: false, tifs_us: 150, name: "dflt/150 current" },
-    Turnaround { fast_ru: true, tifs_us: 150, name: "fast/150" },
-    Turnaround { fast_ru: true, tifs_us: 190, name: "fast/190 +40" },
-    Turnaround { fast_ru: true, tifs_us: 110, name: "fast/110 -40" },
+    Turnaround {
+        fast_ru: false,
+        tifs_us: 150,
+        name: "dflt/150 current",
+    },
+    Turnaround {
+        fast_ru: true,
+        tifs_us: 150,
+        name: "fast/150",
+    },
+    Turnaround {
+        fast_ru: true,
+        tifs_us: 190,
+        name: "fast/190 +40",
+    },
+    Turnaround {
+        fast_ru: true,
+        tifs_us: 110,
+        name: "fast/110 -40",
+    },
 ];
 
 /// Where a [`scan_probe`] attempt got to. Reported as a whole so a zero response
@@ -793,7 +894,11 @@ pub(crate) fn scan_probe(cand: &Candidate, t: Turnaround) -> ProbeStats {
     let r = pac::RADIO;
     r.tifs().write(|w| w.set_tifs(t.tifs_us));
     r.modecnf0().modify(|w| {
-        w.set_ru(if t.fast_ru { vals::Ru::Fast } else { vals::Ru::Default })
+        w.set_ru(if t.fast_ru {
+            vals::Ru::Fast
+        } else {
+            vals::Ru::Default
+        })
     });
 
     // SCAN_REQ: type 0x03, TxAdd = ours (random static), RxAdd = target's;
@@ -944,7 +1049,11 @@ fn build_connect_ind(cand: &Candidate) {
     ll[8..10].copy_from_slice(&WIN_OFFSET.to_le_bytes());
     ll[10..12].copy_from_slice(&CONN_INTERVAL.to_le_bytes());
     ll[12..14].copy_from_slice(&CONN_LATENCY.to_le_bytes());
-    ll[14..16].copy_from_slice(&CONN_TIMEOUT_UNITS.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+    ll[14..16].copy_from_slice(
+        &CONN_TIMEOUT_UNITS
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .to_le_bytes(),
+    );
     // Channel map: all 37 data channels usable (bits 0..36) → FF FF FF FF 1F.
     ll[16..21].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x1F]);
     // Hop (bits 0..4) + SCA (bits 5..7, 0 = worst-case, fine as master).
@@ -955,7 +1064,13 @@ fn build_connect_ind(cand: &Candidate) {
 
 pub(crate) struct Conn {
     /// Absolute deadline of the next connection event's master transmission.
-    anchor: Instant,
+    ///
+    /// This is a 1 MHz TIMER1 tick, captured from the CONNECT_IND END rather
+    /// than an Embassy `Instant`: the RTC's 30.5 µs granularity cannot hold a
+    /// 7.5 ms interval phase-locked to the peripheral.
+    anchor: u32,
+    /// Hardware clock that owns `anchor` and fires TXEN at its ramp lead.
+    clock: RadioEndClock,
     /// CSA#1 last unmapped channel index (0..36).
     unmapped: u8,
     /// Master transmit sequence number (stop-and-wait).
@@ -982,9 +1097,20 @@ pub(crate) struct Conn {
     /// summary — and the event number it lands on says whether our anchor was
     /// right from the start (ev=1) or we only caught the peer later.
     saw_reply: bool,
+    /// True once the peer's link layer has ever acknowledged a data PDU we sent —
+    /// the same proof-of-life as `saw_reply`, but for the TX direction. Useful to
+    /// distinguish "peer answered MTU but then its ATT database went silent" from
+    /// "the write itself never got an LL ack" when a targeted find dies.
+    pub(crate) tx_acked: bool,
     /// Negotiated ATT MTU. Starts at [`ATT_MTU_DEFAULT`]; [`exchange_mtu`] raises
     /// it toward [`ATT_MTU_MAX`] to the smaller of the two peers' Rx MTUs.
     att_mtu: u16,
+    /// Largest data-PDU payload the peer has accepted from us. Starts at the
+    /// legacy 27 bytes and rises only after an LL_LENGTH_RSP proves DLE.
+    ll_payload_max: usize,
+    /// DLE is an LL procedure, not an ATT one: run it at most once even if a
+    /// device-specific path retries Exchange MTU later in the same link.
+    dle_attempted: bool,
     /// This link's access address, CRC init, and CSA#1 hop increment. A single
     /// radio can hold several connections only if every event reprograms the radio
     /// with the identity of the link it is servicing and hops *its* channel
@@ -1117,8 +1243,22 @@ pub(crate) struct ConnectStats {
 /// the initial [`Conn`] on success (with `anchor` set to the first event), and
 /// accumulates what it saw into `st` either way.
 pub(crate) async fn try_connect(cand: &Candidate, st: &mut ConnectStats) -> Option<Conn> {
+    try_connect_rounds(cand, st, SURVEY_ROUNDS * 2).await
+}
+
+/// [`try_connect`] with a caller-chosen connect window. The Midea no-bind path
+/// passes [`CONNECT_ROUNDS`] because its appliances advertise sparsely; the
+/// default above keeps the survey-sized window for every other device kind.
+pub(crate) async fn try_connect_rounds(
+    cand: &Candidate,
+    st: &mut ConnectStats,
+    rounds: u32,
+) -> Option<Conn> {
     configure_ble();
     build_connect_ind(cand);
+    // Capture the actual CONNECT_IND END and retain this 1 MHz timebase for
+    // every connection anchor. The PPI path has no executor/USB jitter.
+    let end_clock = start_end_capture();
     let r = pac::RADIO;
     r.tifs().write(|w| w.set_tifs(T_IFS_US));
     // Default (140 µs) ramp-up. This looks wrong against a 150 µs T_IFS and an
@@ -1131,7 +1271,7 @@ pub(crate) async fn try_connect(cand: &Candidate, st: &mut ConnectStats) -> Opti
     r.modecnf0().modify(|w| w.set_ru(vals::Ru::Default));
 
     // A few passes over the advertising channels waiting to catch the target.
-    for _ in 0..(SURVEY_ROUNDS * 2) {
+    for _ in 0..rounds {
         for &(ch_idx, freq) in ADV_CHANNELS.iter() {
             arm_connect_rx(ch_idx, freq);
 
@@ -1148,7 +1288,7 @@ pub(crate) async fn try_connect(cand: &Candidate, st: &mut ConnectStats) -> Opti
                 }
                 r.events_end().write_value(0);
                 st.pkts += 1;
-                if let Some(conn) = finish_connect(cand, st) {
+                if let Some(conn) = finish_connect(cand, st, &end_clock) {
                     return Some(conn);
                 }
                 // Not our target (or bad CRC): the turnaround is already ramping
@@ -1173,13 +1313,18 @@ pub(crate) async fn try_connect(cand: &Candidate, st: &mut ConnectStats) -> Opti
             disable_silent();
         }
     }
+    disarm_rxen();
     None
 }
 
 /// Called the instant an armed reception ends: if the received PDU is our target,
 /// let the hardware turnaround transmit the CONNECT_IND and build the [`Conn`];
 /// otherwise return `None` so the caller aborts the pending transmission.
-fn finish_connect(cand: &Candidate, st: &mut ConnectStats) -> Option<Conn> {
+fn finish_connect(
+    cand: &Candidate,
+    st: &mut ConnectStats,
+    end_clock: &RadioEndClock,
+) -> Option<Conn> {
     let r = pac::RADIO;
     if r.events_crcok().read() == 0 {
         return None;
@@ -1244,7 +1389,7 @@ fn finish_connect(cand: &Candidate, st: &mut ConnectStats) -> Option<Conn> {
             return None;
         }
     }
-    let connect_end = Instant::now();
+    let connect_end = end_clock.end_ticks();
     r.events_end().write_value(0);
     // Settle the radio in DISABLED before configure_conn_radio() runs, or it
     // finds the radio still running and logs a spurious radio_stuck.
@@ -1252,15 +1397,21 @@ fn finish_connect(cand: &Candidate, st: &mut ConnectStats) -> Option<Conn> {
 
     ulogf!(
         "CONNECT_IND -> {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} rssi={} aa={:08X}\r\n",
-        cand.addr[5], cand.addr[4], cand.addr[3], cand.addr[2], cand.addr[1], cand.addr[0],
-        cand.rssi, conn_aa()
+        cand.addr[5],
+        cand.addr[4],
+        cand.addr[3],
+        cand.addr[2],
+        cand.addr[1],
+        cand.addr[0],
+        cand.rssi,
+        conn_aa()
     );
 
     // First anchor = connIndEnd + transmitWindowDelay + WinOffset·1.25 ms.
-    let anchor = connect_end
-        + Duration::from_micros(TX_WIN_DELAY_US + WIN_OFFSET as u64 * 1250);
+    let anchor = connect_end.wrapping_add(TX_WIN_DELAY_US as u32 + WIN_OFFSET as u32 * 1250);
     Some(Conn {
         anchor,
+        clock: *end_clock,
         unmapped: 0,
         sn: 0,
         nesn: 0,
@@ -1271,7 +1422,10 @@ fn finish_connect(cand: &Candidate, st: &mut ConnectStats) -> Option<Conn> {
         trace: [EvTrace::default(); TRACE_EVENTS],
         first_late_us: i32::MIN,
         saw_reply: false,
+        tx_acked: false,
         att_mtu: ATT_MTU_DEFAULT as u16,
+        ll_payload_max: LL_PAYLOAD_DEFAULT,
+        dle_attempted: false,
         // The radio identity this connection was established with, restored by
         // `conn_event` on the radio before each of this connection's events.
         aa: conn_aa(),
@@ -1319,24 +1473,39 @@ pub(crate) fn configure_conn_radio() {
     r.modecnf0().modify(|w| w.set_ru(vals::Ru::Default));
 }
 
-/// Runs one connection event: waits for the anchor, hops (CSA#1), transmits the
+/// Wait until a TIMER1 tick without consuming the last few hundred microseconds
+/// of CPU time before a radio deadline. The PPI owns the actual TXEN edge; this
+/// wait is only to make the executor yield while there is still safe slack.
+async fn wait_until_tick(clock: &RadioEndClock, at: u32) {
+    const WAKE_EARLY_US: u32 = 250;
+    loop {
+        let remaining = at.wrapping_sub(clock.now_ticks()) as i32;
+        if remaining <= 0 {
+            return;
+        }
+        if remaining as u32 > WAKE_EARLY_US {
+            Timer::after_micros(remaining as u64 - WAKE_EARLY_US as u64).await;
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Runs one connection event: hardware-schedules the anchor, hops (CSA#1), transmits the
 /// PDU currently staged in [`TX_BUF`] (`tx_len` payload bytes), and receives the
 /// peer's reply via the hardware T_IFS turnaround. Advances `anchor` by one
 /// interval. Returns the peer PDU descriptor, or `None` if the peer did not
 /// answer. The received payload (if any) lands in `RX_BUF[2..]`.
 pub(crate) async fn conn_event(conn: &mut Conn, tx_len: u8) -> Option<RxPdu> {
     // Diagnostic: how close to the first anchor did we actually arrive? If we're
-    // already past it, Timer::at returns immediately and event 0 fires late,
+    // already past it, the PPI starts TXEN immediately and event 0 fires late,
     // outside the peer's transmit window → the peer never anchors.
     if conn.first_late_us == i32::MIN {
-        let now = Instant::now();
-        conn.first_late_us = match conn.anchor.checked_duration_since(now) {
-            Some(d) => -(d.as_micros() as i32), // early: negative
-            None => now.duration_since(conn.anchor).as_micros() as i32, // late: positive
-        };
+        // Positive `until` means early, so preserve the old diagnostic sign:
+        // negative = early, positive = late.
+        let until = conn.anchor.wrapping_sub(conn.clock.now_ticks()) as i32;
+        conn.first_late_us = -until;
     }
-    Timer::at(conn.anchor).await;
-    conn.anchor += Duration::from_ticks(CONN_INTERVAL_TICKS);
 
     // CSA#1: next data channel = (last + hop) mod 37 (full map → no remap). The
     // hop increment is this connection's own, stored on it when it was established.
@@ -1381,7 +1550,13 @@ pub(crate) async fn conn_event(conn: &mut Conn, tx_len: u8) -> Option<RxPdu> {
         w.set_rxready_start(true);
         w.set_address_rssistart(true);
     });
-    r.tasks_txen().write_value(1);
+    // Program the timer/PPI deadline only after all radio state and shorts are
+    // ready. It starts the normal 140 µs TX ramp before `anchor`, so the first
+    // bit is on-air at anchor with no RTC quantisation or executor jitter.
+    let txen_at = conn.anchor.wrapping_sub(TX_RAMP_US);
+    conn.clock.arm_txen_at(txen_at);
+    conn.anchor = conn.anchor.wrapping_add(CONN_INTERVAL_US);
+    wait_until_tick(&conn.clock, txen_at).await;
 
     // TXREADY: START has already latched TX_BUF, so PACKETPTR can be re-aimed at
     // RX_BUF for the reply the same chain is about to receive.
@@ -1433,7 +1608,10 @@ pub(crate) async fn conn_event(conn: &mut Conn, tx_len: u8) -> Option<RxPdu> {
             break;
         }
     }
-    let gap_us = Instant::now().duration_since(tx_done_at).as_micros().min(0xFFFF) as u16;
+    let gap_us = Instant::now()
+        .duration_since(tx_done_at)
+        .as_micros()
+        .min(0xFFFF) as u16;
     // Diagnostic: did the peer's reply even begin (AA match) / pass CRC? Read
     // before cleanup_radio clears the events.
     let addr_seen = r.events_address().read() != 0;
@@ -1450,7 +1628,7 @@ pub(crate) async fn conn_event(conn: &mut Conn, tx_len: u8) -> Option<RxPdu> {
     // Signalling both a "transmitting" and a "received" colour within the same
     // event would show neither: `led::LED` is a Signal, and this function never
     // yields between the two points, so the LED task would only ever observe
-    // the second. At one event per 31.25 ms the distinction that is actually
+    // the second. At one event per 7.5 ms the distinction that is actually
     // visible — and useful — is whether the peer answered.
     // Red only for a reply we could actually use: a CRC failure is discarded
     // below, so showing it as a good event would hide the one condition this
@@ -1507,7 +1685,10 @@ pub(crate) async fn conn_event(conn: &mut Conn, tx_len: u8) -> Option<RxPdu> {
         conn.saw_reply = true;
         ulogf!(
             "link live: peer replied on ev={} llid={} len={} ch={}\r\n",
-            conn.ev_total, pdu.llid, pdu.len, conn.unmapped
+            conn.ev_total,
+            pdu.llid,
+            pdu.len,
+            conn.unmapped
         );
     }
     Some(pdu)
@@ -1536,6 +1717,18 @@ pub(crate) fn stage_empty(conn: &Conn) -> u8 {
     0
 }
 
+/// Stages a link-layer control PDU with the current stop-and-wait sequence
+/// bits. LL control is carried directly in the data-channel payload (LLID=11),
+/// rather than inside L2CAP.
+fn stage_ll_control(conn: &Conn, payload: &[u8]) -> u8 {
+    let buf = unsafe { &mut *TX_BUF.0.get() };
+    debug_assert!(payload.len() <= LL_PAYLOAD_DEFAULT);
+    buf[0] = 0b11 | (conn.nesn << 2) | (conn.sn << 3);
+    buf[1] = payload.len() as u8;
+    buf[2..2 + payload.len()].copy_from_slice(payload);
+    payload.len() as u8
+}
+
 /// Stages an ATT request as an L2CAP frame on CID 0x0004 in one LL data PDU
 /// (LLID=10, start of an L2CAP message). Returns the LL payload length.
 pub(crate) fn stage_att(conn: &Conn, att: &[u8]) -> u8 {
@@ -1562,24 +1755,28 @@ fn stage_l2cap(conn: &Conn, cid: u16, payload: &[u8]) -> u8 {
 
 /// Number of LL data PDUs an `req_len`-byte ATT request needs on the wire, and
 /// how many ATT bytes segment `seg` carries. Segment 0 also carries the 4-byte
-/// L2CAP header, so it holds [`LL_PAYLOAD_MAX`]`-4` ATT bytes; every
-/// continuation holds [`LL_PAYLOAD_MAX`]. A request whose L2CAP frame fits one
-/// PDU stays whole (the caller stages it with [`stage_att`]).
-fn att_req_seg_count(req_len: usize) -> usize {
-    if req_len + 4 <= LL_PAYLOAD_MAX {
+/// L2CAP header, so it holds `payload_max - 4` ATT bytes; every continuation
+/// holds `payload_max`. A request whose L2CAP frame fits one PDU stays whole
+/// (the caller stages it with [`stage_att`]).
+fn att_req_seg_count(req_len: usize, payload_max: usize) -> usize {
+    if req_len + 4 <= payload_max {
         1
     } else {
-        1 + (req_len - (LL_PAYLOAD_MAX - 4)).div_ceil(LL_PAYLOAD_MAX)
+        1 + (req_len - (payload_max - 4)).div_ceil(payload_max)
     }
 }
 
-fn att_req_seg_len(req_len: usize, seg: usize) -> usize {
+fn att_req_seg_len(req_len: usize, seg: usize, payload_max: usize) -> usize {
     let start = if seg == 0 {
         0
     } else {
-        (LL_PAYLOAD_MAX - 4) + (seg - 1) * LL_PAYLOAD_MAX
+        (payload_max - 4) + (seg - 1) * payload_max
     };
-    let cap = if seg == 0 { LL_PAYLOAD_MAX - 4 } else { LL_PAYLOAD_MAX };
+    let cap = if seg == 0 {
+        payload_max - 4
+    } else {
+        payload_max
+    };
     cap.min(req_len.saturating_sub(start))
 }
 
@@ -1597,7 +1794,7 @@ fn stage_att_req_segment(conn: &Conn, req: &[u8], seg: usize, n_att: usize) -> u
         buf[6..6 + n_att].copy_from_slice(&req[..n_att]);
     } else {
         buf[1] = n_att as u8;
-        let start = (LL_PAYLOAD_MAX - 4) + (seg - 1) * LL_PAYLOAD_MAX;
+        let start = (conn.ll_payload_max - 4) + (seg - 1) * conn.ll_payload_max;
         buf[2..2 + n_att].copy_from_slice(&req[start..start + n_att]);
     }
     buf[1]
@@ -1646,7 +1843,12 @@ pub(crate) struct Reasm {
 
 impl Reasm {
     pub(crate) fn new() -> Self {
-        Self { buf: [0u8; REASM_CAP], have: 0, need: None, cid: 0 }
+        Self {
+            buf: [0u8; REASM_CAP],
+            have: 0,
+            need: None,
+            cid: 0,
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1670,7 +1872,10 @@ impl Reasm {
                 let l2_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
                 self.cid = u16::from_le_bytes([payload[2], payload[3]]);
                 if l2_len > REASM_CAP {
-                    ulogf!("  [ERR] peer L2CAP frame too large ({} B) — dropped\r\n", l2_len);
+                    ulogf!(
+                        "  [ERR] peer L2CAP frame too large ({} B) — dropped\r\n",
+                        l2_len
+                    );
                     return false;
                 }
                 self.need = Some(l2_len);
@@ -1738,7 +1943,12 @@ async fn att_txn(conn: &mut Conn, req: &[u8], resp: &mut [u8]) -> Option<usize> 
 /// ATT request/response, giving up after `max_events` connection events. Callers
 /// that can proceed without an answer (Exchange MTU is optional) pass a short
 /// budget so a silent peer costs a fraction of a second instead of ~1.9 s.
-async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events: u32) -> Option<usize> {
+async fn att_txn_within(
+    conn: &mut Conn,
+    req: &[u8],
+    resp: &mut [u8],
+    max_events: u32,
+) -> Option<usize> {
     let mut sent = false; // request acknowledged by the peer's link layer
     let mut miss = 0u32;
     // The one response opcode that answers `req`. Everything else arriving on
@@ -1756,7 +1966,7 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
     // segment at a time. `seg_sent` counts acked segments; `sent` stays false
     // until the last one is on the wire, so the response is awaited only once
     // the whole request arrived.
-    let n_segs = att_req_seg_count(req.len());
+    let n_segs = att_req_seg_count(req.len(), conn.ll_payload_max);
     let mut seg_sent = 0usize;
 
     for _ in 0..max_events {
@@ -1775,9 +1985,12 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
             match (&owed, sent) {
                 // Clear the ATT debt before our own request.
                 (Some((b, n)), _) => stage_att(conn, &b[..*n]),
-                (None, false) if n_segs > 1 => {
-                    stage_att_req_segment(conn, req, seg_sent, att_req_seg_len(req.len(), seg_sent))
-                }
+                (None, false) if n_segs > 1 => stage_att_req_segment(
+                    conn,
+                    req,
+                    seg_sent,
+                    att_req_seg_len(req.len(), seg_sent, conn.ll_payload_max),
+                ),
                 (None, false) => stage_att(conn, req),
                 (None, true) => stage_empty(conn),
             }
@@ -1787,7 +2000,11 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
             miss += 1;
             // A peer that has never spoken gets a short leash; once it has
             // replied even once the link is real and we wait the full budget.
-            let cap = if conn.saw_reply { MAX_CONSEC_MISS } else { MAX_CONSEC_MISS_UNPROVEN };
+            let cap = if conn.saw_reply {
+                MAX_CONSEC_MISS
+            } else {
+                MAX_CONSEC_MISS_UNPROVEN
+            };
             if miss >= cap {
                 return None;
             }
@@ -1797,6 +2014,7 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
         let (new_data, acked) = update_flow(conn, &rx);
         if acked {
             // An ack retires whatever we actually put on air this event.
+            conn.tx_acked = true; // link layer accepted our TX — link is bidirectional
             if sig_owed.is_some() {
                 sig_owed = None;
             } else if owed.is_some() {
@@ -1833,13 +2051,20 @@ async fn att_txn_within(conn: &mut Conn, req: &[u8], resp: &mut [u8], max_events
                         sig_owed = Some(l2cap_conn_param_update_rsp(sig_id));
                         ulogf!("  peer conn-param-update id=0x{:02X} (accept)\r\n", sig_id);
                     } else {
-                        ulogf!("  peer L2CAP sig code=0x{:02X} len={} (ignored)\r\n",
-                            frame.first().copied().unwrap_or(0), frame.len());
+                        ulogf!(
+                            "  peer L2CAP sig code=0x{:02X} len={} (ignored)\r\n",
+                            frame.first().copied().unwrap_or(0),
+                            frame.len()
+                        );
                     }
                 } else if cid != 0x0004 {
                     // SMP and other bearers. A peer that opens with a pairing
                     // request is a peer whose attributes we may not be allowed to read.
-                    ulogf!("  peer L2CAP cid=0x{:04X} len={} (ignored)\r\n", cid, frame.len());
+                    ulogf!(
+                        "  peer L2CAP cid=0x{:04X} len={} (ignored)\r\n",
+                        cid,
+                        frame.len()
+                    );
                 } else if !frame.is_empty() {
                     let att = frame;
                     // Only the matching response opcode, or an error response
@@ -1986,7 +2211,11 @@ pub(crate) async fn att_write_await_notify(
     // or the PDU carried a stale SN and was read as a retransmission). Distinct
     // from the "write acked but no notification" case the caller reports later.
     if att_txn(conn, &req[..3 + vlen], &mut wrsp).await.is_none() {
-        ulogf!("  central: write h={:04X} len={} got no Write Response\r\n", write_h, vlen);
+        ulogf!(
+            "  central: write h={:04X} len={} got no Write Response\r\n",
+            write_h,
+            vlen
+        );
         return None;
     }
 
@@ -2031,10 +2260,16 @@ pub(crate) async fn att_write_await_notify(
                     {
                         let n = (frame.len() - 3).min(out.len());
                         out[..n].copy_from_slice(&frame[3..3 + n]);
-                        ulogf!("    reply h={:04X} {} len={}\r\n",
+                        ulogf!(
+                            "    reply h={:04X} {} len={}\r\n",
                             notify_h,
-                            if frame[0] == ATT_HANDLE_VALUE_IND { "IND" } else { "NTF" },
-                            n);
+                            if frame[0] == ATT_HANDLE_VALUE_IND {
+                                "IND"
+                            } else {
+                                "NTF"
+                            },
+                            n
+                        );
                         decoder::hexdump(&out[..n], 0, 4);
                         // An indication (0x1D) requires a confirmation (0x1E) before
                         // the peer will process the next write. If we return without
@@ -2093,9 +2328,9 @@ pub(crate) async fn dump_trace(conn: &Conn) {
             (t.tx_hdr >> 3) & 1,
             (t.tx_hdr >> 2) & 1,
             t.tx_len,
-            t.flags & 1,          // EVENTS_ADDRESS — reply preamble+AA matched
-            (t.flags >> 1) & 1,   // EVENTS_CRCOK
-            (t.flags >> 2) & 1,   // reply END seen
+            t.flags & 1,        // EVENTS_ADDRESS — reply preamble+AA matched
+            (t.flags >> 1) & 1, // EVENTS_CRCOK
+            (t.flags >> 2) & 1, // reply END seen
             t.rx_hdr & 0x03,
             (t.rx_hdr >> 3) & 1,
             (t.rx_hdr >> 2) & 1,
@@ -2114,7 +2349,9 @@ pub(crate) async fn dump_trace(conn: &Conn) {
 /// Minimal LL control handling: we do not negotiate features/version/MTU, but we
 /// note a peer-initiated termination so the caller can stop cleanly.
 pub(crate) fn handle_ll_control(payload: &[u8]) {
-    let Some(&opcode) = payload.first() else { return };
+    let Some(&opcode) = payload.first() else {
+        return;
+    };
     match opcode {
         // LL_TERMINATE_IND. A peer ending the link is a normal event, not our
         // error; the decoded reason name says whether it was a clean close or a
@@ -2122,7 +2359,11 @@ pub(crate) fn handle_ll_control(payload: &[u8]) {
         0x02 => {
             let reason = payload.get(1).copied().unwrap_or(0);
             let name = crate::decoder::protocol::ll::error_name(reason);
-            ulogf!("peer LL_TERMINATE_IND reason=0x{:02X} ({})\r\n", reason, name);
+            ulogf!(
+                "peer LL_TERMINATE_IND reason=0x{:02X} ({})\r\n",
+                reason,
+                name
+            );
         }
         // LL_VERSION_IND. Strict peers re-send this if we don't reply, and some
         // disconnect if we remain silent for the whole supervision window. We
@@ -2133,8 +2374,15 @@ pub(crate) fn handle_ll_control(payload: &[u8]) {
         // TODO: expose a return value from handle_ll_control so owed can be set.
         0x0C => {
             let ver = payload.get(1).copied().unwrap_or(0);
-            let comp = payload.get(2).map(|&a| u16::from_le_bytes([a, payload.get(3).copied().unwrap_or(0)])).unwrap_or(0);
-            ulogf!("peer LL_VERSION_IND ver=0x{:02X} company=0x{:04X}\r\n", ver, comp);
+            let comp = payload
+                .get(2)
+                .map(|&a| u16::from_le_bytes([a, payload.get(3).copied().unwrap_or(0)]))
+                .unwrap_or(0);
+            ulogf!(
+                "peer LL_VERSION_IND ver=0x{:02X} company=0x{:04X}\r\n",
+                ver,
+                comp
+            );
         }
         other => {
             ulogf!("peer LL ctrl op=0x{:02X} len={}\r\n", other, payload.len());
@@ -2223,6 +2471,8 @@ pub fn att_error_name(code: u8) -> &'static str {
 
 // ── ATT opcodes ───────────────────────────────────────────────────────────────
 const ATT_ERROR_RSP: u8 = 0x01;
+const ATT_FIND_BY_TYPE_VALUE_REQ: u8 = 0x06;
+const ATT_FIND_BY_TYPE_VALUE_RSP: u8 = 0x07;
 const ATT_READ_BY_TYPE_REQ: u8 = 0x08;
 const ATT_READ_BY_TYPE_RSP: u8 = 0x09;
 const ATT_READ_REQ: u8 = 0x0A;
@@ -2325,10 +2575,91 @@ fn exchange_mtu_rsp() -> ([u8; 5], usize) {
     ([0x03, (m & 0xFF) as u8, (m >> 8) as u8, 0, 0], 3)
 }
 
+/// Ask the peer to enable LE Data Length Extension before ATT starts.
+///
+/// ATT MTU only raises the attribute-layer frame size; without this LL exchange
+/// the frame is still divided into 27-byte data PDUs. A successful response lets
+/// a 247-byte ATT value use one 251-byte LL PDU instead of ten, which is what
+/// turns the 7.5 ms interval into materially more captured data. This remains
+/// best effort because a pre-4.2 peripheral may ignore the request or reply
+/// `LL_UNKNOWN_RSP`; in either case all later traffic stays at the legacy limit.
+async fn exchange_data_length(conn: &mut Conn) {
+    if conn.dle_attempted {
+        return;
+    }
+    conn.dle_attempted = true;
+    let req = [
+        0x14, // LL_LENGTH_REQ
+        (LL_PAYLOAD_DLE & 0xFF) as u8,
+        (LL_PAYLOAD_DLE >> 8) as u8,
+        (LL_TIME_DLE_US & 0xFF) as u8,
+        (LL_TIME_DLE_US >> 8) as u8,
+        (LL_PAYLOAD_DLE & 0xFF) as u8,
+        (LL_PAYLOAD_DLE >> 8) as u8,
+        (LL_TIME_DLE_US & 0xFF) as u8,
+        (LL_TIME_DLE_US >> 8) as u8,
+    ];
+    let mut request_acked = false;
+    let mut misses = 0u32;
+
+    for _ in 0..DLE_EVENTS {
+        let tx_len = if request_acked {
+            stage_empty(conn)
+        } else {
+            stage_ll_control(conn, &req)
+        };
+        let Some(rx) = conn_event(conn, tx_len).await else {
+            misses += 1;
+            if misses >= MAX_CONSEC_MISS_UNPROVEN {
+                break;
+            }
+            continue;
+        };
+        misses = 0;
+        let (new_data, acked) = update_flow(conn, &rx);
+        if acked {
+            request_acked = true;
+        }
+        if !new_data || rx.llid != 0b11 || rx.len < 1 {
+            continue;
+        }
+        let payload = unsafe { &*RX_BUF.0.get() };
+        match payload[2] {
+            // LL_LENGTH_RSP: peer MaxRxOctets bounds our TX. We cap it to our
+            // DMA-backed advertised 251 octets and never lower the legacy 27.
+            // MaxRxTime is an independent bound: accepting octets alone could
+            // still overrun a peer that reports 251 octets but a shorter time.
+            0x15 if rx.len >= 9 => {
+                let peer_rx = u16::from_le_bytes([payload[3], payload[4]]) as usize;
+                let peer_rx_time = u16::from_le_bytes([payload[5], payload[6]]) as usize;
+                // At LE 1M an uncoded data PDU takes 80 µs fixed overhead plus
+                // 8 µs/octet. Use the floor so every selected payload fits.
+                let time_octets = peer_rx_time.saturating_sub(80) / 8;
+                conn.ll_payload_max = peer_rx
+                    .min(time_octets)
+                    .clamp(LL_PAYLOAD_DEFAULT, LL_PAYLOAD_DLE);
+                ulogf!(
+                    "  dle = {} B LL payload (peer rx {} time {}us)\r\n",
+                    conn.ll_payload_max,
+                    peer_rx,
+                    peer_rx_time
+                );
+                return;
+            }
+            // LL_UNKNOWN_RSP naming LL_LENGTH_REQ means this controller has no
+            // DLE. Do not wait out the whole best-effort budget.
+            0x07 if rx.len >= 2 && payload[3] == 0x14 => break,
+            _ => handle_ll_control(&payload[2..2 + rx.len as usize]),
+        }
+    }
+    ulogf!("  dle = {} B LL payload (legacy)\r\n", conn.ll_payload_max);
+}
+
 /// Negotiates a larger ATT MTU as the first transaction on the bearer, so a full
 /// characteristic value fits in one Read Response. Best-effort: on a peer that
 /// declines, errors, or never answers, the link keeps [`ATT_MTU_DEFAULT`].
 pub(crate) async fn exchange_mtu(conn: &mut Conn) {
+    exchange_data_length(conn).await;
     let m = ATT_MTU_MAX as u16;
     let req = [0x02, (m & 0xFF) as u8, (m >> 8) as u8];
     let mut resp = [0u8; ATT_MTU_MAX];
@@ -2347,9 +2678,18 @@ pub(crate) async fn exchange_mtu(conn: &mut Conn) {
         ulogf!("  mtu = {} (req {}, peer {})\r\n", conn.att_mtu, m, peer_rx);
     } else if n >= 5 && resp[0] == 0x01 {
         // Error Response: [opcode 0x01][req opcode][handle lo][handle hi][code].
-        ulogf!("  mtu = {} (peer rejected err=0x{:02X})\r\n", conn.att_mtu, resp[4]);
+        ulogf!(
+            "  mtu = {} (peer rejected err=0x{:02X})\r\n",
+            conn.att_mtu,
+            resp[4]
+        );
     } else {
-        ulogf!("  mtu = {} (bad reply op=0x{:02X} len={})\r\n", conn.att_mtu, resp[0], n);
+        ulogf!(
+            "  mtu = {} (bad reply op=0x{:02X} len={})\r\n",
+            conn.att_mtu,
+            resp[0],
+            n
+        );
     }
 }
 
@@ -2379,6 +2719,85 @@ pub(crate) struct Characteristic {
 }
 
 // ── GATT walk ─────────────────────────────────────────────────────────────────
+
+/// Existence/state of a targeted primary-service find, decided by the peer's ATT
+/// error response: `0x0A` attribute-not-found means the service is genuinely
+/// absent; any other error means the request reached the peer but it refused
+/// (auth/encryption-gated, invalid PDU, …) — the service likely exists but is not
+/// being served to us.
+pub(crate) enum ServiceFind {
+    /// Service present: its declaration handle range.
+    Found { start: u16, end: u16 },
+    /// Peer answered err 0x0A — no such service.
+    Absent,
+    /// Peer answered with another ATT error code (gated / refused).
+    Gated(u8),
+    /// Link lost or a reply we could not parse — no conclusion.
+    Unknown,
+}
+
+/// Find one primary service by 16-bit UUID via ATT Find By Type Value (0x06) over
+/// `0x2800`. Unlike [`discover_services`] this does not enumerate the tree — it
+/// asks for the single UUID and reads the peer's error response as the existence
+/// signal ([`ServiceFind`]). That is exactly what an unbound / non-serving
+/// appliance answers with when it withholds its attribute table.
+pub(crate) async fn find_service16(conn: &mut Conn, uuid16: u16) -> ServiceFind {
+    let req = [
+        ATT_FIND_BY_TYPE_VALUE_REQ,
+        0x01,
+        0x00, // starting handle 0x0001
+        0xFF,
+        0xFF, // ending handle 0xFFFF
+        0x00,
+        0x28, // type = 0x2800 Primary Service
+        (uuid16 & 0xFF) as u8,
+        (uuid16 >> 8) as u8,
+    ];
+    let mut resp = [0u8; ATT_MTU_MAX];
+    let Some(n) = att_txn(conn, &req, &mut resp).await else {
+        // Diagnostic for the midea-serving question: did the link die during the
+        // write, or did a live link simply not answer the ATT find? A live link
+        // (saw_reply + tx_acked) that ignores Find-By-Type-Value is the "peer
+        // stack alive but its GATT database not serving" signature.
+        ulogf!(
+            "  find 0x{:04X}: no ATT response (saw_reply={} tx_acked={} ev={}/{}/{} addr={} crcok={} txdone={})\r\n",
+            uuid16,
+            conn.saw_reply,
+            conn.tx_acked,
+            conn.ev_total,
+            conn.ev_addr,
+            conn.ev_crcok,
+            conn.ev_addr,
+            conn.ev_crcok,
+            conn.ev_txdone
+        );
+        return ServiceFind::Unknown;
+    };
+    if n == 0 {
+        return ServiceFind::Unknown;
+    }
+    if resp[0] == ATT_ERROR_RSP {
+        // Error Response: [0x01][req opcode][handle lo][hi][code]
+        let code = resp.get(4).copied().unwrap_or(0);
+        return if code == 0x0A {
+            ServiceFind::Absent
+        } else {
+            ServiceFind::Gated(code)
+        };
+    }
+    if resp[0] != ATT_FIND_BY_TYPE_VALUE_RSP || n < 2 {
+        return ServiceFind::Unknown;
+    }
+    // Response: [0x07][handle-information-list length][(start,end) …]
+    let each = resp[1] as usize;
+    if each < 4 || n < 2 + each {
+        return ServiceFind::Unknown;
+    }
+    ServiceFind::Found {
+        start: u16::from_le_bytes([resp[2], resp[3]]),
+        end: u16::from_le_bytes([resp[4], resp[5]]),
+    }
+}
 
 /// Discovers all primary services (Read By Group Type, UUID 0x2800), collecting
 /// them into `services`. Each service is printed later by [`enumerate`], grouped
@@ -2412,7 +2831,9 @@ pub(crate) async fn discover_services(conn: &mut Conn, services: &mut Vec<Servic
             // was indistinguishable in the log from a peer with no services.
             ulogf!(
                 "  [ERR] (service discovery: unexpected ATT 0x{:02X} {} len={})\r\n",
-                resp[0], att_opcode_name(resp[0]), n
+                resp[0],
+                att_opcode_name(resp[0]),
+                n
             );
             return;
         }
@@ -2430,7 +2851,12 @@ pub(crate) async fn discover_services(conn: &mut Conn, services: &mut Vec<Servic
             let mut ub = [0u8; 16];
             let ul = uuid.len().min(16);
             ub[..ul].copy_from_slice(&uuid[..ul]);
-            let _ = services.push(Service { start: h, end: e, uuid: ub, uuid_len: ul as u8 });
+            let _ = services.push(Service {
+                start: h,
+                end: e,
+                uuid: ub,
+                uuid_len: ul as u8,
+            });
             last_end = e;
         }
         if last_end == 0xFFFF || last_end < start {
@@ -2577,14 +3003,21 @@ pub(crate) async fn subscribe(conn: &mut Conn, cccd: u16, props: u8) -> bool {
         return true;
     }
     if n >= 5 && resp[0] == ATT_ERROR_RSP {
-        ulogf!("          sub h={:04X} err=0x{:02X} ({})\r\n", cccd, resp[4], att_error_name(resp[4]));
+        ulogf!(
+            "          sub h={:04X} err=0x{:02X} ({})\r\n",
+            cccd,
+            resp[4],
+            att_error_name(resp[4])
+        );
     }
     false
 }
 
 /// Reads a characteristic value (ATT Read Request) and prints it (hex + ASCII),
-/// or the ATT error the peer returned.
-async fn read_value(conn: &mut Conn, ch: &Characteristic) {
+/// or the ATT error the peer returned. `pub(crate)` so device probes can read
+/// specific characteristics (e.g. the Xiaomi FE95 beacon key) and surface the
+/// result or the auth-gating error.
+pub(crate) async fn read_value(conn: &mut Conn, ch: &Characteristic) {
     let h = ch.value_handle;
     let req = [ATT_READ_REQ, (h & 0xFF) as u8, (h >> 8) as u8];
     let mut resp = [0u8; ATT_MTU_MAX];
@@ -2595,7 +3028,12 @@ async fn read_value(conn: &mut Conn, ch: &Characteristic) {
         return;
     }
     if resp[0] == ATT_ERROR_RSP && n >= 5 {
-        ulogf!("        [ERR] read h={:04X} err=0x{:02X} ({})\r\n", h, resp[4], att_error_name(resp[4]));
+        ulogf!(
+            "        [ERR] read h={:04X} err=0x{:02X} ({})\r\n",
+            h,
+            resp[4],
+            att_error_name(resp[4])
+        );
         return;
     }
     if resp[0] != ATT_READ_RSP {
@@ -2615,8 +3053,13 @@ async fn read_value(conn: &mut Conn, ch: &Characteristic) {
     let mut more = len == mtu - 1;
     while more && len < ATT_VALUE_CAP {
         let off = len as u16;
-        let req = [ATT_READ_BLOB_REQ, (h & 0xFF) as u8, (h >> 8) as u8,
-                   (off & 0xFF) as u8, (off >> 8) as u8];
+        let req = [
+            ATT_READ_BLOB_REQ,
+            (h & 0xFF) as u8,
+            (h >> 8) as u8,
+            (off & 0xFF) as u8,
+            (off >> 8) as u8,
+        ];
         let mut blob = [0u8; ATT_MTU_MAX];
         let Some(bn) = att_txn(conn, &req, &mut blob).await else {
             truncated = true;
@@ -2626,8 +3069,12 @@ async fn read_value(conn: &mut Conn, ch: &Characteristic) {
             // Not-Long and Invalid-Offset both mean "you already have it all";
             // anything else (typically 0x05) means the peer stopped short.
             if blob[4] != ATT_ERR_NOT_LONG && blob[4] != ATT_ERR_INVALID_OFFSET {
-                ulogf!("        [ERR] blob h={:04X} err=0x{:02X} ({})\r\n",
-                       h, blob[4], att_error_name(blob[4]));
+                ulogf!(
+                    "        [ERR] blob h={:04X} err=0x{:02X} ({})\r\n",
+                    h,
+                    blob[4],
+                    att_error_name(blob[4])
+                );
                 truncated = true;
             }
             break;
@@ -2698,7 +3145,10 @@ async fn read_value(conn: &mut Conn, ch: &Characteristic) {
     // say: a value that read cleanly needs neither, since the decode or dump
     // above already carries it.
     if offset_blind {
-        ulogf!("        [!] len={} peer ignores blob offset; needs larger MTU\r\n", len);
+        ulogf!(
+            "        [!] len={} peer ignores blob offset; needs larger MTU\r\n",
+            len
+        );
     } else if truncated {
         ulogf!("        [!] len={} truncated\r\n", len);
     }
@@ -2712,10 +3162,7 @@ async fn read_value(conn: &mut Conn, ch: &Characteristic) {
 /// `on_char(value_handle, uuid)` is invoked for every characteristic so a caller
 /// can pick out the handles it cares about (e.g. the Midea mode's FFA1/FFA2
 /// control profile) without this shared walk knowing any device's protocol.
-pub(crate) async fn enumerate(
-    conn: &mut Conn,
-    on_char: impl FnMut(u16, &[u8]),
-) -> usize {
+pub(crate) async fn enumerate(conn: &mut Conn, on_char: impl FnMut(u16, &[u8])) -> usize {
     // Raise the MTU first so a full characteristic value fits in one Read
     // Response; every read below then benefits from the negotiated size.
     exchange_mtu(conn).await;
@@ -2725,12 +3172,10 @@ pub(crate) async fn enumerate(
     // line no longer repeats it.
     ulogf!("  services = {}\r\n", services.len());
 
-    let subscribed = walk_services(conn, &services, on_char).await;
-
-    if subscribed > 0 {
-        ulogf!("  listening on {} subscription(s)\r\n", subscribed);
-        listen_notifications(conn, LISTEN_EVENTS).await;
-    }
+    // Enumeration remains a bounded database walk. CCCDs may still be written
+    // while walking characteristics, but holding the sole radio open waiting
+    // for periodic notifications throttles discovery far more than it helps.
+    let _ = walk_services(conn, &services, on_char).await;
     services.len()
 }
 
@@ -2770,8 +3215,11 @@ pub(crate) async fn walk_services(
                 use core::fmt::Write;
                 let mut pf: heapless::String<48> = heapless::String::new();
                 char_props(ch.props, &mut pf);
-                let _ = write!(s, "    - chr h={:04X} val={:04X} [{}] ",
-                    ch.decl_handle, ch.value_handle, pf);
+                let _ = write!(
+                    s,
+                    "    - chr h={:04X} val={:04X} [{}] ",
+                    ch.decl_handle, ch.value_handle, pf
+                );
                 decoder::gatt::write_uuid(&mut s, &ch.uuid[..ch.uuid_len as usize]);
                 decoder::emit(s);
             }
@@ -2816,6 +3264,6 @@ pub(crate) async fn terminate(conn: &mut Conn) {
     buf[3] = 0x13; // reason: remote user terminated
     let _ = conn_event(conn, 4).await;
     ensure_disabled();
+    disarm_rxen();
     configure_ble();
 }
-

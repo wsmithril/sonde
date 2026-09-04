@@ -9,12 +9,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// "Ola Friends" earbuds — manufacturer data (Company ID 0xCEBD, unregistered).
 pub(super) struct OlaFriends;
 impl super::VendorDecoder for OlaFriends {
-    fn company_ids(&self) -> &'static [u16] { &[0xCEBD] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0xCEBD]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 11 {
             hexdump(body, ctx.base, 6);
@@ -38,7 +40,10 @@ impl super::VendorDecoder for OlaFriends {
             let mut s: LogStr = LogStr::new();
             let _ = write!(s, "    Ola Friends: name=\"");
             match core::str::from_utf8(&body[11..]) {
-                Ok(n) => { let _ = write!(s, "{}\"", n); emit(s); }
+                Ok(n) => {
+                    let _ = write!(s, "{}\"", n);
+                    emit(s);
+                }
                 Err(e) => {
                     // A multi-byte character split by the length limit leaves an
                     // incomplete tail; print the part that decodes.

@@ -9,12 +9,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// MOTIVE TECHNOLOGIES, INC. — service data (UUID 0xFC70).
 pub(super) struct Motive;
 impl super::VendorDecoder for Motive {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFC70] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFC70]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 5 {
             hexdump(body, ctx.base, 6);

@@ -9,12 +9,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, write_hex, LogStr};
+use super::{LogStr, emit, hexdump, write_hex};
 
 /// mobike (Hong Kong) Limited — manufacturer data (Company ID 0x04B3).
 pub(super) struct Mobike;
 impl super::VendorDecoder for Mobike {
-    fn company_ids(&self) -> &'static [u16] { &[0x04B3] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x04B3]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if body.len() < 8 {
             hexdump(body, ctx.base, 6);

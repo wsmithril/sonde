@@ -8,16 +8,25 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Baidu — service data (UUID 0xFDC2): DuerOS / device-provisioning SDK.
 pub(super) struct Baidu;
 impl super::VendorDecoder for Baidu {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFDC2] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFDC2]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s, "    Baidu 0xFDC2: frame=0x{:02X} data len={}", body[0], body.len() - 1);
+        let _ = write!(
+            s,
+            "    Baidu 0xFDC2: frame=0x{:02X} data len={}",
+            body[0],
+            body.len() - 1
+        );
         emit(s);
         hexdump(&body[1..], ctx.base + 1, 6);
     }

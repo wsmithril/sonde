@@ -49,7 +49,13 @@ pub fn write_prefix(out: &mut impl Write, queued_at: Instant) {
             let _ = write!(
                 out,
                 "[{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z] ",
-                y, mo, d, h, mi, s, ms % 1000
+                y,
+                mo,
+                d,
+                h,
+                mi,
+                s,
+                ms % 1000
             );
         }
         None => {

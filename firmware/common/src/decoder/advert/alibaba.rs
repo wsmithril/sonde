@@ -7,22 +7,28 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Taobao / Alibaba — manufacturer data (Company ID 0x01A8).
 pub(super) struct Alibaba;
 impl super::VendorDecoder for Alibaba {
-    fn company_ids(&self) -> &'static [u16] { &[0x01A8] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x01A8]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         let mut s: LogStr = LogStr::new();
         let _ = write!(s, "    Taobao/AliGenie:");
         match longest_ascii_run(body) {
             Some((run, off)) => {
                 let _ = write!(s, " id=\"");
-                for &b in run { let _ = s.push(b as char); }
+                for &b in run {
+                    let _ = s.push(b as char);
+                }
                 let _ = write!(s, "\" @p{:02X}", ctx.base + off);
             }
-            None => { let _ = write!(s, " (no ascii id)"); }
+            None => {
+                let _ = write!(s, " (no ascii id)");
+            }
         }
         emit(s);
         hexdump(body, ctx.base, 6);
@@ -38,8 +44,13 @@ fn longest_ascii_run(body: &[u8]) -> Option<(&[u8], usize)> {
     while i < body.len() {
         if (0x20..=0x7E).contains(&body[i]) {
             let start = i;
-            while i < body.len() && (0x20..=0x7E).contains(&body[i]) { i += 1; }
-            if i - start > best_len { best_len = i - start; best_start = start; }
+            while i < body.len() && (0x20..=0x7E).contains(&body[i]) {
+                i += 1;
+            }
+            if i - start > best_len {
+                best_len = i - start;
+                best_start = start;
+            }
         } else {
             i += 1;
         }

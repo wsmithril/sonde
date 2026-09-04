@@ -6,14 +6,18 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Harman International — service data (UUID 0xFDDF).
 pub(super) struct Harman;
 impl super::VendorDecoder for Harman {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFDDF] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFDDF]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
         let _ = write!(s, "    Harman/JBL 0xFDDF: len={}", body.len());
         emit(s);

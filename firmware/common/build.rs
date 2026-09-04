@@ -35,10 +35,22 @@ fn main() {
     // AD types are looked up for every AD structure of every packet, and URI
     // schemes are ~2 KB; both are cheaper to keep in internal flash than to
     // reach through the external-flash asset path.
-    generate_u16_table(out, "../../assets/ad_types.yaml", "value",
-        "AD_TYPE_NAMES", "ad_type_names.rs", 40);
-    generate_u16_table(out, "../../assets/uri_schemes.yaml", "value",
-        "URI_SCHEMES", "uri_schemes.rs", 100);
+    generate_u16_table(
+        out,
+        "../../assets/ad_types.yaml",
+        "value",
+        "AD_TYPE_NAMES",
+        "ad_type_names.rs",
+        40,
+    );
+    generate_u16_table(
+        out,
+        "../../assets/uri_schemes.yaml",
+        "value",
+        "URI_SCHEMES",
+        "uri_schemes.rs",
+        100,
+    );
 
     // ── Big lookup tables → external QSPI flash asset image ────────────────────
     // The IEEE MA-L (~486 KB) and long-prefix (~200 KB) address tables, the
@@ -137,7 +149,10 @@ fn parse_kv_u16(yaml: &str, id_key: &str) -> Vec<(u16, String)> {
         let after_dash = t.strip_prefix('-').map(str::trim_start).unwrap_or(t);
         if let Some(rest) = after_dash.strip_prefix(&value_prefix) {
             let v = rest.trim();
-            let v = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+            let v = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .unwrap_or(v);
             pending = u16::from_str_radix(v, 16).ok();
         } else if let Some(rest) = after_dash.strip_prefix("name:")
             && let Some(id) = pending.take()
@@ -195,7 +210,14 @@ fn parse_uuid() -> Vec<(u16, String)> {
 /// Used for the small core tables that stay in internal flash because they are
 /// consulted on every packet (AD types) or are only a couple of KB (URI
 /// schemes), rather than going into the external-flash asset image.
-fn generate_u16_table(out: &Path, src: &str, id_key: &str, static_name: &str, file: &str, min: usize) {
+fn generate_u16_table(
+    out: &Path,
+    src: &str,
+    id_key: &str,
+    static_name: &str,
+    file: &str,
+    min: usize,
+) {
     println!("cargo:rerun-if-changed={src}");
     let yaml = fs::read_to_string(src).unwrap_or_else(|e| panic!("failed to read {src}: {e}"));
     let mut entries = parse_kv_u16(&yaml, id_key);
@@ -252,7 +274,11 @@ fn generate_appearance_table(out: &Path) {
         } else if let Some(rest) = after_dash.strip_prefix("name:")
             && let Some((is_sub, id)) = pending.take()
         {
-            let full = if is_sub { (cur_cat << 6) | (id & 0x3F) } else { cur_cat << 6 };
+            let full = if is_sub {
+                (cur_cat << 6) | (id & 0x3F)
+            } else {
+                cur_cat << 6
+            };
             entries.push((full, yaml_unquote(rest.trim())));
         }
     }
@@ -278,7 +304,10 @@ fn generate_appearance_table(out: &Path) {
 }
 
 fn parse_hex_u16(v: &str) -> Option<u16> {
-    let v = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+    let v = v
+        .strip_prefix("0x")
+        .or_else(|| v.strip_prefix("0X"))
+        .unwrap_or(v);
     u16::from_str_radix(v, 16).ok()
 }
 
@@ -289,7 +318,9 @@ fn yaml_unquote(s: &str) -> String {
     if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
         s[1..s.len() - 1].replace("''", "'")
     } else if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
+        s[1..s.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
     } else {
         s.to_string()
     }
@@ -325,7 +356,12 @@ fn pack_u16_table(mut entries: Vec<(u16, String)>) -> (Vec<u8>, Vec<(u16, u32)>)
         };
         write_varint(&mut sec, delta);
         let bytes = name.as_bytes();
-        assert!(bytes.len() <= 255, "name too long ({} B): {}", bytes.len(), name);
+        assert!(
+            bytes.len() <= 255,
+            "name too long ({} B): {}",
+            bytes.len(),
+            name
+        );
         sec.push(bytes.len() as u8);
         sec.extend_from_slice(bytes);
         prev = key;
@@ -399,9 +435,12 @@ struct OuiTables {
 /// `hex_digits` is the assignment width in hex characters — 7 for a 28-bit MA-M
 /// block, 9 for a 36-bit MA-S or IAB one — of which the leading 6 are the parent
 /// OUI and the rest are the extension.
-fn parse_long_registry(src: &str, registry: &str, hex_digits: usize, min: usize)
-    -> Vec<(u32, u32, Vec<u8>)>
-{
+fn parse_long_registry(
+    src: &str,
+    registry: &str,
+    hex_digits: usize,
+    min: usize,
+) -> Vec<(u32, u32, Vec<u8>)> {
     println!("cargo:rerun-if-changed={src}");
     let csv = fs::read_to_string(src).unwrap_or_else(|e| panic!("failed to read {src}: {e}"));
 
@@ -520,7 +559,11 @@ fn build_oui() -> OuiTables {
 
     // Alphabet: distinct name bytes across all four registries, sorted, remapped
     // to ids 0..A.
-    let names = || recs.iter().map(|(_, n)| n).chain(subs.iter().map(|(_, n)| n));
+    let names = || {
+        recs.iter()
+            .map(|(_, n)| n)
+            .chain(subs.iter().map(|(_, n)| n))
+    };
     let mut chars: Vec<u8> = {
         let mut set = std::collections::HashSet::new();
         for n in names() {
@@ -533,8 +576,11 @@ fn build_oui() -> OuiTables {
     chars.sort_unstable();
     let alpha = chars.len();
     assert!(alpha < 256, "OUI alphabet {} too large for BPE", alpha);
-    let cmap: std::collections::HashMap<u8, u8> =
-        chars.iter().enumerate().map(|(i, &b)| (b, i as u8)).collect();
+    let cmap: std::collections::HashMap<u8, u8> = chars
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| (b, i as u8))
+        .collect();
     let mut seqs: Vec<Vec<u8>> = names()
         .map(|n| n.iter().map(|b| cmap[b]).collect())
         .collect();

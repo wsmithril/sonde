@@ -8,6 +8,7 @@
 
 use embassy_nrf::pac;
 use embassy_nrf::pac::radio::vals;
+use embassy_time::{Duration, Instant};
 
 // ── BLE advertising constants ─────────────────────────────────────────────────
 
@@ -18,6 +19,159 @@ pub const ADV_CRC_INIT: u32 = 0x55_5555;
 /// BLE CRC polynomial (x24 + x10 + x9 + x6 + x4 + x3 + x + 1), shared by adv and
 /// data channels; only the init value differs per connection.
 pub const ADV_CRC_POLY: u32 = 0x00_065B;
+
+// ── Bounded BLE CRC repair ───────────────────────────────────────────────────
+
+/// The bit order in which this RADIO exposes the received CRC.
+///
+/// The PDU shift-register state is not documented in the same representation as
+/// `RXCRC`.  We learn this from a packet the hardware has already CRC-validated
+/// instead of relying on a chip-specific assumption.
+#[derive(Copy, Clone)]
+enum RxCrcOrder {
+    State,
+    BitReversed24,
+}
+
+/// Per-radio calibration for optional, bounded CRC-error repair.
+///
+/// A repair is admitted only when a clean PDU has first established how RXCRC is
+/// represented.  It changes payload bits only: a damaged length header would
+/// make the DMA extent unknowable, so accepting it would turn a useful recovery
+/// path into a parser-safety risk.
+#[derive(Default)]
+pub struct BleCrcRepair {
+    order: Option<RxCrcOrder>,
+}
+
+impl BleCrcRepair {
+    /// Record a CRC-good PDU and calibrate `RXCRC`'s representation if possible.
+    pub fn observe_good(&mut self, pdu: &[u8], init: u32, rxcrc: u32) {
+        if self.order.is_some() {
+            return;
+        }
+        let state = ble_crc_state(pdu, init);
+        self.order = if rxcrc == state {
+            Some(RxCrcOrder::State)
+        } else if rxcrc == reverse24(state) {
+            Some(RxCrcOrder::BitReversed24)
+        } else {
+            None
+        };
+    }
+
+    /// Correct one damaged payload bit, returning its PDU bit index.
+    ///
+    /// This is O(PDU bits): at most 2,064 short state updates for a 258-byte
+    /// DMA buffer.  Two-bit and three-bit brute force would be O(n²) and O(n³),
+    /// respectively, and are intentionally not attempted on the capture path.
+    pub fn repair_one_payload_bit(&self, pdu: &mut [u8], init: u32, rxcrc: u32) -> Option<u16> {
+        self.repair_one_payload_bit_until(pdu, init, rxcrc, || false)
+    }
+
+    /// Correct one damaged payload bit unless `expired` says a newer packet has
+    /// arrived. `expired` is polled every 64 candidate bits, bounding sniffer
+    /// work to the space between packet arrivals as well as to one PDU.
+    pub fn repair_one_payload_bit_until<F>(
+        &self,
+        pdu: &mut [u8],
+        init: u32,
+        rxcrc: u32,
+        expired: F,
+    ) -> Option<u16>
+    where
+        F: FnMut() -> bool,
+    {
+        let expected_state = match self.order? {
+            RxCrcOrder::State => rxcrc,
+            RxCrcOrder::BitReversed24 => reverse24(rxcrc),
+        };
+        repair_one_bit_from(16, pdu, init, expected_state, expired)
+    }
+}
+
+/// CRC state representation used by BLE's link-layer shift register. PDU bits
+/// are fed least-significant-bit first.
+fn ble_crc_state(pdu: &[u8], init: u32) -> u32 {
+    let mut state = init & 0x00FF_FFFF;
+    for &byte in pdu {
+        for bit in 0..8 {
+            let feedback = ((state >> 23) ^ u32::from(byte >> bit)) & 1;
+            state = (state << 1) & 0x00FF_FFFF;
+            if feedback != 0 {
+                state ^= ADV_CRC_POLY;
+            }
+        }
+    }
+    state
+}
+
+fn reverse24(v: u32) -> u32 {
+    v.reverse_bits() >> 8
+}
+
+/// Repair one bit at or after `first_bit`, using the received CRC syndrome.
+fn repair_one_bit_from(
+    first_bit: usize,
+    pdu: &mut [u8],
+    init: u32,
+    expected_state: u32,
+    mut expired: impl FnMut() -> bool,
+) -> Option<u16> {
+    let syndrome = ble_crc_state(pdu, init) ^ expected_state;
+    if syndrome == 0 || pdu.len() > u16::MAX as usize / 8 {
+        return None;
+    }
+
+    // A flipped final input bit changes the state by this value. Walking toward
+    // the start applies the zero-input transition once per preceding bit.
+    let mut delta = ADV_CRC_POLY;
+    for bit_index in (0..pdu.len() * 8).rev() {
+        if bit_index.is_multiple_of(64) && expired() {
+            return None;
+        }
+        if bit_index >= first_bit && delta == syndrome {
+            pdu[bit_index / 8] ^= 1 << (bit_index % 8);
+            return Some(bit_index as u16);
+        }
+        let feedback = (delta >> 23) & 1;
+        delta = (delta << 1) & 0x00FF_FFFF;
+        if feedback != 0 {
+            delta ^= ADV_CRC_POLY;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod crc_tests {
+    use super::*;
+
+    #[test]
+    fn crc24_ble_check_value() {
+        // Published CRC-24/BLE check value, in the conventional on-air bit order.
+        assert_eq!(
+            reverse24(ble_crc_state(b"123456789", ADV_CRC_INIT)),
+            0xC2_5A_56
+        );
+    }
+
+    #[test]
+    fn repairs_one_payload_bit() {
+        let init = 0x12_3456;
+        let original = [
+            0x02, 0x0A, 0x19, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        ];
+        let expected = ble_crc_state(&original, init);
+        let mut bad = original;
+        bad[7] ^= 0b0010_0000;
+        assert_eq!(
+            repair_one_bit_from(16, &mut bad, init, expected, || false),
+            Some(61)
+        );
+        assert_eq!(bad, original);
+    }
+}
 
 // ── Radio helpers ─────────────────────────────────────────────────────────────
 
@@ -105,57 +259,164 @@ pub fn disable_silent() {
 // with the aux offset. TIMER1 plus one PPI channel take the executor out of the
 // one deadline that matters: the compare event drives TASKS_RXEN in hardware at
 // the programmed time regardless of what the CPU is doing. TIMER1 is otherwise
-// unused (embassy-time runs on RTC1) and PPI channel 0 is free — the RADIO is
-// driven here through raw registers, not the embassy Ppi HAL.
+// unused (embassy-time runs on RTC1) and PPI channels 0–1 are free — the RADIO
+// is driven here through raw registers, not the embassy Ppi HAL.
 
 /// PPI channel routing TIMER1.EVENTS_COMPARE[0] → RADIO.TASKS_RXEN.
 const PPI_CH_RXEN: usize = 0;
+/// PPI channel routing RADIO.EVENTS_END → TIMER1.TASKS_CAPTURE[1].
+const PPI_CH_END_CAPTURE: usize = 1;
+
+/// A mapping from TIMER1's 1 MHz counter to Embassy time for one RX window.
+///
+/// `Instant::now()` is based on RTC1 and therefore quantized to its 32.768 kHz
+/// tick. `RADIO.END` is captured into TIMER1 over PPI at the hardware event, so
+/// deriving an end time through this mapping removes poll-loop latency from the
+/// connection follower's re-anchor.
+#[derive(Clone, Copy)]
+pub struct RadioEndClock {
+    instant: Instant,
+    counter: u32,
+}
+
+impl RadioEndClock {
+    /// Capture and return TIMER1's current 1 MHz tick count.
+    pub fn now_ticks(&self) -> u32 {
+        let t = pac::TIMER1;
+        t.tasks_capture(2).write_value(1);
+        t.cc(2).read()
+    }
+
+    /// Return the TIMER1 tick latched by the most recent `RADIO.END` event.
+    ///
+    /// Read this before another received PDU reaches END: CC1 deliberately
+    /// holds only the latest capture.
+    pub fn end_ticks(&self) -> u32 {
+        pac::TIMER1.cc(1).read()
+    }
+
+    /// Convert a TIMER1 tick to an `Instant` for log timestamps only.
+    ///
+    /// Connection timing must retain the tick value: `Instant` is RTC1-based
+    /// and rounds to 30.5 µs ticks.
+    pub fn instant_at(&self, ticks: u32) -> Instant {
+        self.instant + Duration::from_micros(ticks.wrapping_sub(self.counter) as u64)
+    }
+
+    /// Return the time captured by the most recent `RADIO.END` event.
+    ///
+    /// This compatibility helper is for log timestamps. Connection anchors use
+    /// [`Self::end_ticks`] directly so they retain TIMER1 precision.
+    pub fn end_instant(&self) -> Instant {
+        self.instant_at(self.end_ticks())
+    }
+
+    /// Hardware-arm RXEN at an absolute TIMER1 tick.
+    ///
+    /// The timer runs continuously for a connection follow. A signed modular
+    /// comparison is safe here because no arm is more than one connection
+    /// interval (< 2³¹ µs) away, including across TIMER1's 71-minute wrap.
+    pub fn arm_rxen_at(&self, at: u32) {
+        self.arm_task_at(at, pac::RADIO.tasks_rxen().as_ptr() as usize as u32);
+    }
+
+    /// Hardware-arm RADIO.TASKS_TXEN at an absolute TIMER1 tick.
+    ///
+    /// The central uses this to start its default-ramp TX early enough that the
+    /// first bit lands on a 1 MHz connection anchor rather than an RTC-rounded
+    /// approximation of one.
+    pub fn arm_txen_at(&self, at: u32) {
+        self.arm_task_at(at, pac::RADIO.tasks_txen().as_ptr() as usize as u32);
+    }
+
+    fn arm_task_at(&self, at: u32, task: u32) {
+        let r = pac::RADIO;
+        let now = self.now_ticks();
+        let remaining = at.wrapping_sub(now) as i32;
+        if remaining <= RXEN_MIN_LEAD_US as i32 {
+            // The only current immediate caller is RXEN. TXEN is always armed
+            // a full default-ramp before its air-time anchor.
+            if task == r.tasks_txen().as_ptr() as usize as u32 {
+                r.tasks_txen().write_value(1);
+            } else {
+                r.tasks_rxen().write_value(1);
+            }
+            return;
+        }
+
+        let t = pac::TIMER1;
+        t.cc(0).write_value(at);
+        t.events_compare(0).write_value(0);
+
+        let ppi = pac::PPI;
+        ppi.ch(PPI_CH_RXEN)
+            .eep()
+            .write_value(t.events_compare(0).as_ptr() as usize as u32);
+        ppi.ch(PPI_CH_RXEN).tep().write_value(task);
+        ppi.chenset().write(|w| w.set_ch(PPI_CH_RXEN, true));
+    }
+}
 
 /// Leads at or below this fire RXEN immediately: the timer path's own setup
 /// latency would otherwise land after so near a deadline, and the short-offset
 /// case already performed best when driven directly.
 const RXEN_MIN_LEAD_US: u32 = 20;
 
-/// Arm `RADIO.TASKS_RXEN` to fire `delay_us` from now, in hardware.
+/// Start TIMER1's 1 MHz counter and capture every `RADIO.END` into CC1.
 ///
-/// Programs a one-shot TIMER1 compare and routes it to TASKS_RXEN over a PPI
-/// channel, so the receiver ramps at the scheduled instant even while another
-/// task holds the CPU. COMPARE0 also stops the timer through a built-in
-/// shortcut, so the arm is self-terminating. Pair with [`disarm_rxen`] once the
-/// RX window closes. Very short leads fire immediately — see [`RXEN_MIN_LEAD_US`].
-pub fn arm_rxen_after(delay_us: u32) {
+/// The returned clock maps the hardware counter to Embassy time. It remains
+/// valid until [`disarm_rxen`] is called. TIMER1 intentionally keeps running
+/// after COMPARE0 so it can timestamp the received packet.
+pub fn start_end_capture() -> RadioEndClock {
     let r = pac::RADIO;
-    if delay_us <= RXEN_MIN_LEAD_US {
-        r.tasks_rxen().write_value(1);
-        return;
-    }
     let t = pac::TIMER1;
     t.tasks_stop().write_value(1);
     t.tasks_clear().write_value(1);
-    t.mode().write(|w| w.set_mode(pac::timer::vals::Mode::Timer));
-    t.bitmode().write(|w| w.set_bitmode(pac::timer::vals::Bitmode::_32bit));
-    t.prescaler().write(|w| w.set_prescaler(4)); // 16 MHz >> 4 = 1 MHz → 1 tick = 1 µs
-    t.cc(0).write_value(delay_us);
-    t.events_compare(0).write_value(0);
-    t.shorts().write(|w| w.set_compare_stop(0, true));
+    t.mode()
+        .write(|w| w.set_mode(pac::timer::vals::Mode::Timer));
+    t.bitmode()
+        .write(|w| w.set_bitmode(pac::timer::vals::Bitmode::_32bit));
+    t.prescaler().write(|w| w.set_prescaler(4)); // 16 MHz >> 4 = 1 MHz
+    t.shorts().write(|_w| {});
+    t.tasks_start().write_value(1);
 
     let ppi = pac::PPI;
-    ppi.ch(PPI_CH_RXEN)
+    ppi.ch(PPI_CH_END_CAPTURE)
         .eep()
-        .write_value(t.events_compare(0).as_ptr() as usize as u32);
-    ppi.ch(PPI_CH_RXEN)
+        .write_value(r.events_end().as_ptr() as usize as u32);
+    ppi.ch(PPI_CH_END_CAPTURE)
         .tep()
-        .write_value(r.tasks_rxen().as_ptr() as usize as u32);
-    ppi.chenset().write(|w| w.set_ch(PPI_CH_RXEN, true));
+        .write_value(t.tasks_capture(1).as_ptr() as usize as u32);
+    ppi.chenset().write(|w| w.set_ch(PPI_CH_END_CAPTURE, true));
 
-    t.tasks_start().write_value(1);
+    // Sample both clocks as closely as possible. The absolute phase may be off
+    // by one RTC tick, but every later RADIO.END has TIMER1 precision.
+    t.tasks_capture(2).write_value(1);
+    RadioEndClock {
+        instant: Instant::now(),
+        counter: t.cc(2).read(),
+    }
 }
 
-/// Tear down the [`arm_rxen_after`] wiring: disable the PPI channel and stop
-/// TIMER1. Safe whether or not the compare fired — the one-shot shortcut may
-/// already have stopped the timer, and stopping a stopped timer is a no-op.
+/// Arm `RADIO.TASKS_RXEN` to fire `delay_us` from now, in hardware, and return
+/// a hardware END timestamp clock for this receive window.
+///
+/// TIMER1 COMPARE0 routes to TASKS_RXEN over PPI, so the receiver ramps at the
+/// scheduled instant even while another task holds the CPU. Pair with
+/// [`disarm_rxen`] once the RX window closes. Very short leads fire immediately
+/// — see [`RXEN_MIN_LEAD_US`].
+pub fn arm_rxen_after(delay_us: u32) -> RadioEndClock {
+    let clock = start_end_capture();
+    clock.arm_rxen_at(clock.now_ticks().wrapping_add(delay_us));
+    clock
+}
+
+/// Tear down the RXEN and END-capture PPI wiring, then stop TIMER1.
 pub fn disarm_rxen() {
-    pac::PPI.chenclr().write(|w| w.set_ch(PPI_CH_RXEN, true));
+    pac::PPI.chenclr().write(|w| {
+        w.set_ch(PPI_CH_RXEN, true);
+        w.set_ch(PPI_CH_END_CAPTURE, true);
+    });
     pac::TIMER1.tasks_stop().write_value(1);
 }
 
@@ -285,7 +546,8 @@ const CRC_POLY_154: u32 = 0x0001_1021;
 /// The caller sets FREQUENCY per channel; see [`zb_ch_freq`].
 pub fn configure_154() {
     let r = pac::RADIO;
-    r.mode().write(|w| w.set_mode(vals::Mode::Ieee802154250kbit));
+    r.mode()
+        .write(|w| w.set_mode(vals::Mode::Ieee802154250kbit));
     r.pcnf0().write(|w| {
         // PHR is one 8-bit length octet, and 802.15.4 has no S0/S1 equivalent.
         w.set_lflen(8);

@@ -127,7 +127,10 @@ impl Cmd {
     /// Whether issuing this command changes device state.
     pub fn mutating(self) -> bool {
         use Cmd::*;
-        !matches!(self, GetSoftwareVersion | GetSecretKey | GetSeid | GetChallenge)
+        !matches!(
+            self,
+            GetSoftwareVersion | GetSecretKey | GetSeid | GetChallenge
+        )
     }
 
     /// The safe, read-only commands — always probed (never change state).

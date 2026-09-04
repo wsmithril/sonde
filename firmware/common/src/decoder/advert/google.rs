@@ -9,13 +9,15 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Google — Nearby service data: Play Services (UUID 0xFCF1) and cross-device
 /// (UUID 0xFEF3); dispatched by UUID.
 pub(super) struct Google;
 impl super::VendorDecoder for Google {
-    fn service_uuids(&self) -> &'static [u16] { &[0xFCF1, 0xFEF3] }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFCF1, 0xFEF3]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         match ctx.key {
             0xFEF3 => Self::decode_fef3(body, ctx.base),
@@ -26,11 +28,16 @@ impl super::VendorDecoder for Google {
 
 impl Google {
     fn decode_fcf1(f: &[u8], base: usize) {
-        if f.is_empty() { return; }
+        if f.is_empty() {
+            return;
+        }
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s,
+        let _ = write!(
+            s,
             "    Google 0xFCF1 (Play Services, undocumented): frame=0x{:02X} rotating len={}",
-            f[0], f.len() - 1);
+            f[0],
+            f.len() - 1
+        );
         emit(s);
         hexdump(&f[1..], base + 1, 6);
     }
@@ -43,12 +50,20 @@ impl Google {
     /// plaintext device name; in contact/hidden mode it is an encrypted metadata
     /// blob, so it stays as the rotating hex dump.
     fn decode_fef3(f: &[u8], base: usize) {
-        if f.is_empty() { return; }
+        if f.is_empty() {
+            return;
+        }
         let h = f[0];
         let mut s: LogStr = LogStr::new();
-        let _ = write!(s,
+        let _ = write!(
+            s,
             "    Google 0xFEF3 (Nearby Connections): v{} sockv{} fast={} 2nd-profile={} rotating len={}",
-            h >> 5, (h >> 2) & 0x07, (h >> 1) & 0x01, h & 0x01, f.len() - 1);
+            h >> 5,
+            (h >> 2) & 0x07,
+            (h >> 1) & 0x01,
+            h & 0x01,
+            f.len() - 1
+        );
         emit(s);
         hexdump(&f[1..], base + 1, 6);
     }

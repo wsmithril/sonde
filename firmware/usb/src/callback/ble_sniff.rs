@@ -22,8 +22,12 @@ async fn provision_task(mut rx: Receiver<'static, UsbDriver>, qspi: Qspi<'static
     provision(&mut rx, qspi).await;
 }
 
-#[embassy_executor::task]
-pub async fn run(spawner: Spawner, rx: Receiver<'static, UsbDriver>, q: QspiParts, l: LedParts) {
+pub async fn run(
+    spawner: Spawner,
+    rx: Receiver<'static, UsbDriver>,
+    q: QspiParts,
+    l: LedParts,
+) -> ! {
     ulog!("mode=ble_sniff\r\n");
     let mut m = mode::BleSniff::<ConsoleSink>::new();
     // The build-specific callback the mode `await`s in `init`: bring up the QSPI
@@ -91,7 +95,9 @@ async fn provision(rx: &mut Receiver<'static, UsbDriver>, mut qspi: Qspi<'static
         };
         ulogf!(
             "prov: handshake len={} crc=0x{:08x} (build crc=0x{:08x})",
-            len, want_crc, asset::ASSET_CRC32
+            len,
+            want_crc,
+            asset::ASSET_CRC32
         );
 
         // Reject early if the image doesn't match this firmware build.
@@ -143,7 +149,10 @@ async fn provision(rx: &mut Receiver<'static, UsbDriver>, mut qspi: Qspi<'static
             for b in &mut buf.0[take..wlen] {
                 *b = 0xFF;
             }
-            if qspi.blocking_write(asset::HDR_SIZE + off, &buf.0[..wlen]).is_err() {
+            if qspi
+                .blocking_write(asset::HDR_SIZE + off, &buf.0[..wlen])
+                .is_err()
+            {
                 ulogf!("prov: write failed at offset {}", off);
                 ok = false;
                 break;
@@ -174,7 +183,10 @@ async fn provision(rx: &mut Receiver<'static, UsbDriver>, mut qspi: Qspi<'static
         } else {
             ulogf!(
                 "prov: crc/verify mismatch got=0x{:08x} want=0x{:08x} build=0x{:08x} ok={}",
-                got, want_crc, asset::ASSET_CRC32, ok
+                got,
+                want_crc,
+                asset::ASSET_CRC32,
+                ok
             );
             ok = false;
         }
@@ -191,7 +203,10 @@ async fn provision(rx: &mut Receiver<'static, UsbDriver>, mut qspi: Qspi<'static
 
 /// Read the 15-byte handshake (`"BSPROV\n"` + len + crc) across CDC packets,
 /// returning `(len, crc)` on a valid header or `None` to retry.
-async fn read_handshake(rx: &mut Receiver<'static, UsbDriver>, buf: &mut [u8]) -> Option<(u32, u32)> {
+async fn read_handshake(
+    rx: &mut Receiver<'static, UsbDriver>,
+    buf: &mut [u8],
+) -> Option<(u32, u32)> {
     let mut acc = [0u8; 15];
     let mut have = 0usize;
     while have < acc.len() {

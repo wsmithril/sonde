@@ -37,11 +37,11 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 
-use super::{Ctx, Mode};
+use super::{Ctx, Mode, ModeRef};
 use crate::hal::hash::fnv1a;
 use crate::hal::radio::{disable_silent, ensure_disabled, use_fast_ramp_up, zb_ch_freq};
 use crate::led::{Gpio, OnBoardLed};
-use crate::{led, LogLine, Rng, SyncBuf};
+use crate::{LogLine, Rng, SyncBuf, led};
 
 // ── Channels ──────────────────────────────────────────────────────────────────
 
@@ -159,13 +159,13 @@ const ED_POLL_LIMIT: u32 = 32;
 //                  and never written to RAM)
 //   [1+n]          LQI, appended by the hardware
 // PHR maxes at 127, so 1 + 125 + 1 = 127 bytes are ever written; 128 rounds it.
-static RX_BUF: SyncBuf<128> = SyncBuf::new();
+static RX_BUF: ModeRef<SyncBuf<128>> = ModeRef::new();
 
 /// Snapshot of the frame being processed, copied out of [`RX_BUF`]. PHYEND_START
 /// re-arms the receiver in hardware the instant a frame completes, so [`RX_BUF`]
 /// begins filling with the next one while we are still reading this — same race
 /// the BLE scanner runs, handled the same way.
-static PKT_BUF: SyncBuf<128> = SyncBuf::new();
+static PKT_BUF: ModeRef<SyncBuf<128>> = ModeRef::new();
 
 // ── Decode queue ──────────────────────────────────────────────────────────────
 
@@ -183,7 +183,8 @@ struct ZbPacket {
     ch: u8,
 }
 
-static RX_QUEUE: Channel<CriticalSectionRawMutex, ZbPacket, RX_QUEUE_DEPTH> = Channel::new();
+static RX_QUEUE: ModeRef<Channel<CriticalSectionRawMutex, ZbPacket, RX_QUEUE_DEPTH>> =
+    ModeRef::new();
 
 /// Copies a received MAC frame into the decode queue. A plain `fn` so the packet
 /// is built on the stack and stays out of the scan task's future; a full queue
@@ -260,17 +261,7 @@ struct Stats {
 
 struct StatsCell(UnsafeCell<Stats>);
 unsafe impl Sync for StatsCell {}
-static STATS: StatsCell = StatsCell(UnsafeCell::new(Stats {
-    cycles: 0,
-    frames: 0,
-    crc_err: 0,
-    dropped: 0,
-    torn: 0,
-    strongest: -128,
-    framestart: 0,
-    phyend: 0,
-    states: 0,
-}));
+static STATS: ModeRef<StatsCell> = ModeRef::new();
 
 fn stats_frame(rssi_dbm: i16) {
     let s = unsafe { &mut *STATS.0.get() };
@@ -318,12 +309,27 @@ fn stats_tick() {
     crate::ulogf!(
         "zb stats: cycles={} frames={} crc_err={} strongest={}dBm dev={} dropped={} torn={} \
          fs={} phyend={} states=0x{:04X}\r\n",
-        s.cycles, s.frames, s.crc_err, s.strongest, device_count(), s.dropped, s.torn,
-        s.framestart, s.phyend, s.states
+        s.cycles,
+        s.frames,
+        s.crc_err,
+        s.strongest,
+        device_count(),
+        s.dropped,
+        s.torn,
+        s.framestart,
+        s.phyend,
+        s.states
     );
     *s = Stats {
-        cycles: 0, frames: 0, crc_err: 0, dropped: 0, torn: 0, strongest: -128,
-        framestart: 0, phyend: 0, states: 0,
+        cycles: 0,
+        frames: 0,
+        crc_err: 0,
+        dropped: 0,
+        torn: 0,
+        strongest: -128,
+        framestart: 0,
+        phyend: 0,
+        states: 0,
     };
     nets_report();
 }
@@ -369,14 +375,12 @@ struct Net {
 
 struct NetTable(UnsafeCell<[Net; NET_SLOTS]>);
 unsafe impl Sync for NetTable {}
-static NETS: NetTable = NetTable(UnsafeCell::new(
-    [Net { pan: 0, ch: 0, used: false, stack: Stack::Unknown, frames: 0, best_rssi: -128 }; NET_SLOTS],
-));
+static NETS: ModeRef<NetTable> = ModeRef::new();
 
 /// Whether the table filled and dropped a PAN. Reported rather than silently
 /// truncating: a table that overflowed is a survey that under-counts, and the
 /// reader needs to know which of the two they are looking at.
-static NETS_FULL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static NETS_FULL: ModeRef<core::sync::atomic::AtomicBool> = ModeRef::new();
 
 fn net_note(pan: u16, ch: u8, rssi_dbm: i16, stack: Stack) {
     let t = unsafe { &mut *NETS.0.get() };
@@ -395,7 +399,14 @@ fn net_note(pan: u16, ch: u8, rssi_dbm: i16, stack: Stack) {
     }
     for n in t.iter_mut() {
         if !n.used {
-            *n = Net { pan, ch, used: true, stack, frames: 1, best_rssi: rssi_dbm };
+            *n = Net {
+                pan,
+                ch,
+                used: true,
+                stack,
+                frames: 1,
+                best_rssi: rssi_dbm,
+            };
             return;
         }
     }
@@ -407,11 +418,18 @@ fn nets_report() {
     for n in t.iter().filter(|n| n.used) {
         crate::ulogf!(
             "zb net: pan=0x{:04X} ch={} stack={} frames={} best={}dBm\r\n",
-            n.pan, n.ch, n.stack.name(), n.frames, n.best_rssi
+            n.pan,
+            n.ch,
+            n.stack.name(),
+            n.frames,
+            n.best_rssi
         );
     }
     if NETS_FULL.load(Ordering::Relaxed) {
-        crate::ulogf!("zb net: table full ({} slots) — further PANs not counted\r\n", NET_SLOTS);
+        crate::ulogf!(
+            "zb net: table full ({} slots) — further PANs not counted\r\n",
+            NET_SLOTS
+        );
     }
 }
 
@@ -428,8 +446,76 @@ const DEV_SLOTS: usize = 128;
 
 struct DevSet(UnsafeCell<[u16; DEV_SLOTS]>);
 unsafe impl Sync for DevSet {}
-static DEVS: DevSet = DevSet(UnsafeCell::new([0u16; DEV_SLOTS]));
-static DEV_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static DEVS: ModeRef<DevSet> = ModeRef::new();
+static DEV_COUNT: ModeRef<core::sync::atomic::AtomicU32> = ModeRef::new();
+
+/// All IEEE 802.15.4 survey state. It is mutually exclusive with every BLE
+/// boot mode, so the binary stores it in the overlaid mode arena.
+pub struct Storage {
+    rx_buf: SyncBuf<128>,
+    pkt_buf: SyncBuf<128>,
+    rx_queue: Channel<CriticalSectionRawMutex, ZbPacket, RX_QUEUE_DEPTH>,
+    stats: StatsCell,
+    nets: NetTable,
+    nets_full: core::sync::atomic::AtomicBool,
+    devs: DevSet,
+    dev_count: core::sync::atomic::AtomicU32,
+}
+
+impl Storage {
+    pub const fn new() -> Self {
+        Self {
+            rx_buf: SyncBuf::new(),
+            pkt_buf: SyncBuf::new(),
+            rx_queue: Channel::new(),
+            stats: StatsCell(UnsafeCell::new(Stats {
+                cycles: 0,
+                frames: 0,
+                crc_err: 0,
+                dropped: 0,
+                torn: 0,
+                strongest: -128,
+                framestart: 0,
+                phyend: 0,
+                states: 0,
+            })),
+            nets: NetTable(UnsafeCell::new(
+                [Net {
+                    pan: 0,
+                    ch: 0,
+                    used: false,
+                    stack: Stack::Unknown,
+                    frames: 0,
+                    best_rssi: -128,
+                }; NET_SLOTS],
+            )),
+            nets_full: core::sync::atomic::AtomicBool::new(false),
+            devs: DevSet(UnsafeCell::new([0u16; DEV_SLOTS])),
+            dev_count: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// # Safety
+/// Must be called exactly once before any Zigbee-mode task starts.
+pub unsafe fn bind_storage(storage: &'static Storage) {
+    unsafe {
+        RX_BUF.bind(&storage.rx_buf);
+        PKT_BUF.bind(&storage.pkt_buf);
+        RX_QUEUE.bind(&storage.rx_queue);
+        STATS.bind(&storage.stats);
+        NETS.bind(&storage.nets);
+        NETS_FULL.bind(&storage.nets_full);
+        DEVS.bind(&storage.devs);
+        DEV_COUNT.bind(&storage.dev_count);
+    }
+}
 
 fn device_note(addr: &[u8]) {
     // 0 is the empty marker, so fold it onto a non-zero value rather than
@@ -591,7 +677,13 @@ pub async fn scan(rng: &mut Rng, leds: &mut impl led::OnBoardLed) {
 }
 
 /// Holds the receiver open on one channel, queueing every frame that passes CRC.
-async fn dwell_channel(ch: u8, freq: u8, ms: u64, rng: &mut Rng, led: &mut Blink<'_, impl led::OnBoardLed>) {
+async fn dwell_channel(
+    ch: u8,
+    freq: u8,
+    ms: u64,
+    rng: &mut Rng,
+    led: &mut Blink<'_, impl led::OnBoardLed>,
+) {
     let r = pac::RADIO;
 
     // Retune flash. Started here and darkened by `service` inside the poll loop
@@ -833,12 +925,20 @@ fn parse_mhr(f: &[u8]) -> Option<Mhr> {
     };
 
     let (has_dst_pan, has_src_pan) = pan_presence(version, dst_mode, src_mode, compress);
-    let dst_pan = if has_dst_pan { Some(take_u16(f, &mut off)?) } else { None };
+    let dst_pan = if has_dst_pan {
+        Some(take_u16(f, &mut off)?)
+    } else {
+        None
+    };
     let dst = take_addr(f, &mut off, dst_mode);
     if dst_mode >= 2 && dst.is_none() {
         return None;
     }
-    let src_pan = if has_src_pan { Some(take_u16(f, &mut off)?) } else { None };
+    let src_pan = if has_src_pan {
+        Some(take_u16(f, &mut off)?)
+    } else {
+        None
+    };
     let src = take_addr(f, &mut off, src_mode);
     if src_mode >= 2 && src.is_none() {
         return None;
@@ -875,8 +975,20 @@ fn parse_mhr(f: &[u8]) -> Option<Mhr> {
     }
 
     Some(Mhr {
-        ftype, security, pending, ack_req, ie_present, version, seq,
-        dst_pan, dst, src_pan, src, sec_level, key_id_mode, frame_counter,
+        ftype,
+        security,
+        pending,
+        ack_req,
+        ie_present,
+        version,
+        seq,
+        dst_pan,
+        dst,
+        src_pan,
+        src,
+        sec_level,
+        key_id_mode,
+        frame_counter,
         hdr_len: off,
     })
 }
@@ -917,8 +1029,7 @@ fn beacon_stack(payload: &[u8]) -> Stack {
 
 /// Drains [`RX_QUEUE`], decoding and logging one frame at a time while the radio
 /// is listening. `with_log_stamp` gives every line the frame's air time.
-#[embassy_executor::task]
-pub async fn log_task() -> ! {
+pub async fn log_forever() -> ! {
     loop {
         let p = RX_QUEUE.receive().await;
         crate::with_log_stamp(p.t_air, || emit(&p));
@@ -934,7 +1045,8 @@ fn write_addr(s: &mut LogLine, a: &Addr) {
             // Printed big-endian (transmission order reversed) so the leading
             // bytes are the OUI, which is how an EUI-64 is normally read.
             let _ = write!(
-                s, "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                s,
+                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                 b[7], b[6], b[5], b[4], b[3], b[2], b[1], b[0]
             );
         }
@@ -947,7 +1059,10 @@ fn emit(p: &ZbPacket) {
     let Some(m) = parse_mhr(f) else {
         crate::ulogf!(
             "zb ch={} {}dBm lqi={} MALFORMED len={}\r\n",
-            p.ch, p.rssi_dbm, p.lqi, f.len()
+            p.ch,
+            p.rssi_dbm,
+            p.lqi,
+            f.len()
         );
         crate::hexdump(f, 0, 2);
         return;
@@ -957,7 +1072,11 @@ fn emit(p: &ZbPacket) {
 
     // A beacon is the only frame that names its stack; everything else inherits
     // whatever a beacon on the same PAN established earlier.
-    let stack = if m.ftype == 0 { beacon_stack(payload) } else { Stack::Unknown };
+    let stack = if m.ftype == 0 {
+        beacon_stack(payload)
+    } else {
+        Stack::Unknown
+    };
     if let Some(pan) = m.src_pan.or(m.dst_pan) {
         net_note(pan, p.ch, p.rssi_dbm, stack);
     }
@@ -970,8 +1089,13 @@ fn emit(p: &ZbPacket) {
 
     let mut s = LogLine::new();
     let _ = write!(
-        s, "zb ch={} {}dBm lqi={} {} v{}",
-        p.ch, p.rssi_dbm, p.lqi, ftype_name(m.ftype), m.version
+        s,
+        "zb ch={} {}dBm lqi={} {} v{}",
+        p.ch,
+        p.rssi_dbm,
+        p.lqi,
+        ftype_name(m.ftype),
+        m.version
     );
     if let Some(q) = m.seq {
         let _ = write!(s, " seq={}", q);
@@ -1047,14 +1171,21 @@ pub struct ZigbeeSniff<K: super::CaptureSink> {
 
 impl<K: super::CaptureSink> ZigbeeSniff<K> {
     pub fn new(leds: Gpio) -> Self {
-        Self { leds: Some(leds), _k: PhantomData }
+        Self {
+            leds: Some(leds),
+            _k: PhantomData,
+        }
     }
 }
 
 impl<K: super::CaptureSink> Mode for ZigbeeSniff<K> {
     type Sink = K;
 
-    async fn init<F: core::future::Future<Output = ()>>(&mut self, _ctx: &'static Ctx<K>, setup: F) {
+    async fn init<F: core::future::Future<Output = ()>>(
+        &mut self,
+        _ctx: &'static Ctx<K>,
+        setup: F,
+    ) {
         // Build-specific plumbing (spawns the decode consumer / LED task).
         setup.await;
         // Undo the BLE radio setup every boot does before the mode is known.

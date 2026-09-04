@@ -11,7 +11,7 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Apple, Inc. — manufacturer data (Company ID 0x004C): iBeacon, AirDrop,
 /// Handoff, Nearby, AirPods/Find My continuity messages; plus the Apple service
@@ -19,8 +19,12 @@ use super::{emit, hexdump, LogStr};
 /// plaintext layout and are labelled + dumped.
 pub(super) struct Apple;
 impl super::VendorDecoder for Apple {
-    fn company_ids(&self) -> &'static [u16] { &[0x004C] }
-    fn service_uuids(&self) -> &'static [u16] { &[0xFCB2, 0xFD44] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x004C]
+    }
+    fn service_uuids(&self) -> &'static [u16] {
+        &[0xFCB2, 0xFD44]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         if let super::FrameKind::Service = ctx.kind {
             Self::decode_service(ctx, body);
@@ -38,10 +42,12 @@ impl super::VendorDecoder for Apple {
             if mtype == 0x00 {
                 break;
             }
-            let mlen  = data[i + 1] as usize;
+            let mlen = data[i + 1] as usize;
             let start = i + 2;
-            let end   = start + mlen;
-            if end > data.len() { break; }
+            let end = start + mlen;
+            if end > data.len() {
+                break;
+            }
             // No Continuity message carries an empty body, so a zero-length
             // sub-message is trailing padding or salvage noise (in real captures
             // this shows up as tens of thousands of phantom `Apple ? (0x01)`
@@ -62,7 +68,9 @@ impl super::VendorDecoder for Apple {
                     // iBeacon: 16B proximity UUID, major (BE), minor (BE), measured power (i8).
                     for (k, b) in p[0..16].iter().enumerate() {
                         let _ = write!(s, "{:02X}", b);
-                        if matches!(k, 3 | 5 | 7 | 9) { let _ = write!(s, "-"); }
+                        if matches!(k, 3 | 5 | 7 | 9) {
+                            let _ = write!(s, "-");
+                        }
                     }
                     let major = u16::from_be_bytes([p[16], p[17]]);
                     let minor = u16::from_be_bytes([p[18], p[19]]);
@@ -74,7 +82,7 @@ impl super::VendorDecoder for Apple {
                     // p[0]=prefix, p[1..3]=model(BE), p[3]=status, p[4]=pod batteries,
                     // p[5]=charging flags(hi) + case battery(lo). Remaining bytes are
                     // an encrypted payload that stays as the outer hex dump.
-                    let model  = u16::from_be_bytes([p[1], p[2]]);
+                    let model = u16::from_be_bytes([p[1], p[2]]);
                     let status = p[3];
                     // status bit1 clear ⇒ pod battery nibbles are (left, right) swapped.
                     let flip = (status & 0x02) == 0;
@@ -88,9 +96,15 @@ impl super::VendorDecoder for Apple {
                     Self::write_batt(&mut s, "case", case_b);
                     // charge nibble: bit0=right, bit1=left, bit2=case.
                     let _ = write!(s, " chg[");
-                    if charge & 0x01 != 0 { let _ = write!(s, "R"); }
-                    if charge & 0x02 != 0 { let _ = write!(s, "L"); }
-                    if charge & 0x04 != 0 { let _ = write!(s, "C"); }
+                    if charge & 0x01 != 0 {
+                        let _ = write!(s, "R");
+                    }
+                    if charge & 0x02 != 0 {
+                        let _ = write!(s, "L");
+                    }
+                    if charge & 0x04 != 0 {
+                        let _ = write!(s, "C");
+                    }
                     let _ = write!(s, "]");
                 }
                 0x09 if p.len() >= 6 => {
@@ -98,8 +112,11 @@ impl super::VendorDecoder for Apple {
                     // rotates, and an IPv4 address. The IP is a genuine plaintext
                     // leak when populated (it reads 0.0.0.0 while idle). Verified
                     // against live captures; still plaintext on current iOS.
-                    let _ = write!(s, "flags=0x{:02X} seed={} ip={}.{}.{}.{}",
-                        p[0], p[1], p[2], p[3], p[4], p[5]);
+                    let _ = write!(
+                        s,
+                        "flags=0x{:02X} seed={} ip={}.{}.{}.{}",
+                        p[0], p[1], p[2], p[3], p[4], p[5]
+                    );
                 }
                 0x0C if p.len() >= 3 => {
                     // Handoff: a clipboard copy/cut flag and a sequence-number IV
@@ -107,9 +124,15 @@ impl super::VendorDecoder for Apple {
                     // it are AES-GCM encrypted, so they stay as the hex tail.
                     // Verified against live captures.
                     let seq = u16::from_le_bytes([p[1], p[2]]);
-                    let _ = write!(s, "clipboard={} seq={}",
-                        if p[0] != 0 { "yes" } else { "no" }, seq);
-                    if p.len() > 3 { tail = Some((&p[3..], base + start + 3)); }
+                    let _ = write!(
+                        s,
+                        "clipboard={} seq={}",
+                        if p[0] != 0 { "yes" } else { "no" },
+                        seq
+                    );
+                    if p.len() > 3 {
+                        tail = Some((&p[3..], base + start + 3));
+                    }
                 }
                 0x0F if !p.is_empty() => {
                     // NearbyAction: flags, action type, 3-byte auth tag, then params.
@@ -118,7 +141,9 @@ impl super::VendorDecoder for Apple {
                         let _ = write!(s, " action={}(0x{:02X})", Self::action_name(p[1]), p[1]);
                     }
                     // Auth tag + type-specific parameters are opaque — keep as hex.
-                    if p.len() > 2 { tail = Some((&p[2..], base + start + 2)); }
+                    if p.len() > 2 {
+                        tail = Some((&p[2..], base + start + 2));
+                    }
                 }
                 0x10 if !p.is_empty() => {
                     // NearbyInfo: high nibble of byte0 = status flags (bitmask), low
@@ -133,24 +158,44 @@ impl super::VendorDecoder for Apple {
                     let ac = p[0] & 0x0F;
                     let _ = write!(s, "action={}(0x{:X}) flags[", Self::activity_name(ac), ac);
                     let mut sep = "";
-                    if sf & 0x01 != 0 { let _ = write!(s, "{}primary", sep); sep = " "; }
-                    if sf & 0x04 != 0 { let _ = write!(s, "{}airdrop", sep); }
+                    if sf & 0x01 != 0 {
+                        let _ = write!(s, "{}primary", sep);
+                        sep = " ";
+                    }
+                    if sf & 0x04 != 0 {
+                        let _ = write!(s, "{}airdrop", sep);
+                    }
                     let _ = write!(s, "]");
                     if p.len() > 1 {
                         let df = p[1];
                         let _ = write!(s, " df=0x{:02X}[", df);
                         let mut sep = "";
-                        if df & 0x01 != 0 { let _ = write!(s, "{}airpods", sep); sep = " "; }
-                        if df & 0x04 != 0 { let _ = write!(s, "{}wifi", sep); sep = " "; }
-                        if df & 0x20 != 0 { let _ = write!(s, "{}watch-locked", sep); sep = " "; }
-                        if df & 0x40 != 0 { let _ = write!(s, "{}autounlock-watch", sep); sep = " "; }
-                        if df & 0x80 != 0 { let _ = write!(s, "{}autounlock", sep); }
+                        if df & 0x01 != 0 {
+                            let _ = write!(s, "{}airpods", sep);
+                            sep = " ";
+                        }
+                        if df & 0x04 != 0 {
+                            let _ = write!(s, "{}wifi", sep);
+                            sep = " ";
+                        }
+                        if df & 0x20 != 0 {
+                            let _ = write!(s, "{}watch-locked", sep);
+                            sep = " ";
+                        }
+                        if df & 0x40 != 0 {
+                            let _ = write!(s, "{}autounlock-watch", sep);
+                            sep = " ";
+                        }
+                        if df & 0x80 != 0 {
+                            let _ = write!(s, "{}autounlock", sep);
+                        }
                         let _ = write!(s, "]");
                         if p.len() > 2 {
                             let taglen = if df & 0x02 != 0 { 4 } else { 3 };
                             let avail = p.len() - 2;
                             if avail > taglen {
-                                let _ = write!(s, " auth({}B) post=0x{:02X}", taglen, p[2 + taglen]);
+                                let _ =
+                                    write!(s, " auth({}B) post=0x{:02X}", taglen, p[2 + taglen]);
                             } else {
                                 let _ = write!(s, " auth({}B)", taglen.min(avail));
                             }
@@ -162,10 +207,15 @@ impl super::VendorDecoder for Apple {
                     // FindMy: status byte carries a coarse battery level in bits 6-7
                     // and a "maintained" flag (bit2). Rest = rotating public-key bits.
                     let batt = match (p[0] >> 6) & 0x03 {
-                        0 => "full", 1 => "medium", 2 => "low", _ => "critical",
+                        0 => "full",
+                        1 => "medium",
+                        2 => "low",
+                        _ => "critical",
                     };
                     let _ = write!(s, "battery={} maintained={}", batt, (p[0] & 0x04) != 0);
-                    if p.len() > 1 { tail = Some((&p[1..], base + start + 1)); }
+                    if p.len() > 1 {
+                        tail = Some((&p[1..], base + start + 1));
+                    }
                 }
                 0x16 if !p.is_empty() => {
                     // AWDL (Apple Wireless Direct Link) peer-discovery beacon: p[0]
@@ -176,18 +226,25 @@ impl super::VendorDecoder for Apple {
                     // is an AWDL source doing AirPlay/AirDrop/Sidecar/Continuity-
                     // Camera discovery — Apple TV, Mac or iPhone. Carries no battery.
                     let _ = write!(s, "flags=0x{:02X}", p[0]);
-                    if p.len() > 1 { tail = Some((&p[1..], base + start + 1)); }
+                    if p.len() > 1 {
+                        tail = Some((&p[1..], base + start + 1));
+                    }
                 }
                 0x03 if p.len() >= 22 => {
                     // AirPrint: address-type, resource-path-type, security-type, a
                     // TCP port (BE), a 16-byte IPv4/IPv6 address (plaintext leak) and
                     // measured power (furiousMAC). All plaintext.
                     let port = u16::from_be_bytes([p[3], p[4]]);
-                    let _ = write!(s, "addr=0x{:02X} path=0x{:02X} sec=0x{:02X} port={} pwr={}dBm ip=",
-                        p[0], p[1], p[2], port, p[21] as i8);
+                    let _ = write!(
+                        s,
+                        "addr=0x{:02X} path=0x{:02X} sec=0x{:02X} port={} pwr={}dBm ip=",
+                        p[0], p[1], p[2], port, p[21] as i8
+                    );
                     for (k, b) in p[5..21].iter().enumerate() {
                         let _ = write!(s, "{:02X}", b);
-                        if k % 2 == 1 && k != 15 { let _ = write!(s, ":"); }
+                        if k % 2 == 1 && k != 15 {
+                            let _ = write!(s, ":");
+                        }
                     }
                 }
                 0x05 if p.len() >= 18 => {
@@ -195,9 +252,11 @@ impl super::VendorDecoder for Apple {
                     // SHA-256 hashes of the sender's AppleID / phone / e-mail /
                     // e-mail2 (not reversible) and a suffix. Decode the layout and
                     // which contact slots are populated.
-                    let _ = write!(s,
+                    let _ = write!(
+                        s,
                         "ver=0x{:02X} appleid={:02X}{:02X} phone={:02X}{:02X} email={:02X}{:02X} email2={:02X}{:02X}",
-                        p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16]);
+                        p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16]
+                    );
                 }
                 0x06 if p.len() >= 13 => {
                     // HomeKit accessory: status flags, 6-byte device ID, accessory
@@ -209,47 +268,97 @@ impl super::VendorDecoder for Apple {
                     // `sf` record): bit0 = not paired, bit1 = Wi-Fi not configured,
                     // bit2 = problem detected.
                     let _ = write!(s, "status=0x{:02X}[", p[0]);
-                    let _ = write!(s, "{}", if p[0] & 0x01 != 0 { "unpaired " } else { "paired " });
-                    if p[0] & 0x02 != 0 { let _ = write!(s, "no-wifi "); }
-                    if p[0] & 0x04 != 0 { let _ = write!(s, "problem "); }
+                    let _ = write!(
+                        s,
+                        "{}",
+                        if p[0] & 0x01 != 0 {
+                            "unpaired "
+                        } else {
+                            "paired "
+                        }
+                    );
+                    if p[0] & 0x02 != 0 {
+                        let _ = write!(s, "no-wifi ");
+                    }
+                    if p[0] & 0x04 != 0 {
+                        let _ = write!(s, "problem ");
+                    }
                     let _ = write!(s, "]");
-                    let _ = write!(s,
+                    let _ = write!(
+                        s,
                         " id={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} cat={}(0x{:04X}) gsn={} cfg={} ver={}",
-                        p[1], p[2], p[3], p[4], p[5], p[6],
-                        Self::homekit_category(cat), cat, gsn, p[11], p[12]);
-                    if p.len() > 13 { tail = Some((&p[13..], base + start + 13)); }
+                        p[1],
+                        p[2],
+                        p[3],
+                        p[4],
+                        p[5],
+                        p[6],
+                        Self::homekit_category(cat),
+                        cat,
+                        gsn,
+                        p[11],
+                        p[12]
+                    );
+                    if p.len() > 13 {
+                        tail = Some((&p[13..], base + start + 13));
+                    }
                 }
                 0x08 if p.len() >= 7 => {
                     // Hey Siri: a perceptual hash of the voice command, SNR,
                     // confidence, a device class and a random byte (furiousMAC). All
                     // plaintext — the hash is a lossy fingerprint of the utterance.
-                    let hash  = u16::from_be_bytes([p[0], p[1]]);
+                    let hash = u16::from_be_bytes([p[0], p[1]]);
                     let class = u16::from_be_bytes([p[4], p[5]]);
-                    let _ = write!(s, "hash=0x{:04X} snr={} conf={} class=0x{:04X} rnd=0x{:02X}",
-                        hash, p[2], p[3], class, p[6]);
+                    let _ = write!(
+                        s,
+                        "hash=0x{:04X} snr={} conf={} class=0x{:04X} rnd=0x{:02X}",
+                        hash, p[2], p[3], class, p[6]
+                    );
                 }
                 0x0B if p.len() >= 3 => {
                     // MagicSwitch (Apple Watch wrist detection): two opaque bytes plus
                     // a wrist-state confidence byte (0x3F = on wrist) (furiousMAC).
-                    let _ = write!(s, "data=0x{:02X}{:02X} wrist={}", p[0], p[1],
-                        if p[2] == 0x3F { "on-wrist" } else { "off" });
-                    if p[2] != 0x3F { let _ = write!(s, "(0x{:02X})", p[2]); }
+                    let _ = write!(
+                        s,
+                        "data=0x{:02X}{:02X} wrist={}",
+                        p[0],
+                        p[1],
+                        if p[2] == 0x3F { "on-wrist" } else { "off" }
+                    );
+                    if p[2] != 0x3F {
+                        let _ = write!(s, "(0x{:02X})", p[2]);
+                    }
                 }
                 0x0D if p.len() >= 4 => {
                     // Tethering Target: a 4-byte identifier derived from the user's
                     // iCloud DSID. Rotates ~daily but is identical across every device
                     // on the same iCloud account — a cross-device correlator.
-                    let _ = write!(s, "icloud-id={:02X}{:02X}{:02X}{:02X}", p[0], p[1], p[2], p[3]);
-                    if p.len() > 4 { tail = Some((&p[4..], base + start + 4)); }
+                    let _ = write!(
+                        s,
+                        "icloud-id={:02X}{:02X}{:02X}{:02X}",
+                        p[0], p[1], p[2], p[3]
+                    );
+                    if p.len() > 4 {
+                        tail = Some((&p[4..], base + start + 4));
+                    }
                 }
                 0x0E if p.len() >= 6 => {
                     // Tethering Source (Instant Hotspot): version, flags, battery %,
                     // cellular connection type and signal-quality bars — all plaintext
                     // (furiousMAC). A phone broadcasting its own battery and carrier.
                     let cell = u16::from_le_bytes([p[3], p[4]]);
-                    let _ = write!(s, "ver=0x{:02X} flags=0x{:02X} batt={}% cell={} bars={}",
-                        p[0], p[1], p[2], Self::cell_type(cell), p[5]);
-                    if p.len() > 6 { tail = Some((&p[6..], base + start + 6)); }
+                    let _ = write!(
+                        s,
+                        "ver=0x{:02X} flags=0x{:02X} batt={}% cell={} bars={}",
+                        p[0],
+                        p[1],
+                        p[2],
+                        Self::cell_type(cell),
+                        p[5]
+                    );
+                    if p.len() > 6 {
+                        tail = Some((&p[6..], base + start + 6));
+                    }
                 }
                 _ => {
                     // Other continuity types are typically encrypted/rotating — hex only.
@@ -303,7 +412,7 @@ impl Apple {
             0x10 => "NearbyInfo",
             0x12 => "FindMy",
             0x16 => "AWDL",
-            _    => "?",
+            _ => "?",
         }
     }
 
@@ -343,7 +452,7 @@ impl Apple {
             0x1D20 => "Powerbeats Pro 2",
             0x2520 => "Beats Solo 4",
             0x2620 => "Beats Solo Buds",
-            _      => "?",
+            _ => "?",
         }
     }
 
@@ -369,7 +478,7 @@ impl Apple {
             0x0B => "recent interaction",
             0x0D => "driving",
             0x0E => "phone/FaceTime call",
-            _    => "?",
+            _ => "?",
         }
     }
 
@@ -397,7 +506,7 @@ impl Apple {
             0x15 => "Remote Mgmt",
             0x16 => "Remote AutoFill Pong",
             0x17 => "Remote Display",
-            _    => "?",
+            _ => "?",
         }
     }
 
@@ -432,15 +541,21 @@ impl Apple {
             0x001E => "Shower System",
             0x0020 => "Television",
             0x0021 => "Remote Control",
-            _      => "?",
+            _ => "?",
         }
     }
 
     /// Instant Hotspot cellular connection type (furiousMAC dissector).
     fn cell_type(t: u16) -> &'static str {
         match t {
-            0 => "GSM", 1 => "1xRTT", 2 => "GPRS", 3 => "EDGE",
-            4 => "EV-DO", 5 => "3G", 6 => "4G", 7 => "LTE",
+            0 => "GSM",
+            1 => "1xRTT",
+            2 => "GPRS",
+            3 => "EDGE",
+            4 => "EV-DO",
+            5 => "3G",
+            6 => "4G",
+            7 => "LTE",
             _ => "?",
         }
     }

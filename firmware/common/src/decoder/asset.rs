@@ -100,12 +100,7 @@ pub fn uuid_name(id: u16) -> Option<&'static str> {
 
 /// Binary-search a packed `(u16, name)` section for `key`, returning the name as
 /// a `'static` slice into XIP. `index` is the section's sparse checkpoint index.
-fn str_lookup(
-    index: &[(u16, u32)],
-    sec_off: u32,
-    sec_len: u32,
-    key: u16,
-) -> Option<&'static str> {
+fn str_lookup(index: &[(u16, u32)], sec_off: u32, sec_len: u32, key: u16) -> Option<&'static str> {
     let sec = section(sec_off, sec_len)?;
     if index.is_empty() || key < index[0].0 {
         return None;
@@ -167,7 +162,11 @@ pub fn oui_vendor(prefix: u32, ext12: Option<u16>) -> Option<heapless::String<96
     if let (Some(ext), Ok(ordinal)) = (ext12, OUI_SUB_PARENTS.binary_search(&prefix)) {
         // MA-S and IAB carve a block into 4096; MA-M into 16, keyed by the top
         // 4 of the 12 extension bits.
-        let ext = if OUI_SUB36.contains(&prefix) { ext as u32 } else { (ext >> 8) as u32 };
+        let ext = if OUI_SUB36.contains(&prefix) {
+            ext as u32
+        } else {
+            (ext >> 8) as u32
+        };
         let key = (ordinal as u32) << 12 | ext;
         if let Some(name) = scan_bpe_section(OUISUB_XIP_OFF, OUISUB_LEN, OUI_SUB_INDEX, key) {
             return Some(name);

@@ -6,12 +6,14 @@
 
 use core::fmt::Write;
 
-use super::{emit, hexdump, LogStr};
+use super::{LogStr, emit, hexdump};
 
 /// Band XI International, LLC — manufacturer data (Company ID 0x0064).
 pub(super) struct BandXi;
 impl super::VendorDecoder for BandXi {
-    fn company_ids(&self) -> &'static [u16] { &[0x0064] }
+    fn company_ids(&self) -> &'static [u16] {
+        &[0x0064]
+    }
     fn decode(&self, ctx: &super::DecodeCtx, body: &[u8]) {
         // The serial is the longest printable-ASCII run in the frame.
         let mut best: Option<(usize, usize)> = None;
@@ -33,7 +35,9 @@ impl super::VendorDecoder for BandXi {
             Some((st, en)) => {
                 let mut s: LogStr = LogStr::new();
                 let _ = write!(s, "    Band XI: serial=\"");
-                for &b in &body[st..en] { let _ = s.push(b as char); }
+                for &b in &body[st..en] {
+                    let _ = s.push(b as char);
+                }
                 let _ = write!(s, "\"");
                 emit(s);
             }

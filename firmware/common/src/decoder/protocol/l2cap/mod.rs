@@ -10,7 +10,7 @@
 //! PDUs marked as continuation fragments, so `plen` and the body length
 //! disagreeing is normal rather than a decode error.
 
-use super::{lookup, Decoder};
+use super::{Decoder, lookup};
 
 // Helpers shared by the channel protocols. Imported once here so each module
 // keeps reaching them as `super::…`.
@@ -55,8 +55,19 @@ pub fn emit(head: &str, p: &[u8]) -> bool {
     let body = &p[4..];
     // `plen` counts only the information payload; a short `body` means the frame
     // continues in the next connection event (llid=01 fragments).
-    let frag = if (body.len() as u16) < plen { " (fragmented)" } else { "" };
-    crate::ulogf!("{} L2CAP cid=0x{:04X} ({}) plen={}{}\r\n", head, cid, cid_name(cid), plen, frag);
+    let frag = if (body.len() as u16) < plen {
+        " (fragmented)"
+    } else {
+        ""
+    };
+    crate::ulogf!(
+        "{} L2CAP cid=0x{:04X} ({}) plen={}{}\r\n",
+        head,
+        cid,
+        cid_name(cid),
+        plen,
+        frag
+    );
     if body.is_empty() {
         return true;
     }

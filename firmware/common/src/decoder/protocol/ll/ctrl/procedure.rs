@@ -8,7 +8,7 @@
 
 use core::fmt::Write;
 
-use super::{ctrl_name, error_name, line, send, Decoder};
+use super::{Decoder, ctrl_name, error_name, line, send};
 
 pub(super) struct Procedure;
 
@@ -38,7 +38,10 @@ impl Decoder<u8> for Procedure {
                 let _ = write!(
                     s,
                     "rejected=0x{:02X} ({}) error=0x{:02X} ({})",
-                    d[0], ctrl_name(d[0]), d[1], error_name(d[1])
+                    d[0],
+                    ctrl_name(d[0]),
+                    d[1],
+                    error_name(d[1])
                 );
                 send(s);
             }
