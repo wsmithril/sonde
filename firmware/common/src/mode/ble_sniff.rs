@@ -26,7 +26,8 @@ use crate::hal::csa2;
 use crate::hal::hash::fnv1a;
 use crate::hal::radio::{
     ADV_AA, ADV_CRC_INIT, BleCrcRepair, arm_rxen_after, data_ch_freq, disable_silent, disarm_rxen,
-    ensure_disabled, set_access_address, set_pcnf0, set_pcnf0_coded, use_fast_ramp_up,
+    ensure_disabled, set_access_address, set_pcnf0, set_pcnf0_coded, start_end_capture,
+    use_fast_ramp_up,
 };
 use crate::led::{OFF, OnBoardLed, Pwm, RED, Rgb};
 use crate::{Rng, SyncBuf, decoder};
@@ -997,9 +998,10 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
 // ── Phase 2: BLE advertising packet detection ─────────────────────────────────
 //
 // 3 channels × (ADV_DWELL_MS + jitter). EVENTS_END is polled every PRIMARY_POLL_US,
-// so active channels return within ~150 µs of a packet landing (and we timestamp
-// it for aux scheduling); quiet channels burn the full (jittered) dwell window.
-// Any AuxPtr is followed inline before moving on.
+// so active channels return within ~150 µs of a packet landing. A TIMER1 capture
+// driven directly by RADIO.END supplies the AuxPtr timing anchor, rather than the
+// later poll instant; quiet channels burn the full (jittered) dwell window. Any
+// AuxPtr is followed inline before moving on.
 pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
     // ── Polling-based BLE advertising packet detection ────────────────────────
     // Interrupt-driven reception (ISR) was not working — neither #[no_mangle]
@@ -1035,6 +1037,11 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
         r.events_address().write_value(0);
         r.events_sync().write_value(0);
         r.events_disabled().write_value(0);
+        // Capture every primary RADIO.END into TIMER1 over PPI before reception
+        // begins. `EVENTS_END` is still polled to drive packet processing, but
+        // its poll latency must not move the AuxPtr reference time: an aux may
+        // follow only a few hundred microseconds after its primary packet.
+        let end_clock = start_end_capture();
         // RXREADY→START begins reception; ADDRESS→RSSISTART captures the signal
         // strength of a packet the moment its access address matches; END→START
         // re-arms the receiver in hardware the instant one completes.
@@ -1069,7 +1076,10 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
             // (ADDRESS→RSSISTART re-samples RSSI on the next address match),
             // then snapshot the buffer, then check whether we won the race.
             r.events_end().write_value(0);
-            let t_end = Instant::now();
+            // TIMER1 latched this on the RADIO.END edge through PPI. Do not use
+            // `Instant::now()` here: it is sampled up to PRIMARY_POLL_US late
+            // and would shift every predicted aux time by that error.
+            let t_end = end_clock.end_instant();
             let mut crc_ok = r.events_crcok().read() != 0;
             // Read RXCRC before END_START can receive and overwrite it with the
             // next packet. We only use this value after snapshotting the PDU.
@@ -1216,6 +1226,9 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
         if !left_channel {
             disable_silent();
         }
+        // `follow_aux` also tears this down before returning. Repeating it is
+        // harmless, and covers primary-only channel visits and early exits.
+        disarm_rxen();
     }
 
     // One scan cycle complete — fold into the periodic stats summary.

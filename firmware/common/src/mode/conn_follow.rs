@@ -30,10 +30,11 @@
 //! `connInterval` later, which keeps the timeline drift-free.
 //!
 //! A connection update breaks that chain for exactly one event: its `WinOffset`
-//! moves the instant event's anchor forward by `1.25 ms + WinOffset × 1.25 ms`
-//! (Core v5.4 Vol 6 Part B §5.1.1), the same construction as the first anchor
-//! after `CONNECT_IND`, and only `WinSize` of width is left to hunt across. The
-//! offset has to move the anchor rather than widen the window: receive windows
+//! moves the instant event's anchor forward by `WinOffset × 1.25 ms` from that
+//! event's old-interval prediction (Core v5.4 Vol 6 Part B §5.1.1). The prior
+//! event's anchor plus the old interval is already that prediction, so there is
+//! no additional 1.25 ms term. Only `WinSize` of width is left to hunt across.
+//! The offset has to move the anchor rather than widen the window: receive windows
 //! are capped below one interval (see below), and a `WinOffset` of 6.25 ms on a
 //! 7.5 ms interval is outside any legal window — the instant would be missed,
 //! and `anchor` would then sit a whole interval behind the event counter, which
@@ -55,7 +56,10 @@
 //! the next slot and the mismatch is self-consistent forever: captures showed
 //! 0 packets in 24 events on a 24-channel map, and exactly 2 on an 8-channel
 //! map — the hit rate you get from remap collisions alone. Widen far enough to
-//! cover anchor error, never far enough to reach the next event.
+//! cover anchor error, and stop just before the next event. The cap is one
+//! interval minus a small hardware guard: with the 1.2 ms lead this still covers
+//! the largest legal transmit window (`connInterval - 1.25 ms`) at short
+//! intervals, without listening on event *N*'s channel when event *N+1* starts.
 //!
 //! The `synced @ev=… offset=…us` line reports how far off the prediction was.
 //!
@@ -108,6 +112,7 @@ use crate::{SyncBuf, led};
 // ── Tunables ──────────────────────────────────────────────────────────────────
 
 const T_IFS_US: u16 = 150; // inter-frame spacing enforced by the RADIO
+const NEXT_EVENT_GUARD_US: u64 = 50;
 
 /// Wake this much before a TIMER1 deadline, then busy-wait the final fraction.
 /// RADIO RXEN itself is PPI-scheduled, so this only ensures software notices the
@@ -277,6 +282,70 @@ fn next_used_channel(from: u8, chm: &[u8; 5]) -> u8 {
 /// yet" from "reached or skipped past".
 fn reached(ev: u16, instant: u16) -> bool {
     ev.wrapping_sub(instant) < 0x8000
+}
+
+/// Return the transmit-window start for a due connection update.
+///
+/// `anchor` is the old-parameter prediction for `ev`.  Usually `ev == instant`,
+/// so the new window simply begins `WinOffset` after that prediction.  Keeping
+/// the elapsed-event form makes a delayed follower correct too: it first backs
+/// out the old schedule to the Instant, then walks forward on the new one.  This
+/// matters when catch-up crossed the Instant while the CPU was busy.
+fn due_update_anchor(
+    pending: &mut Option<PendUpd>,
+    ev: u16,
+    anchor: u32,
+    old_interval: u16,
+) -> Option<(PendUpd, u32, u16)> {
+    let u = (*pending)?;
+    if !reached(ev, u.instant) {
+        return None;
+    }
+    *pending = None;
+    let elapsed = ev.wrapping_sub(u.instant);
+    let old_us = old_interval as u32 * 1250;
+    let new_us = u.interval as u32 * 1250;
+    let window_start = anchor
+        .wrapping_sub((elapsed as u32).wrapping_mul(old_us))
+        .wrapping_add(u.win_offset as u32 * 1250)
+        .wrapping_add((elapsed as u32).wrapping_mul(new_us));
+    Some((u, window_start, elapsed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PendUpd, due_update_anchor};
+
+    const UPDATE: PendUpd = PendUpd {
+        // 30 ms → 7.5 ms, with a 2.5 ms transmit-window offset.
+        instant: 19,
+        win_size: 1,
+        win_offset: 2,
+        interval: 6,
+        latency: 0,
+        timeout: 500,
+    };
+
+    #[test]
+    fn connection_update_uses_only_the_window_offset_at_its_instant() {
+        // Event 18 anchored at 141 ms predicts the old event 19 at 171 ms.
+        // The §5.1.1 transmit window therefore opens at 173.5 ms, not 174 ms.
+        let mut pending = Some(UPDATE);
+        let (_, anchor, elapsed) = due_update_anchor(&mut pending, 19, 171_000, 24).unwrap();
+        assert_eq!(elapsed, 0);
+        assert_eq!(anchor, 173_500);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn connection_update_rebuilds_anchor_after_catch_up_crossed_instant() {
+        // If the old schedule carried us to event 21 at 231 ms, reconstruct the
+        // new schedule: event 19 at 173.5 ms, then 181 ms and 188.5 ms.
+        let mut pending = Some(UPDATE);
+        let (_, anchor, elapsed) = due_update_anchor(&mut pending, 21, 231_000, 24).unwrap();
+        assert_eq!(elapsed, 2);
+        assert_eq!(anchor, 188_500);
+    }
 }
 
 // ── CSA#1 ─────────────────────────────────────────────────────────────────────
@@ -628,59 +697,6 @@ pub async fn follow(
         // LED for the whole inter-event gap and turn a state into a flicker.
         leds.set_chan(led::Chan::G, false);
 
-        // Apply any update scheduled for this event, before hopping / windowing.
-        if let Some(u) = pending_upd
-            && u.instant == ev as u16
-        {
-            interval = u.interval;
-            timeout = u.timeout;
-            miss_cap = supervision_cap(timeout, interval);
-            let _ = u.latency; // latency doesn't affect passive capture
-            win_size = u.win_size;
-            // WinOffset moves this event's anchor, it does not widen its window.
-            // The master's first packet under the new parameters lands in a
-            // transmit window opening transmitWindowDelay (1.25 ms) + WinOffset
-            // × 1.25 ms after where the instant event sat under the old interval
-            // (Core v5.4 Vol 6 Part B §5.1.1) — the same construction as the
-            // first anchor after CONNECT_IND. Listening early and waiting it out
-            // instead only reaches the packet while the offset fits inside the
-            // span cap of three quarters of an interval, and a WinOffset of
-            // 6.25 ms on a 7.5 ms interval does not: the instant is missed and
-            // `anchor` is then a whole new interval behind the event counter, so
-            // every channel from there on is the previous event's.
-            anchor = anchor.wrapping_add(1250 + u.win_offset as u32 * 1250);
-            // Anchored on the window's start, only its width is still unknown.
-            wide_us = (u.win_size as u64 + 1) * 1250;
-            pending_upd = None;
-            ulogf!(
-                "    applied CONNECTION_UPDATE @ev={} interval={}.{:02}ms anchor+{}us\r\n",
-                ev,
-                (interval as u32 * 125) / 100,
-                (interval as u32 * 125) % 100,
-                1250 + u.win_offset as u64 * 1250
-            );
-        }
-        // The radio is disabled here (`cleanup_radio` ran at the end of the
-        // previous event), which is the only point in the loop where MODE may
-        // be rewritten.
-        if let Some(p) = pending_phy
-            && p.instant == ev as u16
-        {
-            phy = if p.c_to_p != 0 { p.c_to_p } else { p.p_to_c };
-            pending_phy = None;
-            set_phy(phy);
-            // Losing the anchor's air-time basis is the same failure as losing
-            // the channel, so drop back to hunt mode for one event rather than
-            // trusting a window sized for the old PHY.
-            synced = false;
-            hunt_wide_us = (win_size as u64 + 1) * 1250;
-            ulogf!(
-                "    applied PHY_UPDATE @ev={} phy={}\r\n",
-                ev,
-                phy_name(phy)
-            );
-        }
-
         // Phase-preserving catch-up. Everything below assumes `anchor` is still
         // ahead of the clock. If an event overran its interval, sliding one
         // event late would tune every window from here on to the *previous*
@@ -688,29 +704,89 @@ pub async fn follow(
         // mismatch that is self-consistent and never recovers. Skip whole
         // intervals instead, advancing the event index and the hop with them, so
         // time and channel stay in step.
-        let interval_us = interval as u32 * 1250;
         let floor = end_clock.now_ticks().wrapping_add(RX_LEAD_US as u32);
         let mut skipped = 0u32;
-        while tick_before(anchor, floor) {
-            anchor = anchor.wrapping_add(interval_us);
-            if !spec.csa2 {
-                unmapped = (unmapped + hop) % 37;
+        // Catch-up can cross an update Instant.  Once it does, the event timeline
+        // changes, so apply the update and re-evaluate the deadline against the
+        // new interval rather than continuing to add old intervals past it.
+        loop {
+            while tick_before(anchor, floor) {
+                anchor = anchor.wrapping_add(interval as u32 * 1250);
+                if !spec.csa2 {
+                    unmapped = (unmapped + hop) % 37;
+                }
+                ev = ev.wrapping_add(1);
+                skipped += 1;
             }
-            ev = ev.wrapping_add(1);
-            skipped += 1;
+
+            if let Some((u, window_start, elapsed)) =
+                due_update_anchor(&mut pending_upd, ev as u16, anchor, interval)
+            {
+                // §5.1.1: this window starts `connInterval_OLD + WinOffset`
+                // after the anchor before the Instant. `anchor` already includes
+                // the old interval, therefore only WinOffset is added here.
+                anchor = window_start;
+                interval = u.interval;
+                timeout = u.timeout;
+                miss_cap = supervision_cap(timeout, interval);
+                let _ = u.latency; // latency doesn't affect passive capture
+                win_size = u.win_size;
+                // Anchored on the window's start, only its width is still unknown.
+                wide_us = (u.win_size as u64 + 1) * 1250;
+                ulogf!(
+                    "    applied CONNECTION_UPDATE @ev={} interval={}.{:02}ms window+{}us{}\r\n",
+                    ev,
+                    (interval as u32 * 125) / 100,
+                    (interval as u32 * 125) % 100,
+                    u.win_offset as u64 * 1250,
+                    if elapsed == 0 {
+                        ""
+                    } else {
+                        " (after catch-up)"
+                    }
+                );
+                // The new window may still be in the past. Re-run catch-up using
+                // the new interval before selecting a channel for this event.
+                continue;
+            }
+
+            // The radio is disabled here (`cleanup_radio` ran at the end of the
+            // previous event), which is the only point in the loop where MODE may
+            // be rewritten. Treat an Instant crossed during catch-up as due too;
+            // an equality-only check otherwise silently lost the PHY switch.
+            if let Some(p) = pending_phy
+                && reached(ev as u16, p.instant)
+            {
+                phy = if p.c_to_p != 0 { p.c_to_p } else { p.p_to_c };
+                pending_phy = None;
+                set_phy(phy);
+                // Losing the anchor's air-time basis is the same failure as losing
+                // the channel, so drop back to hunt mode for one event rather than
+                // trusting a window sized for the old PHY.
+                synced = false;
+                hunt_wide_us = (win_size as u64 + 1) * 1250;
+                ulogf!(
+                    "    applied PHY_UPDATE @ev={} phy={}\r\n",
+                    ev,
+                    phy_name(phy)
+                );
+            }
+            break;
         }
         if skipped > 0 {
             ulogf!(
-                "    [ERR] anchor was {} event(s) behind the clock, skipped to ev={}\r\n",
+                "    [WARN] catch-up skipped {} event(s), now at ev={}\r\n",
                 skipped,
                 ev
             );
         }
 
+        let interval_us = interval as u32 * 1250;
+
         // Apply a pending channel map here — after the catch-up loop, and keyed on
         // the event counter having *reached* the instant rather than equalling it.
-        // Applying it before catch-up (as the connection/PHY updates still are) let a
-        // map whose instant fell on a skipped event slip through unapplied, leaving
+        // Applying it before catch-up used to let a map whose instant fell on a
+        // skipped event slip through unapplied, leaving
         // the follower hopping a stale map for the rest of the connection. A busy
         // central re-runs AFH every few seconds, so a single dropped map is the
         // difference between following and a supervision-timeout outage.
@@ -785,12 +861,13 @@ pub async fn follow(
             MASTER_TAIL_US + HUNT_TAIL_US + hunt_wide_us
         };
         wide_us = 0; // one-shot: the update's transmit window applies to one event
-        // Cap at three quarters of the interval, never the whole thing. `.min(
-        // interval)` was the old cap and it permits precisely the failure the
-        // module note describes: a window reaching anchor[N+1] receives the next
-        // event on this event's channel. Short intervals are where it bites —
-        // at 7.5 ms the hunt tail alone already exceeds one interval.
-        let span = (RX_LEAD_US + tail).min(interval as u64 * 1250 * 3 / 4) as u32;
+        // Keep the window bounded before the next event, but do not use an
+        // arbitrary fraction of the interval. At 7.5 ms a legal WinSize can be
+        // 6.25 ms; the old 3/4 cap ended at only 5.625 ms and could never acquire
+        // a packet at the end of that transmit window. RX_LEAD_US plus the
+        // largest legal window is exactly one interval minus this guard.
+        let max_span = interval as u64 * 1250 - NEXT_EVENT_GUARD_US;
+        let span = (RX_LEAD_US + tail).min(max_span) as u32;
         let rx_open = anchor.wrapping_sub(RX_LEAD_US as u32);
         // Wait until RX opens: microseconds from now until `rx_open`. This is a
         // schedule-slack measurement — how much time we have BEFORE the RX
