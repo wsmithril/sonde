@@ -89,7 +89,7 @@ impl<T> Deref for ModeRef<T> {
 unsafe impl<T: Sync> Sync for ModeRef<T> {}
 
 /// Renders [`crate::led::LED`] commands onto the LED — the state-colour indicator
-/// the active-central modes (GATT, Midea) share. Generic over the backend `L`;
+/// the active-central modes share. Generic over the backend `L`;
 /// called by their `led_control` and `led_task`.
 pub async fn drive_indicator<L: OnBoardLed>(led: &mut L) -> ! {
     use crate::led::{Cmd, LED, OFF};
@@ -193,7 +193,7 @@ pub trait Frame {
 }
 
 /// The one output backend a build supplies. A mode stays oblivious to the build:
-/// packet-capture modes call [`sink_frame`], text modes (GATT/Midea) call
+/// packet-capture modes call [`sink_frame`], text modes call
 /// [`sink_text`]. The USB build decodes/prints to its console; the headless build
 /// writes PCAP/text to the SD ring — the "decode → phy output" half of the flow.
 ///

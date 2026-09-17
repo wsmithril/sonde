@@ -6,6 +6,7 @@
 //! the packet-layout setup and the per-standard configuration live here rather than
 //! being duplicated per mode.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_nrf::pac;
 use embassy_nrf::pac::radio::vals;
 use embassy_time::{Duration, Instant};
@@ -279,6 +280,8 @@ pub struct RadioEndClock {
     counter: u32,
 }
 
+static TIMER1_RUNNING: AtomicBool = AtomicBool::new(false);
+
 impl RadioEndClock {
     /// Capture and return TIMER1's current 1 MHz tick count.
     pub fn now_ticks(&self) -> u32 {
@@ -362,7 +365,9 @@ impl RadioEndClock {
 /// case already performed best when driven directly.
 const RXEN_MIN_LEAD_US: u32 = 20;
 
-/// Start TIMER1's 1 MHz counter and capture every `RADIO.END` into CC1.
+/// Start TIMER1's 1 MHz counter and capture every `RADIO.END` into CC1, or
+/// reuse the running counter when another connection already owns the
+/// connection timeline.
 ///
 /// The returned clock maps the hardware counter to Embassy time. It remains
 /// valid until [`disarm_rxen`] is called. TIMER1 intentionally keeps running
@@ -370,24 +375,26 @@ const RXEN_MIN_LEAD_US: u32 = 20;
 pub fn start_end_capture() -> RadioEndClock {
     let r = pac::RADIO;
     let t = pac::TIMER1;
-    t.tasks_stop().write_value(1);
-    t.tasks_clear().write_value(1);
-    t.mode()
-        .write(|w| w.set_mode(pac::timer::vals::Mode::Timer));
-    t.bitmode()
-        .write(|w| w.set_bitmode(pac::timer::vals::Bitmode::_32bit));
-    t.prescaler().write(|w| w.set_prescaler(4)); // 16 MHz >> 4 = 1 MHz
-    t.shorts().write(|_w| {});
-    t.tasks_start().write_value(1);
+    if !TIMER1_RUNNING.swap(true, Ordering::AcqRel) {
+        t.tasks_stop().write_value(1);
+        t.tasks_clear().write_value(1);
+        t.mode()
+            .write(|w| w.set_mode(pac::timer::vals::Mode::Timer));
+        t.bitmode()
+            .write(|w| w.set_bitmode(pac::timer::vals::Bitmode::_32bit));
+        t.prescaler().write(|w| w.set_prescaler(4)); // 16 MHz >> 4 = 1 MHz
+        t.shorts().write(|_w| {});
+        t.tasks_start().write_value(1);
 
-    let ppi = pac::PPI;
-    ppi.ch(PPI_CH_END_CAPTURE)
-        .eep()
-        .write_value(r.events_end().as_ptr() as usize as u32);
-    ppi.ch(PPI_CH_END_CAPTURE)
-        .tep()
-        .write_value(t.tasks_capture(1).as_ptr() as usize as u32);
-    ppi.chenset().write(|w| w.set_ch(PPI_CH_END_CAPTURE, true));
+        let ppi = pac::PPI;
+        ppi.ch(PPI_CH_END_CAPTURE)
+            .eep()
+            .write_value(r.events_end().as_ptr() as usize as u32);
+        ppi.ch(PPI_CH_END_CAPTURE)
+            .tep()
+            .write_value(t.tasks_capture(1).as_ptr() as usize as u32);
+        ppi.chenset().write(|w| w.set_ch(PPI_CH_END_CAPTURE, true));
+    }
 
     // Sample both clocks as closely as possible. The absolute phase may be off
     // by one RTC tick, but every later RADIO.END has TIMER1 precision.
@@ -418,6 +425,7 @@ pub fn disarm_rxen() {
         w.set_ch(PPI_CH_END_CAPTURE, true);
     });
     pac::TIMER1.tasks_stop().write_value(1);
+    TIMER1_RUNNING.store(false, Ordering::Release);
 }
 
 // ── Packet layout ─────────────────────────────────────────────────────────────
@@ -481,14 +489,18 @@ pub fn data_ch_freq(idx: u8) -> Option<u8> {
 /// do not interfere with RSSI measurements. Callers that need a data-channel AA
 /// (a connection) overwrite BASE0/PREFIX0/CRCINIT afterwards.
 pub fn configure_ble() {
+    configure_ble_with_maxlen(255);
+}
+
+/// Configure BLE advertising reception with a caller-owned DMA payload limit.
+/// The RADIO writes the S0 and LENGTH bytes in addition to this payload, so the
+/// caller must reserve two more bytes in the PACKETPTR buffer.
+pub fn configure_ble_with_maxlen(maxlen: u8) {
     let r = pac::RADIO;
     r.mode().write(|w| w.set_mode(vals::Mode::Ble1mbit));
     set_pcnf0(vals::Plen::_8bit);
     r.pcnf1().write(|w| {
-        // maxlen is only a cap; 255 lets large AUX_ADV_IND payloads pass CRC
-        // during aux following without truncation, and is harmless for the
-        // small legacy PDUs seen on the primary channels.
-        w.set_maxlen(255);
+        w.set_maxlen(maxlen);
         w.set_statlen(0);
         // BALEN=3: match the full 4-byte BLE access address. The low 3 bytes go
         // in BASE0 (left-justified), the top byte in PREFIX0.AP0.

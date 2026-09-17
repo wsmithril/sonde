@@ -1,6 +1,6 @@
 //! Midea air-conditioner codec: build the 0x40 control / 0x41 query appliance
 //! frames and parse the 0xC0 status reply. Byte layout verified against the
-//! manufacturer's own protocol Lua (`meijia-decompile/lua/T_0000_AC_22.lua` —
+//! manufacturer's own protocol Lua (`app_decompile/meijia-decompile/lua/T_0000_AC_22.lua` —
 //! `binToModel` / `jsonToData`); the control-encode side traces back to the
 //! `midea-ble` reference (`ac/appliance.rs`, a port of midea-ble-go).
 //!

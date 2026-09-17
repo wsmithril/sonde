@@ -180,7 +180,31 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 #[cortex_m_rt::exception]
 unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
     cortex_m::interrupt::disable();
-    record(frame.pc(), b"HardFault", b"");
+    // ARMv7-M System Control Block fault-status registers. Reading these after
+    // interrupts are disabled is side-effect free and preserves the reason the
+    // configurable fault escalated to HardFault.
+    let cfsr = unsafe { core::ptr::read_volatile(0xE000_ED28 as *const u32) };
+    let mmfar = unsafe { core::ptr::read_volatile(0xE000_ED34 as *const u32) };
+    let bfar = unsafe { core::ptr::read_volatile(0xE000_ED38 as *const u32) };
+    let mut msg = [0u8; REC_MSG_LEN];
+    let n = {
+        let mut w = Trunc {
+            buf: &mut msg,
+            n: 0,
+        };
+        let _ = core::fmt::write(
+            &mut w,
+            format_args!(
+                "lr={:08X} cfsr={:08X} bfar={:08X} mmfar={:08X}",
+                frame.lr(),
+                cfsr,
+                bfar,
+                mmfar,
+            ),
+        );
+        w.n
+    };
+    record(frame.pc(), b"HardFault", &msg[..n]);
     blink_then_reset()
 }
 

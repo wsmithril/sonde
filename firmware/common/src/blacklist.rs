@@ -2,9 +2,9 @@
 //! that would otherwise dominate every survey and report.
 //!
 //! Provides the candidate filter ([`is_blacklisted`]) and its build-time config
-//! file (`BLACKLIST_CONF`, gitignored `blacklist.conf`). No survey path calls it
-//! yet; a scan that wants to exclude the user's own devices routes its
-//! candidates through [`is_blacklisted`] before recording them.
+//! file (`BLACKLIST_CONF`, gitignored `blacklist.conf`). Recon uses the local-name
+//! extractor for its built-in local-device filter; callers can use
+//! [`is_blacklisted`] for configured exclusions.
 #![allow(dead_code)]
 //!
 //! The **list** lives in a build-time config file, `firmware/common/blacklist.conf`
@@ -14,21 +14,21 @@
 //! excluded, build unaffected.
 //!
 //! Config format — one entry per line:
-//! * a bare string is a **substring** of the advertised Name AD (0x09), e.g.
+//! * a bare string is a **substring** of the advertised local-name AD (0x08 or
+//!   0x09), e.g.
 //!   `WF-1000XM5` (the Sony earbuds advertise `WF-1000XM5` / `LE_WF-1000XM5`);
 //! * `addr:AA:BB:CC:DD:EE:FF` matches an **exact** address (stable-address carry
 //!   devices such as watches or tags — not usable for privacy-rotating RPAs);
 //! * lines starting with `#` are comments.
 //!
-//! A phone that rotates its address and advertises no name (the Xperia here)
-//! needs a scan-response probe (SCAN_REQ → name in SCAN_RSP) to be identified
-//! before connecting; that is a follow-up, not handled here.
+//! The local-name extractor accepts both the shortened and complete local-name
+//! AD types so callers can identify a device from either form.
 
 // Embedded at build time by `build.rs` from `firmware/common/blacklist.conf`
 // (empty string when the file is absent).
 include!(concat!(env!("OUT_DIR"), "/blacklist_conf.rs"));
 
-/// `true` when the advertised `name` (Name AD bytes) matches a config entry, or
+/// `true` when the advertised `name` (local-name AD bytes) matches a config entry, or
 /// `addr` matches an `addr:` entry. Re-parses the (tiny) config per call.
 pub(crate) fn is_blacklisted(name: &[u8], addr: &[u8; 6]) -> bool {
     for line in BLACKLIST_CONF.lines() {
@@ -47,7 +47,7 @@ pub(crate) fn is_blacklisted(name: &[u8], addr: &[u8; 6]) -> bool {
     false
 }
 
-/// The Name AD (0x09) bytes from an advertising payload, when present.
+/// The local-name AD bytes (0x08 or 0x09) from an advertising payload, when present.
 pub(crate) fn adv_name(ad: &[u8]) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < ad.len() {
@@ -55,7 +55,7 @@ pub(crate) fn adv_name(ad: &[u8]) -> Option<&[u8]> {
         if flen == 0 || i + 1 + flen > ad.len() {
             break;
         }
-        if ad[i + 1] == 0x09 {
+        if matches!(ad[i + 1], 0x08 | 0x09) {
             return Some(&ad[i + 2..i + 1 + flen]);
         }
         i += 1 + flen;

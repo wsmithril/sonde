@@ -7,9 +7,13 @@
 //!   Android API level).
 //! * [`uweave`] — Google BLE-Weave transport header decode.
 
+pub(crate) mod hid;
 pub(crate) mod uuid;
 pub(crate) mod uweave;
 pub(crate) mod value;
 
+pub(crate) use hid::{
+    HidLayout, decode_input_report, decode_report_map, decode_value as decode_hid_value,
+};
 pub(crate) use uuid::write_uuid;
 pub(crate) use value::{decode_time, format_walltime, known_value, known_value_128};

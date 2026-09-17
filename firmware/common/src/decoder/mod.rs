@@ -522,6 +522,93 @@ fn emit_ad_header(ad_type: u8) {
     emit(h);
 }
 
+/// Why an advertising-data walk stopped before consuming the complete field.
+/// The byte offset is relative to the start of the AD data, not the link-layer
+/// PDU. This is deliberately separate from [`log_ad_structures`]: callers that
+/// need to keep the hot capture path small can inspect the reason without
+/// duplicating the AD grammar or changing the existing byte-count API.
+#[derive(Clone, Copy)]
+pub enum AdStop {
+    /// A length byte claims more bytes than remain after it.
+    LengthOverrun {
+        offset: usize,
+        declared: usize,
+        remaining: usize,
+    },
+    /// A single non-zero byte remains where a length/type pair is required.
+    MissingType { offset: usize, byte: u8 },
+    /// A zero-length terminator was followed by non-zero bytes.
+    NonZeroAfterTerminator { offset: usize },
+}
+
+/// Return the first structural failure in an AD-data byte slice.
+///
+/// `None` means the complete slice is a valid sequence of AD structures,
+/// including the permitted zero padding after a zero-length terminator.
+pub fn ad_stop_reason(adv_data: &[u8]) -> Option<AdStop> {
+    let mut i = 0;
+    while i < adv_data.len() {
+        let field_len = adv_data[i] as usize;
+        if field_len == 0 {
+            if adv_data[i..].iter().all(|&b| b == 0) {
+                return None;
+            }
+            return Some(AdStop::NonZeroAfterTerminator { offset: i });
+        }
+        if i + 1 >= adv_data.len() {
+            return Some(AdStop::MissingType {
+                offset: i,
+                byte: adv_data[i],
+            });
+        }
+        let remaining = adv_data.len() - i - 1;
+        if field_len > remaining {
+            return Some(AdStop::LengthOverrun {
+                offset: i,
+                declared: field_len,
+                remaining,
+            });
+        }
+        i += 1 + field_len;
+    }
+    None
+}
+
+#[cfg(test)]
+mod ad_stop_tests {
+    use super::{AdStop, ad_stop_reason};
+
+    #[test]
+    fn accepts_complete_structures_and_zero_padding() {
+        assert!(ad_stop_reason(&[2, 1, 5, 3, 3, 0xAA, 0xFE, 0, 0]).is_none());
+        assert!(ad_stop_reason(&[2, 1, 5, 0]).is_none());
+    }
+
+    #[test]
+    fn reports_length_overrun_at_the_field_start() {
+        assert!(matches!(
+            ad_stop_reason(&[2, 1, 5, 0x94, 0xC5, 0xC7]),
+            Some(AdStop::LengthOverrun {
+                offset: 3,
+                declared: 0x94,
+                remaining: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn distinguishes_stray_byte_and_nonzero_terminator_tail() {
+        assert!(matches!(
+            ad_stop_reason(&[2, 1, 5, 1]),
+            Some(AdStop::MissingType { offset: 3, byte: 1 })
+        ));
+        assert!(matches!(
+            ad_stop_reason(&[2, 1, 5, 0, 0xAA]),
+            Some(AdStop::NonZeroAfterTerminator { offset: 3 })
+        ));
+    }
+}
+
 /// Walk every AD structure in `adv_data` and log one decoded line each.
 ///
 /// AdvData is a sequence of AD structures, each `[len][type][data (len-1 bytes)]`.

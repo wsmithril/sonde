@@ -37,6 +37,7 @@ pub fn is_haier_advert(ad: &[u8]) -> bool {
 /// Probe a Haier appliance: walk the GATT, logging every service / characteristic
 /// and reading each readable value — to learn what a raw connection serves
 /// (identity? pairing config? a control profile?). Returns the subscription count.
+#[allow(dead_code)]
 pub(crate) async fn probe(conn: &mut Conn, services: &[Service]) -> u32 {
     walk_services(conn, services, |_vh, _uuid| {}).await
 }

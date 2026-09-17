@@ -30,6 +30,7 @@ pub fn is_jomoo_advert(ad: &[u8]) -> bool {
 
 /// Probe a JOMOO device: walk the GATT to map the `0xFFF0` control profile
 /// (write `0xFFF2` + notify `0xFFF1`). Returns the subscription count.
+#[allow(dead_code)]
 pub(crate) async fn probe(conn: &mut Conn, services: &[Service]) -> u32 {
     walk_services(conn, services, |_vh, _uuid| {}).await
 }

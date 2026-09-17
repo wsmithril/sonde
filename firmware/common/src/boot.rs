@@ -7,8 +7,6 @@
 //!   • GATT enum    — active central: connect to a peripheral and walk its GATT.
 //!   • Conn follow  — passive: catch a CONNECT_IND and follow the connection.
 //!   • Zigbee sniff — IEEE 802.15.4 survey: energy sweep + MAC-header capture.
-//!   • Midea ctrl   — active central specialised to Midea appliances: detect,
-//!                    handshake, subscribe and read status.
 //!
 //! Zigbee is mutually exclusive with the rest for a hardware reason: one RADIO
 //! and one MODE register, and 802.15.4 needs different modulation/sync/CRC/
@@ -43,7 +41,7 @@ pub const BOOT_MODES: u32 = 6;
 const BOOT_MODE_PAGE: u32 = 0x000E_C000;
 const BOOT_MODE_PAGE_LEN: u32 = embassy_nrf::nvmc::PAGE_SIZE as u32; // 4096
 // Slot encoding: high 24 bits are a tag marking a written slot; low byte is the
-// mode (0..4). Erased flash reads 0xFFFFFFFF, which fails the tag test = "free".
+// mode (0..5). Erased flash reads 0xFFFFFFFF, which fails the tag test = "free".
 const SLOT_TAG: u32 = 0x0DE0_0000;
 const SLOT_TAG_MASK: u32 = 0xFFFF_FF00;
 
@@ -87,9 +85,9 @@ pub fn next_boot_mode(nvmc: Peri<'static, peripherals::NVMC>) -> BootMode {
     };
     // Skip ZigbeeSniff (4) only — the XIAO nRF52840 has no 802.15.4 radio, so
     // that mode is blacklisted and the cycle visits BleSniff/RssiMonitor/
-    // GattEnum/ConnFollow. The resolved (non-blacklisted) mode is what gets
-    // persisted, so the next boot's `(prev + 1)` continues from here. BleSniff
-    // (0) is never blacklisted, so the loop always terminates.
+    // GattEnum/ConnFollow/Recon. The resolved (non-blacklisted) mode is what
+    // gets persisted, so the next boot's `(prev + 1)` continues from here.
+    // BleSniff (0) is never blacklisted, so the loop always terminates.
     while matches!(mode, 4) {
         mode = (mode + 1) % BOOT_MODES;
     }
@@ -112,7 +110,8 @@ pub fn next_boot_mode(nvmc: Peri<'static, peripherals::NVMC>) -> BootMode {
         2 => BootMode::GattEnum,
         3 => BootMode::ConnFollow,
         4 => BootMode::ZigbeeSniff,
-        _ => BootMode::Recon,
+        5 => BootMode::Recon,
+        _ => unreachable!("boot mode ordinal out of range"),
     }
 }
 

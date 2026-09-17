@@ -31,6 +31,7 @@ pub mod utech;
 /// A Midea advert whose serial fails [`midea::sn_matches`] (a bit-flipped field)
 /// is not a target; the offending serial is reported through `bad_sn` so the scan
 /// can log it once.
+#[allow(dead_code)]
 pub(crate) fn classify_interest(ad: &[u8], bad_sn: &mut Option<[u8; 14]>) -> Option<Interest> {
     if let Some(sn) = midea::parse_midea_sn(ad) {
         if midea::sn_matches(&sn) {

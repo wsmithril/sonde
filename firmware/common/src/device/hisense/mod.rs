@@ -34,6 +34,7 @@ pub fn is_hisense_advert(ad: &[u8]) -> bool {
 /// Probe a Hisense appliance: connect and GATT-walk to discover what a raw
 /// connection serves (identity? onboarding config? the pan-tilt camera's
 /// `3a69…` profile?). Returns the subscription count.
+#[allow(dead_code)]
 pub(crate) async fn probe(conn: &mut Conn, services: &[Service]) -> u32 {
     walk_services(conn, services, |_vh, _uuid| {}).await
 }

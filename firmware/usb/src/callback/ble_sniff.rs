@@ -9,11 +9,25 @@ use embassy_nrf::qspi::Qspi;
 use embassy_usb::class::cdc_acm::Receiver;
 
 use sonde_common::decoder;
+use sonde_common::hal::radio::BleCrcRepair;
 use sonde_common::led::OnBoardLed as _;
-use sonde_common::mode::{self, Mode as _};
+use sonde_common::mode::{self, CaptureSink as _, Mode as _};
 use sonde_common::{led, ulog, ulogf};
 
 use crate::{CTX, ConsoleSink, LedParts, QspiParts, UsbDriver};
+
+/// Decode and emit queued packets independently of the radio producer. The
+/// producer can therefore keep servicing DMA events while rendering, asset
+/// lookups, and optional CRC repair consume CPU time.
+#[embassy_executor::task]
+async fn decode_forever() -> ! {
+    let mut crc_repair = BleCrcRepair::default();
+    loop {
+        let mut packet = mode::ble_sniff::RX_QUEUE.receive().await;
+        mode::ble_sniff::repair_queued(&mut packet, &mut crc_repair);
+        CTX.sink().sink_frame(&packet);
+    }
+}
 
 /// BLE-sniff provisioning task: owns the QSPI driver (keeping the XIP window mapped
 /// for lookups) and services the CDC provisioning protocol.
@@ -60,6 +74,7 @@ pub async fn run(
         // The rate/liveness LED indicator.
         let pwm = led::Pwm::new(l.pwm, l.r, l.g, l.b);
         spawner.spawn(mode::ble_sniff::led_task(pwm).unwrap());
+        spawner.spawn(decode_forever().unwrap());
     })
     .await;
     m.run(&CTX).await

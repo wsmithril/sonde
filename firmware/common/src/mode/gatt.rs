@@ -62,7 +62,7 @@ use embassy_time::{Duration, Instant, Timer};
 
 use super::{Ctx, Mode, drive_indicator};
 use crate::central::*;
-use crate::hal::radio::{configure_ble, ensure_disabled};
+use crate::hal::radio::{configure_ble_with_maxlen, ensure_disabled};
 use crate::led::OnBoardLed;
 use crate::{Rng, led};
 
@@ -132,7 +132,7 @@ pub async fn run(rng: &mut Rng) {
         // us is re-chosen forever.
         mark_attempted(cand.addr, Instant::now(), RETRY_COOLDOWN_S);
         ensure_disabled();
-        configure_ble();
+        configure_ble_with_maxlen(254);
         Timer::after_millis(flashes).await;
         return;
     };
@@ -170,7 +170,7 @@ pub async fn run(rng: &mut Rng) {
         );
         mark_attempted(cand.addr, Instant::now(), RETRY_COOLDOWN_S);
         ensure_disabled();
-        configure_ble();
+        configure_ble_with_maxlen(254);
         return;
     }
 
@@ -283,8 +283,8 @@ pub async fn run(rng: &mut Rng) {
             ulogf!("turnaround winner: {} at {}/{}\r\n", best.2, best.0, best.1);
         }
         ensure_disabled();
-        configure_ble();
-    } else if conn.ev_addr != 0 {
+        configure_ble_with_maxlen(254);
+    } else if conn.is_active() {
         // Only worth sending into a link we know is alive. `LL_TERMINATE_IND`
         // into silence just spends events on a peer that is not listening.
         terminate(&mut conn).await;

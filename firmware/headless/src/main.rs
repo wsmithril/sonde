@@ -46,6 +46,7 @@ bind_interrupts!(struct Irqs {
     SPI2        => spim::InterruptHandler<peripherals::SPI2>;
     USBD        => usb::InterruptHandler<peripherals::USBD>;
     CLOCK_POWER => usb::vbus_detect::InterruptHandler;
+    RADIO       => capmode::ble_sniff::RadioAddressHandler;
 });
 
 type SharedCard = Mutex<CriticalSectionRawMutex, SdCard<'static>>;
@@ -178,7 +179,7 @@ async fn mode_task(spawner: Spawner, args: ModeArgs) -> ! {
 
 /// Spawn the chosen capture mode's tasks. The radio capture + ring consumers depend
 /// on neither the SD card nor USB, so `main` calls this early — they fill
-/// [`SD_RING`] while the card comes up. Non-capture boots (RSSI/Zigbee/Midea, which
+/// [`SD_RING`] while the card comes up. Non-capture boots (RSSI/Zigbee, which
 /// have no SD path) route to nothing.
 fn spawn_capture(
     spawner: Spawner,

@@ -5,16 +5,15 @@
 //! extended-advertising AuxPtr into the secondary data channels (`AUX_ADV_IND` /
 //! `AUX_CHAIN_IND`).
 //!
-//! Capture and decode run concurrently in the mode's `run`: [`scan`] copies each
-//! packet into [`RX_QUEUE`] and immediately re-arms the radio, while the consumer
-//! branch drains the queue through the build's sink while the radio listens again.
+//! [`scan`] is the radio-producer task. The build callback starts a separate
+//! consumer task that drains [`RX_QUEUE`], keeping rendering and storage away from
+//! the DMA event path.
 
 use core::cell::UnsafeCell;
 use core::fmt::Write as _; // `write!` into a LogStr when rendering the header to a sink
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use embassy_futures::join::join;
 use embassy_nrf::pac;
 use embassy_nrf::pac::radio::vals;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -51,16 +50,22 @@ const ADV_DWELL_MS: u64 = ADV_TOTAL_MS / 3;
 // land in the gaps between advertising events.
 const ADV_DWELL_JITTER_MS: u32 = 20;
 
-// Primary-channel EVENTS_END poll granularity. Kept small (vs the old 1 ms) so an
-// ADV_EXT_IND is noticed within ~150 µs of airing — short enough that its aux,
-// which can follow only ~300 µs later (T_MAFS), is still reachable. Each poll
-// still yields to the executor, so the USB logger keeps running.
+// Primary-channel EVENTS_END poll granularity. The RADIO ADDRESS interrupt
+// handles the DMA handoff; this poll is for packet completion and the fallback
+// path if an ADDRESS event remains pending. Each poll still yields to the
+// executor, so the USB logger keeps running.
 //
-// This bounds how long a completed packet sits in RX_BUF before we copy it out,
-// not how much of the air we hear — END_START re-arms in hardware. The next
-// packet begins overwriting that buffer ~40 µs after its own preamble, so a late
-// poll costs a torn snapshot (counted as `torn=`), not a missed reception.
-const PRIMARY_POLL_US: u64 = 150;
+// This bounds how long a completed packet sits in its DMA buffer before we copy
+// it out, not how much of the air we hear — END_START re-arms in hardware. The
+// ADDRESS event advances the next reception through a ring of DMA buffers. If
+// the polling task cannot make that switch before END, the packet is abandoned
+// and counted as `torn=` rather than decoded from ambiguous storage.
+const PRIMARY_POLL_US: u64 = 30;
+
+/// Bounded CPU fast path after RX starts or a packet completes. This covers the
+/// short interval in which END_START can begin the next reception before the
+/// executor wakes from its normal timer yield.
+const PRIMARY_HANDOFF_SPIN_US: u64 = 100;
 
 // ── Extended-advertising AuxPtr following ─────────────────────────────────────
 // When an ADV_EXT_IND carries an AuxPtr, we schedule an RX window near the aux
@@ -83,15 +88,71 @@ const AUX_MAX_LEAD_US: u32 = 60_000; // skip absurdly-distant aux (keep scanner 
 
 // EasyDMA receive buffer for BLE advertising PDUs. Sized for the largest aux
 // packet: AUX_ADV_IND AdvData can reach 255 bytes, plus the 2-byte PDU header.
-static RX_BUF: ModeRef<SyncBuf<258>> = ModeRef::new();
+static RX_BUF_A: ModeRef<SyncBuf<258>> = ModeRef::new();
 
-/// Snapshot of the packet currently being processed, copied out of [`RX_BUF`].
+/// Primary-channel DMA ring. The radio has one PACKETPTR, so software advances
+/// it at each ADDRESS event; the extra slots absorb packets that complete while
+/// the capture task is copying and queueing the previous one.
+const PRIMARY_DMA_SLOTS: usize = 16;
+const PRIMARY_DMA_BYTES: usize = 258 * PRIMARY_DMA_SLOTS;
+static PRIMARY_DMA: ModeRef<SyncBuf<PRIMARY_DMA_BYTES>> = ModeRef::new();
+
+/// State used by the RADIO ADDRESS interrupt. The interrupt advances the DMA
+/// pointer without waiting for the capture task. `next_slot` is the slot to
+/// assign to the next packet whose ADDRESS event arrives; `address_count` is
+/// also the task-visible proof that the current packet's DMA slot was handed
+/// off before END.
+static PRIMARY_IRQ_NEXT_SLOT: AtomicU8 = AtomicU8::new(0);
+static PRIMARY_IRQ_ADDRESS_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Per-slot metadata captured by the RADIO END interrupt. Keeping this beside
+/// the DMA ring prevents a later packet from replacing the CRC/RSSI/timestamp
+/// registers before the capture task consumes the completed slot.
+#[derive(Clone, Copy)]
+struct PrimaryMeta {
+    sequence: u32,
+    t_end_ticks: u32,
+    rxcrc: u32,
+    rssi_dbm: i16,
+    crc_ok: bool,
+}
+
+const EMPTY_PRIMARY_META: PrimaryMeta = PrimaryMeta {
+    sequence: 0,
+    t_end_ticks: 0,
+    rxcrc: 0,
+    rssi_dbm: 0,
+    crc_ok: false,
+};
+
+struct PrimaryMetaCell(UnsafeCell<[PrimaryMeta; PRIMARY_DMA_SLOTS]>);
+unsafe impl Sync for PrimaryMetaCell {}
+
+static PRIMARY_META: ModeRef<PrimaryMetaCell> = ModeRef::new();
+static PRIMARY_IRQ_END_SLOT: AtomicU8 = AtomicU8::new(0);
+static PRIMARY_IRQ_END_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// RADIO interrupt handler bound by each flashable binary. It only services the
+/// advertising scanner while the scanner has enabled the peripheral ADDRESS
+/// interrupt; all other modes leave that interrupt disabled.
+pub struct RadioAddressHandler;
+
+impl embassy_nrf::interrupt::typelevel::Handler<embassy_nrf::interrupt::typelevel::RADIO>
+    for RadioAddressHandler
+{
+    unsafe fn on_interrupt() {
+        service_primary_events();
+    }
+}
+
+/// Snapshot of the packet currently being processed, copied out of the active
+/// DMA buffer.
 ///
 /// The primary scan re-arms the receiver in hardware (`END_START`) the instant a
-/// packet completes, so [`RX_BUF`] starts filling with the *next* packet — a
-/// T_IFS follow-up begins overwriting it ~190 µs later — while we are still
-/// reading this one. Everything downstream of the copy works from here, off the
-/// DMA path. Static rather than a local so it stays out of the scan future.
+/// packet completes. `PACKETPTR` is switched to the next ring slot at
+/// `ADDRESS`, leaving the completed buffer stable while it is copied. Everything
+/// downstream of the copy works from here, off the DMA path. Static rather than
+/// a local so it stays out of the scan future.
 static PKT_BUF: ModeRef<SyncBuf<258>> = ModeRef::new();
 
 // ── Decode queue ──────────────────────────────────────────────────────────────
@@ -99,14 +160,13 @@ static PKT_BUF: ModeRef<SyncBuf<258>> = ModeRef::new();
 // the QSPI vendor lookup is ~0.3 ms), and in a busy environment that is ~15% of
 // wall clock. Doing it between DISABLE and the next RXEN spends all of it with
 // the receiver off. Instead the scan copies each packet into this queue and
-// re-arms immediately; [`log_task`] drains the queue and does the decode while
-// the radio is listening again.
+// re-arms immediately; the build-specific consumer task drains the queue and
+// does the decode while the producer continues servicing the radio.
 //
-// Depth 8 against a ~0.6 ms service time and a ~4 ms mean packet gap leaves the
-// queue near-empty in steady state; it is sized to absorb the burst of one
-// advertising event (the same payload on 37/38/39 within ~2 ms) plus the 5 ms
-// tail of a large ext-adv decode.
-const RX_QUEUE_DEPTH: usize = 8;
+// The queue is non-blocking: a full queue drops the packet and immediately
+// returns control to capture. Depth 16 absorbs a primary-channel burst while
+// keeping decode, storage, and USB work off the radio path.
+const RX_QUEUE_DEPTH: usize = 16;
 
 /// Where a queued packet was captured, and the metadata that only its capture
 /// context knows.
@@ -118,13 +178,13 @@ pub enum RxSrc {
     Aux { phy: u8, adi: Option<u16> },
 }
 
-/// One captured PDU, copied out of [`RX_BUF`] so the radio can re-arm before it
+/// One captured PDU, copied out of the DMA buffer so the radio can re-arm before it
 /// is decoded.
 pub struct RxPacket {
     /// Air-start of the packet. Every line logged for it carries this instant —
     /// see [`crate::with_log_stamp`].
     pub t_air: Instant,
-    /// PDU header + payload, as received. Sized like [`RX_BUF`] because an
+    /// PDU header + payload, as received. Sized like the DMA buffers because an
     /// AUX_ADV_IND payload can reach 255 bytes; primary PDUs use ~40 of it.
     pub data: [u8; 258],
     /// Valid bytes in `data`, header included.
@@ -132,8 +192,11 @@ pub struct RxPacket {
     pub rssi_dbm: i16,
     /// Repeat count from [`note_and_throttle`]; 0 for a first sighting.
     pub rpt: u32,
-    /// Low 16 bits of the payload fingerprint.
-    pub fp: u16,
+    /// Full 32-bit FNV-1a fingerprint of the advertising data.
+    pub fp: u32,
+    /// Hardware RXCRC captured with this PDU. Used by the consumer-side
+    /// optional one-bit repair so CRC work never delays radio capture.
+    pub rxcrc: u32,
     pub ch: u8,
     /// PDU type from the header, or 0xFF when `crc_ok` is false.
     pub pdu_type: u8,
@@ -161,10 +224,18 @@ fn enqueue(
     pdu_type: u8,
     len: usize,
     rpt: u32,
-    fp: u16,
+    fp: u32,
+    rxcrc: u32,
     repaired_bit: Option<u16>,
     src: RxSrc,
 ) {
+    // Avoid constructing/copying a full 258-byte queue item when the consumer
+    // has already filled the queue. The check is only an optimization; the
+    // non-blocking `try_send` below remains the ownership decision.
+    if RX_QUEUE.is_full() {
+        stats_drop();
+        return;
+    }
     let len = len.min(bytes.len());
     let mut p = RxPacket {
         t_air,
@@ -173,6 +244,7 @@ fn enqueue(
         rssi_dbm,
         rpt,
         fp,
+        rxcrc,
         ch,
         pdu_type,
         crc_ok,
@@ -185,15 +257,23 @@ fn enqueue(
     }
 }
 
-/// Copies the just-completed PDU out of the DMA buffer into [`PKT_BUF`],
+/// Returns the selected primary-channel DMA buffer.
+fn rx_buf(slot: usize) -> &'static [u8; 258] {
+    let slot = slot % PRIMARY_DMA_SLOTS;
+    unsafe { &*(PRIMARY_DMA.0.get().cast::<u8>().add(slot * 258) as *const [u8; 258]) }
+}
+
+fn rx_dma_ptr(slot: usize) -> u32 {
+    rx_buf(slot).as_ptr() as u32
+}
+
+/// Copies the just-completed PDU out of the selected DMA buffer into [`PKT_BUF`],
 /// returning its total length (2-byte header included).
-///
-/// Called with the receiver already re-armed, so this is a race against the next
-/// packet's DMA; the caller checks `EVENTS_ADDRESS` afterwards to see whether it
-/// won. Only the bytes the header claims are copied — a legacy PDU is ~40 of the
-/// 258, and the copy sits directly in that race.
-fn snapshot_rx() -> usize {
-    let src = unsafe { &*RX_BUF.0.get() };
+/// The primary scanner switches `PACKETPTR` to the next ring slot at `ADDRESS`,
+/// so this copy is no longer racing the following packet. Only the bytes the
+/// header claims are copied — a legacy PDU is ~40 of the 258.
+fn snapshot_rx(slot: usize) -> usize {
+    let src = rx_buf(slot);
     // 8-bit Length (BLE 5 / LFLEN=8). On a CRC failure this is whatever noise
     // landed in the header byte, hence the clamp.
     let n = (2 + src[1] as usize).min(src.len());
@@ -290,9 +370,19 @@ struct Stats {
     /// Packets discarded because [`RX_QUEUE`] was full — the decoder falling
     /// behind the radio.
     dropped: u32,
-    /// Snapshots abandoned because the next packet's DMA reached [`RX_BUF`]
-    /// first — the radio out-running the copy, not the decoder.
+    /// Snapshots abandoned because the next packet's DMA reached the active
+    /// buffer before the pointer could be switched — the radio out-running the
+    /// capture task, not the decoder.
     torn: u32,
+    /// END was observed before an ADDRESS handoff was recorded for the packet.
+    torn_before_address: u32,
+    /// END was consumed through the completion path without a recorded ADDRESS
+    /// handoff. This exposes the exact completion-side failure path.
+    torn_end_without_address: u32,
+    /// A later packet completed while the capture loop was copying the previous
+    /// snapshot. The ring preserves slot ownership; this counter records that
+    /// the shared per-packet status registers were under pressure.
+    overrun: u32,
     /// CRC-failed frames that passed the [`salvage`] plausibility gate and were
     /// logged anyway.
     salvaged: u32,
@@ -328,6 +418,8 @@ static RECOVERED_PREV: ModeRef<AtomicU32> = ModeRef::new();
 /// rather than allocating it beside every other selectable mode's state.
 pub struct Storage {
     rx_buf: SyncBuf<258>,
+    primary_dma: SyncBuf<PRIMARY_DMA_BYTES>,
+    primary_meta: PrimaryMetaCell,
     pkt_buf: SyncBuf<258>,
     rx_queue: Channel<CriticalSectionRawMutex, RxPacket, RX_QUEUE_DEPTH>,
     seen: SeenCache,
@@ -340,6 +432,8 @@ impl Storage {
     pub const fn new() -> Self {
         Self {
             rx_buf: SyncBuf::new(),
+            primary_dma: SyncBuf::new(),
+            primary_meta: PrimaryMetaCell(UnsafeCell::new([EMPTY_PRIMARY_META; PRIMARY_DMA_SLOTS])),
             pkt_buf: SyncBuf::new(),
             rx_queue: Channel::new(),
             seen: SeenCache(UnsafeCell::new(
@@ -357,6 +451,9 @@ impl Storage {
                 suppressed: 0,
                 dropped: 0,
                 torn: 0,
+                torn_before_address: 0,
+                torn_end_without_address: 0,
+                overrun: 0,
                 salvaged: 0,
                 crc1fix: 0,
                 strongest: -128,
@@ -380,7 +477,9 @@ impl Default for Storage {
 /// The caller must invoke this exactly once before this mode spawns any task.
 pub unsafe fn bind_storage(storage: &'static Storage) {
     unsafe {
-        RX_BUF.bind(&storage.rx_buf);
+        RX_BUF_A.bind(&storage.rx_buf);
+        PRIMARY_DMA.bind(&storage.primary_dma);
+        PRIMARY_META.bind(&storage.primary_meta);
         PKT_BUF.bind(&storage.pkt_buf);
         RX_QUEUE.bind(&storage.rx_queue);
         SEEN.bind(&storage.seen);
@@ -388,6 +487,123 @@ pub unsafe fn bind_storage(storage: &'static Storage) {
         PKT_TOTAL.bind(&storage.pkt_total);
         RECOVERED_PREV.bind(&storage.recovered_prev);
     }
+}
+
+/// Service one pending primary-channel ADDRESS event. This is shared by the
+/// RADIO ISR and the bounded task-side fallback. The ISR reaches this at the
+/// earliest possible point; the fallback also makes a missed or disabled IRQ
+/// diagnosable instead of silently reusing the active slot.
+#[inline(always)]
+fn service_primary_address_event() {
+    let r = pac::RADIO;
+    if r.events_address().read() == 0 {
+        return;
+    }
+
+    let slot = PRIMARY_IRQ_NEXT_SLOT.load(Ordering::Relaxed) as usize;
+    r.packetptr().write_value(rx_dma_ptr(slot));
+    PRIMARY_IRQ_NEXT_SLOT.store(((slot + 1) % PRIMARY_DMA_SLOTS) as u8, Ordering::Release);
+    PRIMARY_IRQ_ADDRESS_COUNT.fetch_add(1, Ordering::Release);
+    r.events_address().write_value(0);
+}
+
+/// Capture one completed primary-channel packet's metadata and acknowledge its
+/// END event. The DMA payload itself remains in the slot selected at ADDRESS.
+#[inline(always)]
+fn service_primary_end_event() {
+    let r = pac::RADIO;
+    if r.events_end().read() == 0 {
+        return;
+    }
+
+    // Clear END before reading the registers. If END_START completes another
+    // packet while these reads run, its event remains pending for the next IRQ.
+    r.events_end().write_value(0);
+    let crc_ok = r.events_crcok().read() != 0;
+    let rxcrc = r.rxcrc().read().rxcrc();
+    let rssi_dbm = -(r.rssisample().read().rssisample() as i16);
+    let t_end_ticks = pac::TIMER1.cc(1).read();
+    r.events_crcok().write_value(0);
+    r.events_crcerror().write_value(0);
+
+    let slot = PRIMARY_IRQ_END_SLOT.load(Ordering::Relaxed) as usize;
+    let sequence = PRIMARY_IRQ_END_COUNT
+        .load(Ordering::Relaxed)
+        .wrapping_add(1);
+    unsafe {
+        (*PRIMARY_META.0.get())[slot] = PrimaryMeta {
+            sequence,
+            t_end_ticks,
+            rxcrc,
+            rssi_dbm,
+            crc_ok,
+        };
+    }
+    PRIMARY_IRQ_END_SLOT.store(((slot + 1) % PRIMARY_DMA_SLOTS) as u8, Ordering::Relaxed);
+    PRIMARY_IRQ_END_COUNT.store(sequence, Ordering::Release);
+}
+
+#[inline(always)]
+fn service_primary_events() {
+    service_primary_address_event();
+    service_primary_end_event();
+}
+
+/// Enable the RADIO ADDRESS interrupt for one primary-channel visit.
+fn begin_primary_address_irq(initial_slot: usize) {
+    use embassy_nrf::interrupt::typelevel::Interrupt as _;
+
+    PRIMARY_IRQ_NEXT_SLOT.store(
+        ((initial_slot + 1) % PRIMARY_DMA_SLOTS) as u8,
+        Ordering::Release,
+    );
+    PRIMARY_IRQ_ADDRESS_COUNT.store(0, Ordering::Release);
+    PRIMARY_IRQ_END_SLOT.store(initial_slot as u8, Ordering::Release);
+    PRIMARY_IRQ_END_COUNT.store(0, Ordering::Release);
+
+    type RadioIrq = embassy_nrf::interrupt::typelevel::RADIO;
+    RadioIrq::disable();
+    RadioIrq::unpend();
+    let r = pac::RADIO;
+    r.intenclr().write(|w| w.0 = (1 << 1) | (1 << 3));
+    r.events_address().write_value(0);
+    r.events_end().write_value(0);
+    r.intenset().write(|w| w.0 = (1 << 1) | (1 << 3));
+    RadioIrq::unpend();
+    unsafe { RadioIrq::enable() };
+}
+
+/// Disable the RADIO ADDRESS/END interrupts after a primary-channel visit.
+fn end_primary_irq() {
+    use embassy_nrf::interrupt::typelevel::Interrupt as _;
+
+    type RadioIrq = embassy_nrf::interrupt::typelevel::RADIO;
+    RadioIrq::disable();
+    let r = pac::RADIO;
+    r.intenclr().write(|w| w.0 = (1 << 1) | (1 << 3));
+    r.events_address().write_value(0);
+    r.events_end().write_value(0);
+    r.events_crcok().write_value(0);
+    r.events_crcerror().write_value(0);
+    RadioIrq::unpend();
+}
+
+/// Poll pending ADDRESS/END events from task context without racing the RADIO
+/// ISR.
+#[inline(always)]
+fn service_primary_address_fallback() {
+    cortex_m::interrupt::free(|_| service_primary_events());
+}
+
+/// Read metadata only after its release-published sequence is visible. The
+/// critical section also prevents the END ISR from rewriting this slot while it
+/// is copied into task context.
+#[inline(always)]
+fn primary_meta(slot: usize, expected_sequence: u32) -> Option<PrimaryMeta> {
+    cortex_m::interrupt::free(|_| {
+        let meta = unsafe { (*PRIMARY_META.0.get())[slot] };
+        (meta.sequence == expected_sequence).then_some(meta)
+    })
 }
 
 fn stats_record(crc_ok: bool, rssi_dbm: i16, suppressed: bool) {
@@ -412,10 +628,47 @@ fn stats_drop() {
     s.dropped += 1;
 }
 
-fn stats_torn() {
+fn stats_torn_end_without_address() {
     let s = unsafe { &mut *STATS.0.get() };
     crate::ERR_TOTAL.fetch_add(1, Ordering::Relaxed);
     s.torn += 1;
+    s.torn_end_without_address += 1;
+}
+
+fn stats_overrun() {
+    let s = unsafe { &mut *STATS.0.get() };
+    crate::ERR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    s.overrun += 1;
+}
+
+fn log_ad_stop(ad: &[u8], payload_base: usize) {
+    let Some(stop) = decoder::ad_stop_reason(ad) else {
+        return;
+    };
+    match stop {
+        decoder::AdStop::LengthOverrun {
+            offset,
+            declared,
+            remaining,
+        } => emitf!(
+            "  [ERR] ad_stop payload_offset={} ad_offset={} field_len={} remaining={} reason=length_overrun\r\n",
+            payload_base + offset,
+            offset,
+            declared,
+            remaining
+        ),
+        decoder::AdStop::MissingType { offset, byte } => emitf!(
+            "  [ERR] ad_stop payload_offset={} ad_offset={} byte={:02X} reason=missing_type\r\n",
+            payload_base + offset,
+            offset,
+            byte
+        ),
+        decoder::AdStop::NonZeroAfterTerminator { offset } => emitf!(
+            "  [ERR] ad_stop payload_offset={} ad_offset={} reason=nonzero_after_terminator\r\n",
+            payload_base + offset,
+            offset
+        ),
+    }
 }
 
 fn stats_salvage() {
@@ -426,6 +679,24 @@ fn stats_salvage() {
 fn stats_crc1fix() {
     let s = unsafe { &mut *STATS.0.get() };
     s.crc1fix += 1;
+}
+
+/// Complete optional CRC repair for a queued packet. This runs in the decoder
+/// task, never in the radio producer, so a damaged packet cannot delay pointer
+/// rotation or primary-channel capture.
+pub fn repair_queued(packet: &mut RxPacket, repair: &mut BleCrcRepair) {
+    if !matches!(&packet.src, RxSrc::Primary) {
+        return;
+    }
+    let pdu = &mut packet.data[..packet.len as usize];
+    if packet.crc_ok {
+        repair.observe_good(pdu, ADV_CRC_INIT, packet.rxcrc);
+    } else if let Some(bit) = repair.repair_one_payload_bit(pdu, ADV_CRC_INIT, packet.rxcrc) {
+        packet.crc_ok = true;
+        packet.pdu_type = packet.data[0] & 0x0F;
+        packet.repaired_bit = Some(bit);
+        stats_crc1fix();
+    }
 }
 
 /// Called once per scan cycle; emits and resets the window every STATS_CYCLES.
@@ -460,7 +731,7 @@ fn stats_tick() {
         .and_then(|w| w.checked_div(s.pkts))
         .unwrap_or(0);
     ulogf!(
-        "[STAT] cycles={} pkts={} crc_ok={}% median={}dBm weak={}% strongest={}dBm suppressed={} dropped={} torn={} salvaged={} crc1fix={} recovered={}\r\n",
+        "[STAT] cycles={} pkts={} crc_ok={}% median={}dBm weak={}% strongest={}dBm suppressed={} dropped={} torn={} torn_before_address={} torn_end_without_address={} overrun={} salvaged={} crc1fix={} recovered={}\r\n",
         s.cycles,
         s.pkts,
         pct,
@@ -470,6 +741,9 @@ fn stats_tick() {
         s.suppressed,
         s.dropped,
         s.torn,
+        s.torn_before_address,
+        s.torn_end_without_address,
+        s.overrun,
         s.salvaged,
         s.crc1fix,
         recovered
@@ -481,6 +755,9 @@ fn stats_tick() {
         suppressed: 0,
         dropped: 0,
         torn: 0,
+        torn_before_address: 0,
+        torn_end_without_address: 0,
+        overrun: 0,
         salvaged: 0,
         crc1fix: 0,
         strongest: -128,
@@ -582,7 +859,7 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
             w.set_map(vals::Map::Default);
         });
         r.datawhiteiv().write(|w| w.set_datawhiteiv(aux.chan));
-        r.packetptr().write_value(RX_BUF.0.get() as u32);
+        r.packetptr().write_value(RX_BUF_A.0.get() as u32);
 
         r.events_end().write_value(0);
         r.events_crcok().write_value(0);
@@ -600,7 +877,7 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
         // latency that pushed short RX opens past the aux's air time is gone.
         let now = Instant::now();
         let lead_us = open_at.saturating_duration_since(now).as_micros() as u32;
-        arm_rxen_after(lead_us);
+        let end_clock = arm_rxen_after(lead_us);
         if open_at > now {
             Timer::at(open_at).await;
         }
@@ -618,7 +895,10 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
         for _ in 0..(window_us / 200 + 1) {
             if r.events_end().read() != 0 {
                 r.events_end().write_value(0);
-                t_aux_end = Instant::now();
+                // RADIO.END is captured by TIMER1/PPI at the hardware edge;
+                // using the poll instant here can be up to 200 µs late and
+                // shifts the next chained AuxPtr onto the wrong channel/time.
+                t_aux_end = end_clock.end_instant();
                 got = true;
                 break;
             }
@@ -635,7 +915,7 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
 
         let crc_ok = r.events_crcok().read() != 0;
         let rssi_dbm = -(r.rssisample().read().rssisample() as i16);
-        let buf = unsafe { &*RX_BUF.0.get() };
+        let buf = unsafe { &*RX_BUF_A.0.get() };
         let length = buf[1]; // ext-adv length is a full 8-bit field (LFLEN=8)
         let payload_len = (length as usize).min(buf.len().saturating_sub(2));
 
@@ -660,6 +940,7 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
                 false,
                 0xFF,
                 2 + payload_len,
+                0,
                 0,
                 0,
                 None,
@@ -689,6 +970,7 @@ async fn follow_aux(first: decoder::AuxPtr, adi: Option<u16>, mut t_ref: Instant
             true,
             0x07,
             2 + payload_len,
+            0,
             0,
             0,
             None,
@@ -791,7 +1073,7 @@ async fn capture_ext_pdu(
         w.set_map(vals::Map::Default);
     });
     r.datawhiteiv().write(|w| w.set_datawhiteiv(chan));
-    r.packetptr().write_value(RX_BUF.0.get() as u32);
+    r.packetptr().write_value(RX_BUF_A.0.get() as u32);
     r.events_end().write_value(0);
     r.events_crcok().write_value(0);
     r.events_address().write_value(0);
@@ -800,6 +1082,7 @@ async fn capture_ext_pdu(
         w.set_rxready_start(true);
         w.set_address_rssistart(true);
     });
+    let end_clock = start_end_capture();
     r.tasks_rxen().write_value(1);
 
     let mut got = false;
@@ -807,13 +1090,14 @@ async fn capture_ext_pdu(
     for _ in 0..(window_us / 200 + 1) {
         if r.events_end().read() != 0 {
             r.events_end().write_value(0);
-            t_end = Instant::now();
+            t_end = end_clock.end_instant();
             got = true;
             break;
         }
         Timer::after_micros(200).await;
     }
     disable_silent();
+    disarm_rxen();
 
     if !got {
         return None;
@@ -821,7 +1105,7 @@ async fn capture_ext_pdu(
 
     let crc_ok = r.events_crcok().read() != 0;
     let rssi_dbm = -(r.rssisample().read().rssisample() as i16);
-    let buf = unsafe { &*RX_BUF.0.get() };
+    let buf = unsafe { &*RX_BUF_A.0.get() };
     let length = buf[1];
     let payload_len = (length as usize).min(buf.len().saturating_sub(2));
     let air_us: u64 = match phy {
@@ -900,13 +1184,14 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
 
         let plen = cap.payload_len;
         enqueue(
-            unsafe { &*RX_BUF.0.get() },
+            unsafe { &*RX_BUF_A.0.get() },
             cap.t_air,
             ch,
             cap.rssi_dbm,
             cap.crc_ok,
             if cap.crc_ok { 0x07 } else { 0xFF },
             2 + plen,
+            0,
             0,
             0,
             None,
@@ -926,7 +1211,8 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
         // Follow any AUX_CHAIN_IND for this event. Chained PDUs ride the same
         // periodic AA/CRCInit (still configured), so only the schedule/channel
         // changes; the offset is measured from each preceding packet's air-start.
-        let mut chain_next = decoder::parse_ext_hdr(&unsafe { &*RX_BUF.0.get() }[2..2 + plen]).aux;
+        let mut chain_next =
+            decoder::parse_ext_hdr(&unsafe { &*RX_BUF_A.0.get() }[2..2 + plen]).aux;
         let mut chain_ref = cap.t_air;
         let mut chops = 0u8;
         while let Some(cx) = chain_next {
@@ -950,13 +1236,14 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
             };
             let cplen = cc.payload_len;
             enqueue(
-                unsafe { &*RX_BUF.0.get() },
+                unsafe { &*RX_BUF_A.0.get() },
                 cc.t_air,
                 cx.chan,
                 cc.rssi_dbm,
                 cc.crc_ok,
                 if cc.crc_ok { 0x07 } else { 0xFF },
                 2 + cplen,
+                0,
                 0,
                 0,
                 None,
@@ -969,7 +1256,7 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
                 break;
             }
             chain_ref = cc.t_air;
-            chain_next = decoder::parse_ext_hdr(&unsafe { &*RX_BUF.0.get() }[2..2 + cplen]).aux;
+            chain_next = decoder::parse_ext_hdr(&unsafe { &*RX_BUF_A.0.get() }[2..2 + cplen]).aux;
         }
 
         counter = counter.wrapping_add(1);
@@ -997,20 +1284,18 @@ async fn follow_periodic(si: decoder::SyncInfo, t_anchor: Instant, phy: u8) {
 
 // ── Phase 2: BLE advertising packet detection ─────────────────────────────────
 //
-// 3 channels × (ADV_DWELL_MS + jitter). EVENTS_END is polled every PRIMARY_POLL_US,
-// so active channels return within ~150 µs of a packet landing. A TIMER1 capture
-// driven directly by RADIO.END supplies the AuxPtr timing anchor, rather than the
-// later poll instant; quiet channels burn the full (jittered) dwell window. Any
-// AuxPtr is followed inline before moving on.
-pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
-    // ── Polling-based BLE advertising packet detection ────────────────────────
-    // Interrupt-driven reception (ISR) was not working — neither #[no_mangle]
-    // nor bind_interrupts! correctly wired the RADIO vector on this embassy-nrf
-    // build without the nrf-pac rt feature. Polling EVENTS_END every
-    // PRIMARY_POLL_US is simpler and equally effective: the radio listens
-    // continuously, and we catch each received packet within ~150 µs of arrival
-    // (fast enough that a closely-following aux is still reachable). Each Timer
-    // yield keeps the USB logger task running so serial output stays live.
+// 3 channels × (ADV_DWELL_MS + jitter). RADIO ADDRESS advances the DMA ring in
+// the interrupt path and the completed-metadata sequence is checked every
+// PRIMARY_POLL_US. A TIMER1 capture driven directly by RADIO.END supplies the AuxPtr
+// timing anchor, rather than the later poll instant; quiet channels burn the full
+// (jittered) dwell window. Any AuxPtr is followed inline before moving on.
+pub async fn scan(rng: &mut Rng) {
+    // ── Interrupt-assisted BLE advertising packet detection ──────────────────
+    // RADIO ADDRESS is handled synchronously by the bound ISR so PACKETPTR is
+    // advanced before a short packet can reach END. The END ISR records per-slot
+    // metadata; the task drains that sequence and uses the task-side ADDRESS/END
+    // fallback if an event remains pending. Timer yields keep the USB logger task
+    // running.
     //
     // Fisher–Yates shuffle so channel visit order (and thus each channel's
     // sampling phase) varies every cycle.
@@ -1029,7 +1314,12 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
             w.set_map(vals::Map::Default);
         });
         r.datawhiteiv().write(|w| w.set_datawhiteiv(ch_idx));
-        r.packetptr().write_value(RX_BUF.0.get() as u32);
+        // The radio latches PACKETPTR when START runs. The ADDRESS ISR points the
+        // next END_START at the next slot while this one remains stable for the
+        // snapshot below.
+        let mut dma_slot = 0usize;
+        let mut end_count = 0u32;
+        r.packetptr().write_value(rx_dma_ptr(dma_slot));
 
         r.events_end().write_value(0);
         r.events_crcok().write_value(0);
@@ -1038,8 +1328,8 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
         r.events_sync().write_value(0);
         r.events_disabled().write_value(0);
         // Capture every primary RADIO.END into TIMER1 over PPI before reception
-        // begins. `EVENTS_END` is still polled to drive packet processing, but
-        // its poll latency must not move the AuxPtr reference time: an aux may
+        // begins. The END ISR reads that capture into per-slot metadata; its
+        // timestamp remains independent of task poll latency because an aux may
         // follow only a few hundred microseconds after its primary packet.
         let end_clock = start_end_capture();
         // RXREADY→START begins reception; ADDRESS→RSSISTART captures the signal
@@ -1056,7 +1346,22 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
             w.set_address_rssistart(true);
             w.set_end_start(true);
         });
+        begin_primary_address_irq(dma_slot);
         r.tasks_rxen().write_value(1);
+
+        // Give the first packet's ADDRESS event a bounded CPU fast path. The
+        // interrupt normally wins immediately; this also exercises the task
+        // fallback when the vector is pending behind a higher-priority handler.
+        let first_spin_deadline = Instant::now() + Duration::from_micros(PRIMARY_HANDOFF_SPIN_US);
+        while Instant::now() < first_spin_deadline {
+            service_primary_address_fallback();
+            if PRIMARY_IRQ_ADDRESS_COUNT.load(Ordering::Acquire) != 0
+                || PRIMARY_IRQ_END_COUNT.load(Ordering::Acquire) != 0
+            {
+                break;
+            }
+            cortex_m::asm::nop();
+        }
 
         let dwell =
             Duration::from_micros((ADV_DWELL_MS + rng.below(ADV_DWELL_JITTER_MS) as u64) * 1000);
@@ -1066,63 +1371,66 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
         let mut left_channel = false;
 
         while Instant::now() < deadline {
-            if r.events_end().read() == 0 {
-                Timer::after_micros(PRIMARY_POLL_US).await;
+            // The ISR normally consumes ADDRESS. Claim any sticky event under
+            // a critical section so the task fallback cannot race the ISR.
+            service_primary_address_fallback();
+            let completed_count = PRIMARY_IRQ_END_COUNT.load(Ordering::Acquire);
+            if completed_count.wrapping_sub(end_count) == 0 {
+                // A short END_START reception can begin immediately after the
+                // previous completion. Stay on CPU briefly so ADDRESS is
+                // serviced even when the executor's timer wake is late.
+                let spin_deadline = Instant::now() + Duration::from_micros(PRIMARY_HANDOFF_SPIN_US);
+                while Instant::now() < spin_deadline {
+                    service_primary_address_fallback();
+                    if PRIMARY_IRQ_END_COUNT.load(Ordering::Acquire) != end_count {
+                        break;
+                    }
+                    cortex_m::asm::nop();
+                }
+                if PRIMARY_IRQ_END_COUNT.load(Ordering::Acquire) == end_count {
+                    Timer::after_micros(PRIMARY_POLL_US).await;
+                }
                 continue;
+            }
+            let address_count = PRIMARY_IRQ_ADDRESS_COUNT.load(Ordering::Acquire);
+            // An END metadata record without a matching ADDRESS handoff means
+            // the completed slot cannot be proven stable. Abandon this channel
+            // visit instead of decoding a potentially mixed packet.
+            if address_count.wrapping_sub(end_count) == 0 {
+                stats_torn_end_without_address();
+                end_primary_irq();
+                disable_silent();
+                break;
             }
             // ── A packet completed ───────────────────────────────────────────
             // The receiver is already listening again, so everything from here
-            // races the next packet's DMA. Read the per-packet registers first
-            // (ADDRESS→RSSISTART re-samples RSSI on the next address match),
-            // then snapshot the buffer, then check whether we won the race.
-            r.events_end().write_value(0);
-            // TIMER1 latched this on the RADIO.END edge through PPI. Do not use
-            // `Instant::now()` here: it is sampled up to PRIMARY_POLL_US late
-            // and would shift every predicted aux time by that error.
-            let t_end = end_clock.end_instant();
-            let mut crc_ok = r.events_crcok().read() != 0;
-            // Read RXCRC before END_START can receive and overwrite it with the
-            // next packet. We only use this value after snapshotting the PDU.
-            let rxcrc = r.rxcrc().read().rxcrc();
-            r.events_crcok().write_value(0);
-            r.events_crcerror().write_value(0);
-            let rssi_dbm = -(r.rssisample().read().rssisample() as i16);
-
-            r.events_address().write_value(0);
-            let n = snapshot_rx();
-            // A fresh address match during the copy means the next packet was
-            // already writing into RX_BUF: the snapshot may be torn. (Not
-            // airtight — if the match happened before the clear above we miss
-            // it — but it catches the common case and keeps the cost visible in
-            // the stats rather than silently corrupting a decode.)
-            if r.events_address().read() != 0 {
-                stats_torn();
-                continue;
-            }
-
-            // Work solely on the private snapshot, never on RX_BUF while the
-            // hardware is listening again. The search is bounded to one payload
-            // bit (≤2,064 state updates); if a new address arrives while it runs,
-            // drop this candidate and return to the next packet immediately.
-            let repaired_bit = unsafe {
-                let pdu = &mut (&mut *PKT_BUF.0.get())[..n];
-                if crc_ok {
-                    crc_repair.observe_good(pdu, ADV_CRC_INIT, rxcrc);
-                    None
-                } else {
-                    crc_repair.repair_one_payload_bit_until(pdu, ADV_CRC_INIT, rxcrc, || {
-                        r.events_address().read() != 0
-                    })
-                }
+            // races the next packet's DMA. Metadata was captured by the END ISR
+            // before the next completion can replace the radio registers; the
+            // ADDRESS ISR has already switched the DMA to the next ring slot.
+            // The stored TIMER1 timestamp is independent of task poll latency.
+            let completed_slot = dma_slot;
+            let expected_sequence = end_count.wrapping_add(1);
+            let Some(meta) = primary_meta(completed_slot, expected_sequence) else {
+                // The metadata ring wrapped before this slot was consumed. The
+                // matching DMA slot may also have been reused, so skip the
+                // channel visit with an explicit overrun diagnostic.
+                stats_overrun();
+                end_primary_irq();
+                disable_silent();
+                break;
             };
-            if r.events_address().read() != 0 {
-                stats_torn();
-                continue;
-            }
-            if repaired_bit.is_some() {
-                crc_ok = true;
-                stats_crc1fix();
-            }
+            end_count = expected_sequence;
+            dma_slot = (dma_slot + 1) % PRIMARY_DMA_SLOTS;
+            let t_end = end_clock.instant_at(meta.t_end_ticks);
+            let crc_ok = meta.crc_ok;
+            let rxcrc = meta.rxcrc;
+            let rssi_dbm = meta.rssi_dbm;
+            let n = snapshot_rx(completed_slot);
+            // The ISR has already advanced PACKETPTR and captured metadata for
+            // any packet that completed during the snapshot. Service a pending
+            // ADDRESS/END event here; the next loop observes the published END
+            // sequence without delaying the USB and decode tasks.
+            service_primary_address_fallback();
 
             let buf = &unsafe { &*PKT_BUF.0.get() }[..n];
             // BLE 5 advertising PDU header Length is a full 8 bits. Masking it
@@ -1152,7 +1460,7 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
             // Collapse consecutive identical (addr,payload) frames. A repeat is
             // fully suppressed except every REPEAT_NOTICE_EVERY-th sighting, which
             // still prints one line (with rpt=N) so the device stays visible.
-            // fp: low 16 bits of a fingerprint over the ADVERTISING DATA only — the
+            // fp: 32-bit fingerprint over the ADVERTISING DATA only — the
             // 6-byte AdvA is skipped, so it stays stable as a device rotates its RPA
             // (the address changes, the advertising content usually does not).
             // Hashing from buf[2] (which includes AdvA) would change every rotation
@@ -1163,7 +1471,7 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
                 } else {
                     &buf[2..2 + payload_len] // no AdvData (e.g. DIRECT_IND) — hash what's there
                 };
-                fnv1a(ad) as u16
+                fnv1a(ad)
             } else {
                 0
             };
@@ -1206,7 +1514,8 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
                 2 + payload_len,
                 rpt,
                 fp,
-                repaired_bit,
+                rxcrc,
+                None,
                 RxSrc::Primary,
             );
 
@@ -1217,12 +1526,14 @@ pub async fn scan(rng: &mut Rng, crc_repair: &mut BleCrcRepair) {
             // than resuming a dwell whose receiver is now on a data channel.
             if let Some(aux) = ext.aux {
                 let (aux, adi) = (aux, ext.adi);
+                end_primary_irq();
                 follow_aux(aux, adi, t_air).await;
                 left_channel = true;
                 break;
             }
         }
 
+        end_primary_irq();
         if !left_channel {
             disable_silent();
         }
@@ -1285,7 +1596,7 @@ pub struct Header {
     /// TxAdd: true = random address, false = public.
     pub tx_random: bool,
     pub is_ext: bool,
-    pub fp: u16,
+    pub fp: u32,
     pub rpt: u32,
     /// Advertiser address in display order (MSB first) when the frame carried a
     /// usable one (CRC ok, not ext-adv, long enough); else `None`.
@@ -1493,7 +1804,7 @@ fn emit_primary(p: &RxPacket, h: &Header) {
         let mut line = decoder::LogStr::new();
         let _ = write!(
             line,
-            "{} ch={} rssi={} len={} addr={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} {} fp={:04X} crc={}",
+            "{} ch={} rssi={} len={} addr={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} {} fp={:08X} crc={}",
             h.name(),
             h.ch,
             h.rssi_dbm,
@@ -1599,11 +1910,9 @@ fn emit_primary(p: &RxPacket, h: &Header) {
                 if matches!(t, 0x00 | 0x02 | 0x04 | 0x06) && length > 6 {
                     let adva = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
                     let ad = &buf[8..];
-                    unparsed = tail(
-                        6,
-                        decoder::log_ad_structures(ad, Some(adva), false),
-                        ad.len(),
-                    );
+                    let consumed = decoder::log_ad_structures(ad, Some(adva), false);
+                    unparsed = tail(6, consumed, ad.len());
+                    log_ad_stop(ad, 6);
                 }
             }
             None => {
@@ -1644,11 +1953,9 @@ fn emit_primary(p: &RxPacket, h: &Header) {
             // == own address".
             let adva = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]];
             let ad = &buf[8..];
-            unparsed = tail(
-                6,
-                decoder::log_ad_structures(ad, Some(adva), true),
-                ad.len(),
-            );
+            let consumed = decoder::log_ad_structures(ad, Some(adva), true);
+            unparsed = tail(6, consumed, ad.len());
+            log_ad_stop(ad, 6);
         } else if matches!(p.pdu_type, 0x01 | 0x03) && length == 12 {
             // ADV_DIRECT_IND (AdvA, TargetA) and SCAN_REQ (ScanA, AdvA) carry two
             // addresses and nothing else. The header line already named the first
@@ -1826,28 +2133,12 @@ impl<K: super::CaptureSink> Mode for BleSniff<K> {
 
     async fn run(&mut self, ctx: &'static Ctx<K>) -> ! {
         ctx.sink().begin();
-        // `rng` and `sink` come from separate cells, so the producer and consumer
-        // can run concurrently without aliasing.
-        let rng = ctx.rng();
-        let sink = ctx.sink();
-
-        let produce = async {
-            let mut crc_repair = BleCrcRepair::default();
-            loop {
-                scan(rng, &mut crc_repair).await;
-            }
-        };
-        // Decode/format overlaps reception: the radio is listening again while
-        // this drains the queue a packet at a time.
-        let consume = async {
-            loop {
-                let p = RX_QUEUE.receive().await;
-                sink.sink_frame(&p);
-            }
-        };
-        join(produce, consume).await;
-        // Both branches loop forever, so join never returns.
-        unreachable!()
+        // The decoder is spawned by the build callback as a separate task. This
+        // task owns only the radio producer, so synchronous sink/CRC work cannot
+        // delay DMA pointer rotation during an advertising burst.
+        loop {
+            scan(ctx.rng()).await;
+        }
     }
 }
 

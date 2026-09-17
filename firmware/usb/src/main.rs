@@ -42,6 +42,7 @@ bind_interrupts!(struct Irqs {
     CLOCK_POWER => usb::vbus_detect::InterruptHandler;
     // GNSS module (DX-GP21): the NMEA UART + the 1PPS input wait.
     UARTE0 => uarte::InterruptHandler<peripherals::UARTE0>;
+    RADIO => mode::ble_sniff::RadioAddressHandler;
 });
 
 // ── Capture sink + context ──────────────────────────────────────────────────
@@ -177,9 +178,7 @@ pub(crate) struct LedParts {
     pub b: Peri<'static, peripherals::P0_06>,
 }
 
-/// Arguments for the one runtime-selected mode task. An enum makes the task
-/// future the size of its largest mode branch rather than reserving one Embassy
-/// pool for each mutually exclusive callback.
+/// Arguments for the runtime-selected mode task.
 enum ModeArgs {
     BleSniff {
         rx: Receiver<'static, UsbDriver>,
@@ -208,22 +207,68 @@ enum ModeArgs {
     },
 }
 
-/// The sole top-level mode task. The selected enum variant owns the relevant
-/// peripherals; only its future state is live after the match, so all boot-mode
-/// main-loop storage is overlaid in this one Embassy pool.
 #[embassy_executor::task]
-async fn mode_task(spawner: Spawner, args: ModeArgs) -> ! {
+async fn ble_sniff_mode_task(
+    spawner: Spawner,
+    rx: Receiver<'static, UsbDriver>,
+    qspi: QspiParts,
+    leds: LedParts,
+) -> ! {
+    callback::ble_sniff::run(spawner, rx, qspi, leds).await
+}
+
+#[embassy_executor::task]
+async fn rssi_mode_task(
+    spi: Peri<'static, peripherals::SPI3>,
+    din: Peri<'static, peripherals::P0_02>,
+    leds: LedParts,
+) -> ! {
+    callback::rssi::run(spi, din, leds).await
+}
+
+#[embassy_executor::task]
+async fn gatt_mode_task(spawner: Spawner, qspi: QspiParts, leds: LedParts) -> ! {
+    callback::gatt::run(spawner, qspi, leds).await
+}
+
+#[embassy_executor::task]
+async fn conn_follow_mode_task(spawner: Spawner, qspi: QspiParts, leds: LedParts) -> ! {
+    callback::conn_follow::run(spawner, qspi, leds).await
+}
+
+#[embassy_executor::task]
+async fn zigbee_mode_task(spawner: Spawner, leds: LedParts) -> ! {
+    callback::zigbee::run(spawner, leds).await
+}
+
+#[embassy_executor::task]
+async fn recon_mode_task(spawner: Spawner, qspi: QspiParts, leds: LedParts) -> ! {
+    callback::recon::run(spawner, qspi, leds).await
+}
+
+/// Spawn only the selected mode's dedicated async state machine. Keeping the
+/// dispatch synchronous prevents LLVM from combining every mode poller into
+/// one function with a stack frame larger than the available RAM.
+fn spawn_mode(spawner: Spawner, args: ModeArgs) {
     match args {
         ModeArgs::BleSniff { rx, qspi, leds } => {
-            callback::ble_sniff::run(spawner, rx, qspi, leds).await
+            spawner.spawn(ble_sniff_mode_task(spawner, rx, qspi, leds).unwrap());
         }
-        ModeArgs::Rssi { spi, din, leds } => callback::rssi::run(spi, din, leds).await,
-        ModeArgs::Gatt { qspi, leds } => callback::gatt::run(spawner, qspi, leds).await,
+        ModeArgs::Rssi { spi, din, leds } => {
+            spawner.spawn(rssi_mode_task(spi, din, leds).unwrap());
+        }
+        ModeArgs::Gatt { qspi, leds } => {
+            spawner.spawn(gatt_mode_task(spawner, qspi, leds).unwrap());
+        }
         ModeArgs::ConnFollow { qspi, leds } => {
-            callback::conn_follow::run(spawner, qspi, leds).await
+            spawner.spawn(conn_follow_mode_task(spawner, qspi, leds).unwrap());
         }
-        ModeArgs::Zigbee { leds } => callback::zigbee::run(spawner, leds).await,
-        ModeArgs::Recon { qspi, leds } => callback::recon::run(spawner, qspi, leds).await,
+        ModeArgs::Zigbee { leds } => {
+            spawner.spawn(zigbee_mode_task(spawner, leds).unwrap());
+        }
+        ModeArgs::Recon { qspi, leds } => {
+            spawner.spawn(recon_mode_task(spawner, qspi, leds).unwrap());
+        }
     }
 }
 
@@ -313,6 +358,12 @@ async fn cdc_flush(
 /// PART=0x52840, RAM=256, FLASH=1024, VARIANT ASCII like "AAD0".
 fn log_chip() {
     use embassy_nrf::pac::FICR;
+    let resetreas = embassy_nrf::pac::POWER.resetreas().read().0;
+    // RESETREAS is write-one-to-clear. Consume this boot's cause so the next
+    // reboot reports its own cause instead of inheriting stale bits.
+    embassy_nrf::pac::POWER
+        .resetreas()
+        .write_value(embassy_nrf::pac::power::regs::Resetreas(resetreas));
     let part = FICR.info().part().read().0;
     let ram = FICR.info().ram().read().0;
     let flash = FICR.info().flash().read().0;
@@ -339,6 +390,7 @@ fn log_chip() {
         FICR.deviceid(0).read(),
         part == 0x52840 && ram == 256 && flash == 1024
     );
+    ulogf!("resetreas=0x{:08X}\r\n", resetreas);
 }
 
 /// Stream the LOG channel to the host, each line prefixed with its queued-at
@@ -594,5 +646,5 @@ async fn main(spawner: Spawner) {
     // The launch enum owns both the selected peripherals and the identity of
     // its matching arena field, so the two cannot drift apart.
     unsafe { args.init_storage() };
-    spawner.spawn(mode_task(spawner, args).unwrap());
+    spawn_mode(spawner, args);
 }

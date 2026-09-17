@@ -30,6 +30,7 @@ pub fn is_utech_advert(ad: &[u8]) -> bool {
 
 /// Probe a U-tec lock: walk the GATT, which reads and logs every readable
 /// characteristic (including the 0x7220 token). Returns the subscription count.
+#[allow(dead_code)]
 pub(crate) async fn probe(conn: &mut Conn, services: &[Service]) -> u32 {
     walk_services(conn, services, |_vh, _uuid| {}).await
 }

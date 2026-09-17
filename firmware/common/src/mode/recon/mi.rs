@@ -26,7 +26,8 @@ pub(super) async fn probe_scale(conn: &mut Conn, prof: &mi::Profile) {
         prof.notify_h
     );
     while Instant::now() < deadline {
-        let Some(rx) = conn_event(conn, stage_empty(conn)).await else {
+        let tx_len = stage_empty(conn);
+        let Some(rx) = conn_event(conn, tx_len).await else {
             miss += 1;
             if miss >= MAX_CONSEC_MISS {
                 break;

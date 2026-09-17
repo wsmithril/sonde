@@ -1,7 +1,7 @@
 //! Per-appliance Midea codecs, dispatched by the M-Smart type code (`sn[8..10]`).
 //!
 //! Each appliance module implements that product's status decode, cross-checked
-//! against the manufacturer's own protocol Lua (`meijia-decompile/lua/T_0000_*.lua`
+//! against the manufacturer's own protocol Lua (`app_decompile/meijia-decompile/lua/T_0000_*.lua`
 //! — the decrypted per-type codecs). The transport (GATT/handshake/crypto/frame
 //! wrapping) is shared and lives in the parent `device::midea`; only the
 //! appliance-specific `0xC0` status bytes differ here.
