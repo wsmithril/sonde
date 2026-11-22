@@ -53,6 +53,8 @@ dx-gp21-core     = { path = "vendor/dx-gp21/dx-gp21-core" }
 # offloaded to the nRF ECB peripheral; these cover SHA-256/HKDF and P-256 ECDH.
 sha2             = { version = "0.10", default-features = false }
 p256             = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
+# ASTM F3411 drone Remote ID (BLE service UUID 0xFFFA): no_std, allocation-free.
+remoteid         = { version = "0.3.3", default-features = false }
 
 # Profiles must live in the workspace root, not the member crates.
 [profile.release]

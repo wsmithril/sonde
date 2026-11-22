@@ -60,6 +60,7 @@ mod opple;
 mod oppo;
 mod pkoc;
 mod qualcomm;
+mod remote_id;
 mod samsung;
 mod shokz;
 mod sonova;
@@ -180,6 +181,7 @@ static DECODERS: &[&dyn VendorDecoder] = &[
     &lucimed::Lucimed,
     &pkoc::Pkoc,
     &tentacle::Tentacle,
+    &remote_id::RemoteId,
 ];
 
 /// Route `ctx`/`body` to the first registered decoder claiming `ctx.key` in the
