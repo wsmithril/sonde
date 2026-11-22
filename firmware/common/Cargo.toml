@@ -39,3 +39,4 @@ p256             = { workspace = true }
 # DX-GP21 GNSS module — the migrated Embassy board layer from the sibling
 # dx-gp21-rust repo (path + features live in the workspace root).
 dx-gp21-nrf52840 = { workspace = true }
+remoteid         = { workspace = true }
